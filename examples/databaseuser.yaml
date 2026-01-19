@@ -1,0 +1,52 @@
+# Application user - no deletionPolicy means default (Delete)
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: orders-api          # creates "orders_api" user in PostgreSQL
+  namespace: team-alpha
+spec:
+  databaseRef:
+    name: orders-db
+  privileges: readwrite
+  # deletionPolicy not specified = Delete (user dropped when resource deleted)
+---
+# Admin user with explicit Delete policy and password rotation
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: orders-migrations
+  namespace: team-alpha
+spec:
+  databaseRef:
+    name: orders-db
+  username: orders_admin    # explicit username
+  privileges: admin
+  password:
+    length: 32
+  rotation:
+    days: 30
+  deletionPolicy: Delete    # explicit: user will be dropped
+---
+# Readonly user for analytics with connection limit
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: orders-readonly     # creates "orders_readonly" user
+  namespace: team-alpha
+spec:
+  databaseRef:
+    name: orders-db
+  privileges: readonly
+  connectionLimit: 5
+---
+# User with Retain policy - user stays in PostgreSQL after resource deletion
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: shared-service
+  namespace: team-alpha
+spec:
+  databaseRef:
+    name: payments-db
+  privileges: readwrite
+  deletionPolicy: Retain    # user NOT dropped when resource deleted

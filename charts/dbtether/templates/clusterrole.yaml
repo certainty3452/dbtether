@@ -1,0 +1,123 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "dbtether.fullname" . }}-manager-role
+  labels:
+    {{- include "dbtether.labels" . | nindent 4 }}
+rules:
+  # DBCluster permissions
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - dbclusters
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - dbclusters/status
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - dbclusters/finalizers
+    verbs:
+      - update
+  # Database permissions
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - databases
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - databases/status
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - databases/finalizers
+    verbs:
+      - update
+  # DatabaseUser permissions
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - databaseusers
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - databaseusers/status
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - databaseusers/finalizers
+    verbs:
+      - update
+  # Secret permissions (read + write for DatabaseUser credentials)
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  # Leader election
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  # Events (for leader election announcements)
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+

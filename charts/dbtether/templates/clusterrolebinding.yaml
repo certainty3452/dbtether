@@ -1,0 +1,15 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "dbtether.fullname" . }}-manager-rolebinding
+  labels:
+    {{- include "dbtether.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "dbtether.fullname" . }}-manager-role
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "dbtether.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+

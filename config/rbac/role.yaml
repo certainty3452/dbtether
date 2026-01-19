@@ -1,0 +1,50 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - dbtether.io
+  resources:
+  - databases
+  - databaseusers
+  - dbclusters
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - dbtether.io
+  resources:
+  - databases/finalizers
+  - databaseusers/finalizers
+  - dbclusters/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - dbtether.io
+  resources:
+  - databases/status
+  - databaseusers/status
+  - dbclusters/status
+  verbs:
+  - get
+  - patch
+  - update

@@ -1,0 +1,79 @@
+# Default values for dbtether
+
+replicaCount: 1
+
+image:
+  repository: certainty3452/dbtether
+  pullPolicy: IfNotPresent
+  tag: "0.1.1"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# Leader election configuration
+leaderElection:
+  enabled: true
+
+# Metrics configuration
+metrics:
+  enabled: true
+  port: 8080
+
+# Health probe configuration
+health:
+  port: 8081
+
+# Logging configuration
+logging:
+  level: info  # debug, info, warn, error
+  format: json  # json, console
+
+# Extra environment variables for the operator pod
+# Use this for credentialsFromEnv in DBCluster resources
+extraEnv: []
+# Example:
+#   - name: AURORA_USERNAME
+#     valueFrom:
+#       secretKeyRef:
+#         name: aurora-credentials
+#         key: username
+#   - name: AURORA_PASSWORD
+#     valueFrom:
+#       secretKeyRef:
+#         name: aurora-credentials
+#         key: password
+

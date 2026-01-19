@@ -1,0 +1,157 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: databaseusers.dbtether.io
+spec:
+  group: dbtether.io
+  names:
+    kind: DatabaseUser
+    listKind: DatabaseUserList
+    plural: databaseusers
+    singular: databaseuser
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.databaseName
+      name: Database
+      type: string
+    - jsonPath: .status.username
+      name: Username
+      type: string
+    - jsonPath: .spec.privileges
+      name: Privileges
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              additionalGrants:
+                items:
+                  properties:
+                    privileges:
+                      items:
+                        type: string
+                      minItems: 1
+                      type: array
+                    tables:
+                      items:
+                        type: string
+                      minItems: 1
+                      type: array
+                  required:
+                  - privileges
+                  - tables
+                  type: object
+                type: array
+              connectionLimit:
+                default: -1
+                minimum: -1
+                type: integer
+              databaseRef:
+                properties:
+                  name:
+                    type: string
+                  namespace:
+                    type: string
+                required:
+                - name
+                type: object
+              deletionPolicy:
+                default: Delete
+                enum:
+                - Delete
+                - Retain
+                type: string
+              password:
+                properties:
+                  length:
+                    default: 16
+                    maximum: 64
+                    minimum: 12
+                    type: integer
+                type: object
+              privileges:
+                enum:
+                - readonly
+                - readwrite
+                - admin
+                type: string
+              rotation:
+                properties:
+                  days:
+                    maximum: 365
+                    minimum: 1
+                    type: integer
+                required:
+                - days
+                type: object
+              username:
+                maxLength: 63
+                pattern: ^[a-z_][a-z0-9_]*$
+                type: string
+            required:
+            - databaseRef
+            - privileges
+            type: object
+          status:
+            properties:
+              clusterName:
+                type: string
+              databaseName:
+                type: string
+              message:
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              passwordUpdatedAt:
+                format: date-time
+                type: string
+              pendingSince:
+                format: date-time
+                type: string
+              phase:
+                enum:
+                - Pending
+                - Creating
+                - Ready
+                - Failed
+                type: string
+              secretName:
+                type: string
+              username:
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

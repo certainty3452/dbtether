@@ -1,0 +1,39 @@
+# Standard database - name derived from metadata.name (orders_db)
+apiVersion: dbtether.io/v1alpha1
+kind: Database
+metadata:
+  name: orders-db           # creates "orders_db" in PostgreSQL
+  namespace: team-alpha
+spec:
+  clusterRef:
+    name: microservices
+  extensions:
+    - uuid-ossp
+    - pg_trgm
+  deletionPolicy: Delete    # database will be dropped when resource is deleted
+---
+# Database with strict isolation (recommended for multi-tenant)
+apiVersion: dbtether.io/v1alpha1
+kind: Database
+metadata:
+  name: payments-db         # creates "payments_db" in PostgreSQL
+  namespace: team-alpha
+spec:
+  clusterRef:
+    name: microservices
+  extensions:
+    - uuid-ossp
+  deletionPolicy: Retain
+  revokePublicConnect: true
+---
+# Database on platform cluster with explicit name
+apiVersion: dbtether.io/v1alpha1
+kind: Database
+metadata:
+  name: backstage           # Kubernetes resource name
+  namespace: platform
+spec:
+  clusterRef:
+    name: platform
+  databaseName: backstage_production   # explicit PostgreSQL name
+  deletionPolicy: Retain

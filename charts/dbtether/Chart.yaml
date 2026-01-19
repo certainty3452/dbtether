@@ -1,0 +1,21 @@
+apiVersion: v2
+name: dbtether
+description: A Kubernetes operator for managing PostgreSQL databases in external clusters
+type: application
+version: 0.1.1
+appVersion: "0.1.1"
+keywords:
+  - postgresql
+  - postgres
+  - database
+  - operator
+  - kubernetes
+  - aurora
+  - rds
+  - dbtether
+maintainers:
+  - name: dbtether
+    url: https://github.com/certainty3452/dbtether
+sources:
+  - https://github.com/certainty3452/dbtether
+

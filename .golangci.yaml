@@ -1,0 +1,72 @@
+version: "2"
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+linters:
+  enable:
+    - staticcheck
+    - govet
+    - errcheck
+    - ineffassign
+    - misspell
+    - unconvert
+    - gocyclo
+    - funlen
+    - nestif
+    - gosec
+    - prealloc
+    - gocritic
+    - revive
+    - unused
+
+  settings:
+    gocyclo:
+      min-complexity: 15
+
+    funlen:
+      lines: 100
+      statements: 50
+
+    nestif:
+      min-complexity: 5
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: error-return
+        - name: error-strings
+        - name: increment-decrement
+        - name: var-naming
+        - name: package-comments
+          disabled: true
+        - name: exported
+          disabled: true
+
+    gosec:
+      excludes:
+        - G104
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - funlen
+        - gosec
+
+    - path: zz_generated\.deepcopy\.go
+      linters:
+        - all
