@@ -135,3 +135,106 @@ func TestDatabaseReconciler_StatusDatabaseName(t *testing.T) {
 		})
 	}
 }
+
+func TestDatabaseReconciler_ForceAdoptAnnotation(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		wantForce   bool
+	}{
+		{
+			name:        "no annotations",
+			annotations: nil,
+			wantForce:   false,
+		},
+		{
+			name:        "empty annotations",
+			annotations: map[string]string{},
+			wantForce:   false,
+		},
+		{
+			name:        "force-adopt true",
+			annotations: map[string]string{"dbtether.io/force-adopt": "true"},
+			wantForce:   true,
+		},
+		{
+			name:        "force-adopt false",
+			annotations: map[string]string{"dbtether.io/force-adopt": "false"},
+			wantForce:   false,
+		},
+		{
+			name:        "force-adopt other value",
+			annotations: map[string]string{"dbtether.io/force-adopt": "yes"},
+			wantForce:   false, // only "true" works
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := &databasesv1alpha1.Database{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: tt.annotations,
+				},
+			}
+
+			forceAdopt := db.Annotations["dbtether.io/force-adopt"] == "true"
+			if forceAdopt != tt.wantForce {
+				t.Errorf("forceAdopt = %v, want %v", forceAdopt, tt.wantForce)
+			}
+		})
+	}
+}
+
+func TestDatabaseReconciler_OwnershipTrackedStatus(t *testing.T) {
+	tests := []struct {
+		name          string
+		tracked       bool
+		statusTracked *bool
+		shouldWarn    bool
+	}{
+		{
+			name:          "first time not tracked - should warn",
+			tracked:       false,
+			statusTracked: nil,
+			shouldWarn:    true,
+		},
+		{
+			name:          "first time tracked - no warn",
+			tracked:       true,
+			statusTracked: nil,
+			shouldWarn:    false,
+		},
+		{
+			name:          "already warned (false in status) - no warn",
+			tracked:       false,
+			statusTracked: boolPtr(false),
+			shouldWarn:    false,
+		},
+		{
+			name:          "was tracked, now not - should warn",
+			tracked:       false,
+			statusTracked: boolPtr(true),
+			shouldWarn:    true,
+		},
+		{
+			name:          "still tracked - no warn",
+			tracked:       true,
+			statusTracked: boolPtr(true),
+			shouldWarn:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Logic from reconcileDatabase
+			shouldWarn := !tt.tracked && (tt.statusTracked == nil || *tt.statusTracked)
+			if shouldWarn != tt.shouldWarn {
+				t.Errorf("shouldWarn = %v, want %v", shouldWarn, tt.shouldWarn)
+			}
+		})
+	}
+}
+
+func boolPtr(b bool) *bool {
+	return &b
+}

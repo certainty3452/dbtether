@@ -7,6 +7,8 @@
 | [DBCluster](crds/dbcluster.md) | Cluster | External PostgreSQL cluster (Aurora, RDS, self-hosted) |
 | [Database](crds/database.md) | Namespaced | Database within a DBCluster |
 | [DatabaseUser](crds/databaseuser.md) | Namespaced | PostgreSQL user with specific privileges |
+| [BackupStorage](crds/backupstorage.md) | Cluster | Storage destination for backups (S3, GCS, Azure) |
+| [Backup](crds/backup.md) | Namespaced | One-time database backup operation |
 
 ## Quick Start
 
@@ -74,44 +76,44 @@ kubectl get database -A
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Kubernetes Cluster                         │
-│                                                                  │
-│  ┌──────────────────┐     ┌──────────────────────────────────┐  │
-│  │   DBCluster      │     │        Database                  │  │
-│  │   (cluster-wide) │     │        (namespaced)              │  │
-│  │                  │     │                                   │  │
-│  │  name: prod      │◄────│  clusterRef: prod                │  │
-│  │  endpoint: ...   │     │  databaseName: my_app            │  │
-│  │  credentials: ...│     │  extensions: [uuid-ossp]         │  │
-│  └────────┬─────────┘     │  deletionPolicy: Retain          │  │
-│           │               └──────────────────────────────────┘  │
-│           │                                                      │
-│  ┌────────▼─────────┐                                           │
-│  │  Operator Pod    │                                           │
-│  │                  │                                           │
-│  │  - DBCluster     │                                           │
-│  │    Controller    │                                           │
-│  │  - Database      │                                           │
-│  │    Controller    │                                           │
-│  │  - Connection    │                                           │
-│  │    Pool          │                                           │
-│  └────────┬─────────┘                                           │
-│           │                                                      │
-└───────────┼──────────────────────────────────────────────────────┘
-            │
-            │ TCP/5432 (TLS)
-            │
-┌───────────▼──────────────────────────────────────────────────────┐
-│                    External PostgreSQL                            │
-│                    (Aurora, RDS, self-hosted)                     │
-│                                                                   │
-│   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
-│   │  my_app     │  │  other_db   │  │  postgres   │              │
-│   │  (created)  │  │             │  │  (system)   │              │
-│   └─────────────┘  └─────────────┘  └─────────────┘              │
-│                                                                   │
-└───────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              Kubernetes Cluster                               │
+│                                                                               │
+│  ┌────────────────────┐  ┌─────────────────────┐  ┌───────────────────────┐  │
+│  │ DBCluster (cluster)│  │ BackupStorage       │  │ Backup (namespaced)   │  │
+│  │                    │  │ (cluster)           │  │                       │  │
+│  │ name: prod         │  │                     │  │ databaseRef: my-app   │  │
+│  │ endpoint: ...      │  │ s3:                 │  │ storageRef: s3-backup │  │
+│  │ credentials: ...   │  │   bucket: backups   │  └───────────┬───────────┘  │
+│  └────────┬───────────┘  │   region: eu-ctr-1  │              │              │
+│           │              └─────────┬───────────┘              │              │
+│           │                        │                          │              │
+│  ┌────────▼────────────────────────▼──────────────────────────▼───────────┐  │
+│  │                         Operator Pod                                    │  │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌────────────┐ ┌─────────────────┐  │  │
+│  │  │ DBCluster    │ │ Database     │ │ Backup     │ │ BackupStorage   │  │  │
+│  │  │ Controller   │ │ Controller   │ │ Controller │ │ Controller      │  │  │
+│  │  └──────────────┘ └──────────────┘ └─────┬──────┘ └─────────────────┘  │  │
+│  └───────────┬───────────────────────────────┼────────────────────────────┘  │
+│              │                               │                                │
+│              │                      ┌────────▼────────┐                      │
+│              │                      │   Backup Job    │                      │
+│              │                      │   (pg_dump →    │                      │
+│              │                      │    gzip → S3)   │                      │
+│              │                      └────────┬────────┘                      │
+└──────────────┼───────────────────────────────┼───────────────────────────────┘
+               │                               │
+               │ TCP/5432 (TLS)                │ HTTPS (S3 API)
+               │                               │
+┌──────────────▼─────────────────┐   ┌─────────▼─────────────────────────────┐
+│   External PostgreSQL          │   │           Cloud Storage               │
+│   (Aurora, RDS, self-hosted)   │   │        (S3, GCS, Azure Blob)          │
+│                                │   │                                        │
+│   ┌──────────┐  ┌──────────┐   │   │  ┌────────────────────────────────┐   │
+│   │  my_app  │  │ postgres │   │   │  │ prod/my_app/20260120-143022.gz │   │
+│   │          │  │ (system) │   │   │  └────────────────────────────────┘   │
+│   └──────────┘  └──────────┘   │   │                                        │
+└────────────────────────────────┘   └────────────────────────────────────────┘
 ```
 
 ## Deletion Policies
@@ -123,7 +125,10 @@ kubectl get database -A
 
 ## Roadmap
 
-- [ ] **DatabaseUser** — create users with different privileges
-- [ ] **Access Control** — team-based access via Validating Webhook
-- [ ] **Backup/Restore** — pg_dump to S3, scheduled backups
-- [ ] **ESO Integration** — push credentials to AWS Secrets Manager
+See [ROADMAP.md](../ROADMAP.md) for full roadmap.
+
+**Next up:**
+- [ ] BackupSchedule — cron-based scheduled backups with retention policy
+- [ ] Restore — restore from backup with conflict handling
+- [ ] GCS and Azure storage providers
+- [ ] Multi-database user access

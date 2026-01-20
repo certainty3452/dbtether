@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
@@ -9,6 +10,7 @@ import (
 type MockClient struct {
 	mu         sync.RWMutex
 	databases  map[string]bool
+	dbOwners   map[string]string   // database -> "namespace/name"
 	extensions map[string][]string // database -> extensions
 	users      map[string]string   // username -> password
 
@@ -20,6 +22,7 @@ type MockClient struct {
 func NewMockClient() *MockClient {
 	return &MockClient{
 		databases:  make(map[string]bool),
+		dbOwners:   make(map[string]string),
 		extensions: make(map[string][]string),
 		users:      make(map[string]string),
 		Version:    "PostgreSQL 16.0 (mock)",
@@ -51,25 +54,82 @@ func (m *MockClient) DatabaseExists(ctx context.Context, name string) (bool, err
 	return m.databases[name], nil
 }
 
-func (m *MockClient) CreateDatabase(ctx context.Context, name string) error {
+func (m *MockClient) CreateDatabaseWithOwner(ctx context.Context, name, ownerNamespace, ownerName string) error {
 	if m.ShouldFail {
 		return m.FailError
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.databases[name] = true
+	m.dbOwners[name] = ownerNamespace + "/" + ownerName
 	return nil
 }
 
-func (m *MockClient) EnsureDatabase(ctx context.Context, name string) error {
-	exists, err := m.DatabaseExists(ctx, name)
-	if err != nil {
-		return err
+func (m *MockClient) GetDatabaseOwner(ctx context.Context, name string) (namespace, resourceName string, err error) {
+	if m.ShouldFail {
+		return "", "", m.FailError
 	}
-	if exists {
-		return nil
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	owner := m.dbOwners[name]
+	if owner == "" {
+		return "", "", nil
 	}
-	return m.CreateDatabase(ctx, name)
+	parts := splitOwner(owner)
+	return parts[0], parts[1], nil
+}
+
+func splitOwner(owner string) [2]string {
+	for i := range owner {
+		if owner[i] == '/' {
+			return [2]string{owner[:i], owner[i+1:]}
+		}
+	}
+	return [2]string{"", owner}
+}
+
+func (m *MockClient) EnsureDatabaseWithOwner(ctx context.Context, name, ownerNamespace, ownerName string, forceAdopt bool) (bool, error) {
+	m.mu.RLock()
+	exists := m.databases[name]
+	currentOwner := m.dbOwners[name]
+	m.mu.RUnlock()
+
+	if m.ShouldFail {
+		return false, m.FailError
+	}
+
+	if !exists {
+		err := m.CreateDatabaseWithOwner(ctx, name, ownerNamespace, ownerName)
+		return err == nil, err
+	}
+
+	expectedOwner := ownerNamespace + "/" + ownerName
+
+	// Force adopt or no owner — claim it
+	if currentOwner == "" || forceAdopt {
+		m.mu.Lock()
+		m.dbOwners[name] = expectedOwner
+		m.mu.Unlock()
+		return true, nil // mock always succeeds at tracking
+	}
+
+	// Check if we are the owner
+	if currentOwner != expectedOwner {
+		return false, fmt.Errorf("database %s is owned by %s, cannot be claimed by %s (use annotation dbtether.io/force-adopt to override)",
+			name, currentOwner, expectedOwner)
+	}
+
+	return true, nil
+}
+
+func (m *MockClient) ClearDatabaseOwner(ctx context.Context, name string) error {
+	if m.ShouldFail {
+		return m.FailError
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.dbOwners, name)
+	return nil
 }
 
 func (m *MockClient) DropDatabase(ctx context.Context, name string) error {

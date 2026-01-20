@@ -37,6 +37,9 @@ type DatabaseStatus struct {
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`
 	DatabaseName       string             `json:"databaseName,omitempty"`
 	PendingSince       *metav1.Time       `json:"pendingSince,omitempty"`
+	// OwnershipTracked indicates if the operator was able to set ownership comment on the database.
+	// For legacy databases owned by other PostgreSQL users, this may be false.
+	OwnershipTracked *bool `json:"ownershipTracked,omitempty"`
 }
 
 // +kubebuilder:object:root=true

@@ -86,6 +86,67 @@ rules:
       - databaseusers/finalizers
     verbs:
       - update
+  # BackupStorage permissions
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - backupstorages
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - backupstorages/status
+    verbs:
+      - get
+      - patch
+      - update
+  # Backup permissions
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - backups
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - backups/status
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - backups/finalizers
+    verbs:
+      - update
+  # Job permissions (for backup jobs)
+  - apiGroups:
+      - batch
+    resources:
+      - jobs
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
   # Secret permissions (read + write for DatabaseUser credentials)
   - apiGroups:
       - ""

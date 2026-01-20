@@ -5,7 +5,7 @@ replicaCount: 1
 image:
   repository: certainty3452/dbtether
   pullPolicy: IfNotPresent
-  tag: "0.1.1"
+  tag: "0.2.4"
 
 imagePullSecrets: []
 nameOverride: ""
@@ -76,4 +76,3 @@ extraEnv: []
 #       secretKeyRef:
 #         name: aurora-credentials
 #         key: password
-

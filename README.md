@@ -15,9 +15,11 @@ When building a platform on Kubernetes, I faced a common dilemma with database p
 - **CloudNativePG** creates databases inside the Kubernetes cluster, requiring PV/PVC management and adding operational complexity
 - **Crossplane** provisions separate database instances per resource, which becomes expensive when you just need multiple databases in a shared cluster
 
-I was looking for a middle ground: delegate **cluster provisioning** to infrastructure (Terraform, AWS Console, etc.) while giving **developers self-service** for databases and users via GitOps.
+Both are great tools designed for **isolated environments** — separate clusters or instances per team. But I was building a platform where **separation of concerns** mattered more than isolation: infrastructure team provisions shared Aurora clusters via Terraform, developers manage their own databases and users via GitOps.
 
-This operator fills that gap. It connects to existing PostgreSQL-compatible clusters (AWS Aurora, RDS, or self-hosted) and manages databases and users declaratively through CRDs. Combined with ArgoCD, developers can provision databases via pull requests - or even expose it through a Helm chart if you're feeling adventurous.
+I needed **manageability**, not isolation. A simple way for developers to self-serve databases without tickets or manual SQL, while infrastructure controls the underlying clusters.
+
+This operator fills that gap. It connects to existing PostgreSQL-compatible clusters (AWS Aurora, RDS, or self-hosted) and manages databases and users declaratively through CRDs. Perfect for Helm charts that need a database, Backstage templates for self-service portals, or ArgoCD workflows where databases are provisioned via pull requests.
 
 As a GitOps enthusiast, this operator fits perfectly into my workflow. I hope it helps others facing the same challenge.
 
@@ -26,7 +28,8 @@ As a GitOps enthusiast, this operator fits perfectly into my workflow. I hope it
 - **Manage RDS/Aurora from Kubernetes** - connect to existing AWS database clusters and create databases via CRDs
 - **Self-service database provisioning** - developers request databases via pull requests, platform team approves, GitOps applies
 - **Multi-tenant database management** - one Aurora cluster, multiple databases with isolated users per team/namespace
-- **Database-as-Code with ArgoCD** - declarative database and user management synced from Git
+- **Database-as-Code with ArgoCD / Flux** - declarative database and user management synced from Git
+- **Ephemeral environments** - spin up isolated databases for preview/feature branches via Helm charts, auto-cleanup on teardown
 
 ## Features
 
@@ -152,6 +155,8 @@ See full documentation in [docs/](docs/README.md):
 | [DBCluster](docs/crds/dbcluster.md) | Cluster | External PostgreSQL cluster connection |
 | [Database](docs/crds/database.md) | Namespaced | Database within a DBCluster |
 | [DatabaseUser](docs/crds/databaseuser.md) | Namespaced | PostgreSQL user with privileges |
+| BackupStorage | Cluster | S3/GCS/Azure storage configuration |
+| Backup | Namespaced | One-time database backup |
 
 ### Quick Reference
 
@@ -171,6 +176,18 @@ See full documentation in [docs/](docs/README.md):
 - `spec.privileges` - `readonly`, `readwrite`, or `admin` (required)
 - `spec.username` - PostgreSQL username (defaults to metadata.name)
 - `spec.password.length` - Password length (default 16, range 12-64)
+
+**BackupStorage:**
+- `spec.s3.bucket` - S3 bucket name (required for S3)
+- `spec.s3.region` - AWS region (required for S3)
+- `spec.pathTemplate` - Path template (default: `{{ .ClusterName }}/{{ .DatabaseName }}`)
+- `spec.credentialsSecretRef` - Optional, uses IRSA/Pod Identity if omitted
+
+**Backup:**
+- `spec.databaseRef.name` - Name of Database to backup (required)
+- `spec.storageRef.name` - Name of BackupStorage (required)
+- `spec.filenameTemplate` - Filename template (default: `{{ .Timestamp }}.sql.gz`)
+- `spec.ttlAfterCompletion` - Job auto-cleanup duration (default: 1h)
 
 ## Development
 
@@ -204,74 +221,13 @@ make test-envtest
 
 ## Roadmap
 
-### User & Password Management
-- [ ] Customizable secret keys via `spec.secretTemplate` (choose between `DATABASE_*`, `DB_*`, or custom keys)
+See [ROADMAP.md](ROADMAP.md) for planned features:
 
-### Database Features
-- [ ] Database owner via `spec.owner` (reference to DatabaseUser)
-- [ ] Database templates via `spec.template` (for encoding/collation)
-- [ ] Schema management via `spec.schemas` (create additional schemas beyond public)
-- [ ] Deletion protection via `spec.deletionProtection`
-
-### Observability
-- [ ] Periodic drift detection for Database/DatabaseUser - detect if resources were deleted externally and update status
-
-### Access Control & Security
-
-**Namespace Isolation (recommended)**
-- [ ] `spec.allowedNamespaces` on DBCluster - explicit list of namespaces that can reference this cluster
-- [ ] `spec.namespaceSelector` on DBCluster - label selector for allowed namespaces (e.g., `team=backend`)
-- [ ] Validating Webhook to enforce namespace restrictions when creating Database/DatabaseUser
-
-**Authentication Improvements (optional, for sensitive data)**
-- [ ] AWS IAM Authentication for RDS/Aurora - use AWS IAM roles instead of long-lived passwords. Operator gets temporary credentials via IRSA (IAM Roles for Service Accounts). Eliminates secret sprawl, enables CloudTrail audit.
-- [ ] Azure AD Authentication for Azure Database for PostgreSQL - use managed identities
-- [ ] GCP IAM Authentication for Cloud SQL - use Workload Identity
-
-### Database Import
-- [ ] Adopt existing databases via `spec.adopt: true` - safely take over management of existing databases without recreating them
-
-### Backup/Restore
-
-Architecture: separate image for backup runner (resource isolation, pg_dump tools)
-
-```
-dbtether              postgres-db-backup (separate image)
-├── Backup Controller             └── pg_dump + S3 upload
-│   └── creates Job/CronJob ──────► runs backup
-```
-
-- [ ] DatabaseBackup CRD for on-demand and scheduled backups
-- [ ] `postgres-db-backup` image with pg_dump and aws cli
-- [ ] S3 upload with configurable retention
-- [ ] DatabaseRestore CRD for point-in-time recovery
-
-### Secret Management Integrations
-
-Goal: Allow storing credentials in external secret stores instead of (or in addition to) Kubernetes Secrets.
-
-**Option A: Direct write to secret store**
-- [ ] AWS Secrets Manager integration via `spec.secretStore.aws`
-- [ ] Google Cloud Secret Manager integration via `spec.secretStore.gcp`
-- [ ] Azure Key Vault integration via `spec.secretStore.azure`
-- [ ] HashiCorp Vault integration via `spec.secretStore.vault`
-
-**Option B: External Secrets Operator (ESO) integration**
-- [ ] Create `PushSecret` resource for ESO to sync to external store
-- [ ] Support `ExternalSecret` pattern (operator creates secret in store, ESO syncs back to K8s)
-
-```yaml
-# Example future API
-spec:
-  secretStore:
-    type: aws-secretsmanager  # or vault, kubernetes (default)
-    aws:
-      secretName: /myapp/db-credentials
-      region: eu-west-1
-```
-
-### Future Ideas
-- [ ] DatabaseSession CRD - temporary proxy pods for local database access with TTL
+- **Backup & Restore** — scheduled backups, retention policy, restore CRD
+- **User & Password Management** — customizable secrets, multi-database access
+- **Database Features** — owner, templates, schemas, deletion protection
+- **Access Control** — namespace isolation, validating webhook, IAM authentication
+- **Secret Management** — AWS Secrets Manager, Vault, ESO integration
 
 ## Contributing
 

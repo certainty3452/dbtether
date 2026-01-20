@@ -17,8 +17,22 @@ rules:
   - update
   - watch
 - apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - dbtether.io
   resources:
+  - backups
+  - backupstorages
   - databases
   - databaseusers
   - dbclusters
@@ -33,6 +47,8 @@ rules:
 - apiGroups:
   - dbtether.io
   resources:
+  - backups/finalizers
+  - backupstorages/finalizers
   - databases/finalizers
   - databaseusers/finalizers
   - dbclusters/finalizers
@@ -41,6 +57,8 @@ rules:
 - apiGroups:
   - dbtether.io
   resources:
+  - backups/status
+  - backupstorages/status
   - databases/status
   - databaseusers/status
   - dbclusters/status

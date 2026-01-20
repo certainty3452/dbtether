@@ -1,0 +1,41 @@
+# Manual backup - creates a one-time backup job
+# Result path: s3://bucket/microservices/orders_db/20260119-143022.sql.gz
+apiVersion: dbtether.io/v1alpha1
+kind: Backup
+metadata:
+  name: orders-backup-20260119
+  namespace: team-alpha
+spec:
+  databaseRef:
+    name: orders-db
+  storageRef:
+    name: company-s3
+  # Default filenameTemplate: "{{ .Timestamp }}.sql.gz"
+  # Available template variables:
+  #   {{ .ClusterName }}  - DBCluster name
+  #   {{ .DatabaseName }} - Database name
+  #   {{ .Year }}         - 4-digit year (2026)
+  #   {{ .Month }}        - 2-digit month (01-12)
+  #   {{ .Day }}          - 2-digit day (01-31)
+  #   {{ .Timestamp }}    - Full timestamp (20260119-143022)
+  #   {{ .RunID }}        - 8-char unique identifier for this backup run
+  #
+  # Custom example with RunID:
+  # filenameTemplate: "{{ .DatabaseName }}_{{ .Timestamp }}_{{ .RunID }}.sql.gz"
+  #
+  # Optional: auto-delete Job after completion (default: 1h)
+  # ttlAfterCompletion: 24h
+---
+# Backup with custom TTL
+apiVersion: dbtether.io/v1alpha1
+kind: Backup
+metadata:
+  name: orders-backup-keep-longer
+  namespace: team-alpha
+spec:
+  databaseRef:
+    name: orders-db
+  storageRef:
+    name: company-s3
+  filenameTemplate: "{{ .DatabaseName }}_{{ .RunID }}.sql.gz"
+  ttlAfterCompletion: 168h  # Keep Job for 1 week

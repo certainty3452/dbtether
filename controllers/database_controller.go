@@ -107,9 +107,20 @@ func (r *DatabaseReconciler) reconcileDatabase(ctx context.Context, db *database
 		return ctrl.Result{}, err
 	}
 
-	if err := r.ensureDatabase(ctx, db, pgClient); err != nil {
+	ownershipTracked, err := r.ensureDatabase(ctx, db, pgClient)
+	if err != nil {
 		return r.handleDatabaseError(ctx, db, err)
 	}
+
+	// Log warning once if ownership tracking failed (legacy database not owned by operator)
+	if !ownershipTracked && (db.Status.OwnershipTracked == nil || *db.Status.OwnershipTracked) {
+		log.FromContext(ctx).Info("WARNING: database ownership tracking not available (legacy database not owned by operator's PostgreSQL user). "+
+			"Multiple Database CRDs may reference this database without conflict detection. "+
+			"To enable tracking, change PostgreSQL owner: ALTER DATABASE <name> OWNER TO <operator_user>",
+			"database", r.getDatabaseName(db))
+	}
+	// Update ownership tracked status
+	db.Status.OwnershipTracked = &ownershipTracked
 
 	if err := r.ensureExtensions(ctx, db, pgClient); err != nil {
 		return r.setStatus(ctx, db, "Failed", fmt.Sprintf("failed to create extensions: %s", err.Error()))
@@ -127,10 +138,18 @@ func (r *DatabaseReconciler) ensureCreatingStatus(ctx context.Context, db *datab
 	return err
 }
 
-func (r *DatabaseReconciler) ensureDatabase(ctx context.Context, db *databasesv1alpha1.Database, pgClient postgres.ClientInterface) error {
+const forceAdoptAnnotation = "dbtether.io/force-adopt"
+
+func (r *DatabaseReconciler) ensureDatabase(ctx context.Context, db *databasesv1alpha1.Database, pgClient postgres.ClientInterface) (ownershipTracked bool, err error) {
 	dbName := r.getDatabaseName(db)
-	if err := pgClient.EnsureDatabase(ctx, dbName); err != nil {
-		return err
+
+	// Check for force-adopt annotation
+	forceAdopt := db.Annotations[forceAdoptAnnotation] == "true"
+
+	// Use ownership tracking to prevent conflicts across namespaces
+	ownershipTracked, err = pgClient.EnsureDatabaseWithOwner(ctx, dbName, db.Namespace, db.Name, forceAdopt)
+	if err != nil {
+		return false, err
 	}
 
 	if db.Spec.RevokePublicConnect {
@@ -139,7 +158,7 @@ func (r *DatabaseReconciler) ensureDatabase(ctx context.Context, db *databasesv1
 		}
 	}
 
-	return nil
+	return ownershipTracked, nil
 }
 
 func (r *DatabaseReconciler) ensureExtensions(ctx context.Context, db *databasesv1alpha1.Database, pgClient postgres.ClientInterface) error {
@@ -173,6 +192,11 @@ func (r *DatabaseReconciler) handleDeletion(ctx context.Context, db *databasesv1
 		if err := r.dropDatabaseIfPossible(ctx, db); err != nil {
 			logger.Error(err, "failed to drop database during deletion")
 		}
+	} else {
+		// Retain: clear ownership so database can be re-adopted
+		if err := r.clearDatabaseOwnerIfPossible(ctx, db); err != nil {
+			logger.Error(err, "failed to clear database ownership during retention")
+		}
 	}
 
 	controllerutil.RemoveFinalizer(db, FinalizerName)
@@ -199,6 +223,28 @@ func (r *DatabaseReconciler) dropDatabaseIfPossible(ctx context.Context, db *dat
 	dbName := r.getDatabaseName(db)
 	logger.Info("dropping database", "database", dbName)
 	return pgClient.DropDatabase(ctx, dbName)
+}
+
+func (r *DatabaseReconciler) clearDatabaseOwnerIfPossible(ctx context.Context, db *databasesv1alpha1.Database) error {
+	logger := log.FromContext(ctx)
+
+	var cluster databasesv1alpha1.DBCluster
+	if err := r.Get(ctx, types.NamespacedName{Name: db.Spec.ClusterRef.Name}, &cluster); err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("cluster not found, skipping ownership clear")
+			return nil
+		}
+		return err
+	}
+
+	pgClient, err := r.getPostgresClient(ctx, &cluster)
+	if err != nil {
+		return fmt.Errorf("failed to get postgres client: %w", err)
+	}
+
+	dbName := r.getDatabaseName(db)
+	logger.Info("clearing database ownership for re-adoption", "database", dbName)
+	return pgClient.ClearDatabaseOwner(ctx, dbName)
 }
 
 func (r *DatabaseReconciler) getPostgresClient(ctx context.Context, cluster *databasesv1alpha1.DBCluster) (postgres.ClientInterface, error) {

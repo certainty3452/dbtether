@@ -37,3 +37,19 @@ spec:
     name: platform
   databaseName: backstage_production   # explicit PostgreSQL name
   deletionPolicy: Retain
+---
+# Import existing database (created outside the operator)
+# Use force-adopt annotation if database is already owned by another CRD
+apiVersion: dbtether.io/v1alpha1
+kind: Database
+metadata:
+  name: legacy-app-db
+  namespace: migrations
+  annotations:
+    # Uncomment to forcefully claim ownership from another CRD:
+    # dbtether.io/force-adopt: "true"
+spec:
+  clusterRef:
+    name: microservices
+  databaseName: legacy_application  # existing database name in PostgreSQL
+  deletionPolicy: Retain            # never drop the database

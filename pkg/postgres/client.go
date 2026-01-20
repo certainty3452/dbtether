@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,8 +31,10 @@ type ClientInterface interface {
 	Ping(ctx context.Context) error
 	GetVersion(ctx context.Context) (string, error)
 	DatabaseExists(ctx context.Context, name string) (bool, error)
-	CreateDatabase(ctx context.Context, name string) error
-	EnsureDatabase(ctx context.Context, name string) error
+	CreateDatabaseWithOwner(ctx context.Context, name, ownerNamespace, ownerName string) error
+	EnsureDatabaseWithOwner(ctx context.Context, name, ownerNamespace, ownerName string, forceAdopt bool) (ownershipTracked bool, err error)
+	GetDatabaseOwner(ctx context.Context, name string) (namespace, resourceName string, err error)
+	ClearDatabaseOwner(ctx context.Context, name string) error
 	DropDatabase(ctx context.Context, name string) error
 	RevokePublicConnect(ctx context.Context, name string) error
 	CreateExtension(ctx context.Context, dbName, extensionName string) error
@@ -179,13 +182,56 @@ func (c *Client) DatabaseExists(ctx context.Context, name string) (bool, error) 
 	return exists, nil
 }
 
-func (c *Client) CreateDatabase(ctx context.Context, name string) error {
+// ownerComment formats the ownership comment for database metadata
+func ownerComment(namespace, name string) string {
+	return fmt.Sprintf("dbtether:%s/%s", namespace, name)
+}
+
+// parseOwnerComment extracts namespace and name from ownership comment
+func parseOwnerComment(comment string) (namespace, name string, ok bool) {
+	if !strings.HasPrefix(comment, "dbtether:") {
+		return "", "", false
+	}
+	parts := strings.SplitN(strings.TrimPrefix(comment, "dbtether:"), "/", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+func (c *Client) CreateDatabaseWithOwner(ctx context.Context, name, ownerNamespace, ownerName string) error {
 	query := fmt.Sprintf("CREATE DATABASE %s", pq.QuoteIdentifier(name))
 	_, err := c.pool.Exec(ctx, query)
 	if err != nil {
 		return fmt.Errorf("failed to create database %s: %w", name, err)
 	}
+
+	// Set ownership comment (best-effort — should work for newly created databases)
+	comment := ownerComment(ownerNamespace, ownerName)
+	commentQuery := fmt.Sprintf("COMMENT ON DATABASE %s IS %s",
+		pq.QuoteIdentifier(name), pq.QuoteLiteral(comment))
+	// Ignore error — ownership tracking is optional enhancement
+	_, _ = c.pool.Exec(ctx, commentQuery)
+
 	return nil
+}
+
+func (c *Client) GetDatabaseOwner(ctx context.Context, name string) (namespace, resourceName string, err error) {
+	query := `SELECT COALESCE(description, '') FROM pg_database d 
+		LEFT JOIN pg_shdescription s ON d.oid = s.objoid 
+		WHERE datname = $1`
+	var comment string
+	if err := c.pool.QueryRow(ctx, query, name).Scan(&comment); err != nil {
+		return "", "", fmt.Errorf("failed to get database comment: %w", err)
+	}
+	if comment == "" {
+		return "", "", nil // no owner set (legacy database)
+	}
+	ns, n, ok := parseOwnerComment(comment)
+	if !ok {
+		return "", "", nil // comment exists but not in our format
+	}
+	return ns, n, nil
 }
 
 func (c *Client) RevokePublicConnect(ctx context.Context, name string) error {
@@ -197,15 +243,53 @@ func (c *Client) RevokePublicConnect(ctx context.Context, name string) error {
 	return nil
 }
 
-func (c *Client) EnsureDatabase(ctx context.Context, name string) error {
+func (c *Client) EnsureDatabaseWithOwner(ctx context.Context, name, ownerNamespace, ownerName string, forceAdopt bool) (ownershipTracked bool, err error) {
 	exists, err := c.DatabaseExists(ctx, name)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if exists {
-		return nil
+	if !exists {
+		err := c.CreateDatabaseWithOwner(ctx, name, ownerNamespace, ownerName)
+		return err == nil, err // new DB = ownership tracked if created successfully
 	}
-	return c.CreateDatabase(ctx, name)
+
+	// Database exists — check ownership
+	ns, n, err := c.GetDatabaseOwner(ctx, name)
+	if err != nil {
+		return false, err
+	}
+
+	expectedOwner := ownerComment(ownerNamespace, ownerName)
+
+	// No owner set (legacy) or forceAdopt — try to claim it (best-effort)
+	if ns == "" && n == "" || forceAdopt {
+		commentQuery := fmt.Sprintf("COMMENT ON DATABASE %s IS %s",
+			pq.QuoteIdentifier(name), pq.QuoteLiteral(expectedOwner))
+		if _, err := c.pool.Exec(ctx, commentQuery); err != nil {
+			// COMMENT requires being PostgreSQL owner of the database
+			// For legacy databases created by other users, this will fail — that's OK
+			// We continue without ownership tracking for such databases
+			return false, nil // best-effort: skip ownership tracking for legacy databases
+		}
+		return true, nil // ownership claimed successfully
+	}
+
+	// Check if we are the owner
+	if ns != ownerNamespace || n != ownerName {
+		return false, fmt.Errorf("database %s is owned by %s/%s, cannot be claimed by %s/%s (use annotation dbtether.io/force-adopt to override)",
+			name, ns, n, ownerNamespace, ownerName)
+	}
+
+	return true, nil // already owned by us
+}
+
+func (c *Client) ClearDatabaseOwner(ctx context.Context, name string) error {
+	// Set comment to NULL to release ownership
+	query := fmt.Sprintf("COMMENT ON DATABASE %s IS NULL", pq.QuoteIdentifier(name))
+	if _, err := c.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("failed to clear ownership of database %s: %w", name, err)
+	}
+	return nil
 }
 
 func (c *Client) DropDatabase(ctx context.Context, name string) error {

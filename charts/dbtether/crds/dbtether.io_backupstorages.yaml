@@ -1,0 +1,133 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: backupstorages.dbtether.io
+spec:
+  group: dbtether.io
+  names:
+    kind: BackupStorage
+    listKind: BackupStorageList
+    plural: backupstorages
+    shortNames:
+    - bs
+    singular: backupstorage
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.provider
+      name: Provider
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              azure:
+                description: Azure Blob storage configuration (mutually exclusive
+                  with s3 and gcs)
+                properties:
+                  container:
+                    type: string
+                  storageAccount:
+                    type: string
+                required:
+                - container
+                - storageAccount
+                type: object
+              credentialsSecretRef:
+                description: 'Optional: credentials secret reference. If not set,
+                  uses cloud-native auth (OIDC/Pod Identity)'
+                properties:
+                  name:
+                    type: string
+                  namespace:
+                    type: string
+                required:
+                - name
+                - namespace
+                type: object
+              gcs:
+                description: GCS storage configuration (mutually exclusive with s3
+                  and azure)
+                properties:
+                  bucket:
+                    type: string
+                  project:
+                    type: string
+                required:
+                - bucket
+                - project
+                type: object
+              pathTemplate:
+                default: '{{ .ClusterName }}/{{ .DatabaseName }}'
+                description: |-
+                  Path template for directory structure
+                  Available: .ClusterName, .DatabaseName, .Year, .Month, .Day
+                type: string
+              s3:
+                description: S3 storage configuration (mutually exclusive with gcs
+                  and azure)
+                properties:
+                  bucket:
+                    type: string
+                  endpoint:
+                    type: string
+                  region:
+                    type: string
+                required:
+                - bucket
+                - region
+                type: object
+            type: object
+          status:
+            properties:
+              lastValidation:
+                description: Last time the storage was validated
+                format: date-time
+                type: string
+              message:
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                enum:
+                - Ready
+                - Failed
+                type: string
+              provider:
+                description: Detected provider type (s3, gcs, azure)
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -1,0 +1,35 @@
+# AWS S3 storage with secret-based auth
+apiVersion: dbtether.io/v1alpha1
+kind: BackupStorage
+metadata:
+  name: company-s3
+spec:
+  s3:
+    bucket: my-company-backups
+    region: eu-central-1
+  # Default pathTemplate: "{{ .ClusterName }}/{{ .DatabaseName }}"
+  # Available template variables:
+  #   {{ .ClusterName }}  - DBCluster name
+  #   {{ .DatabaseName }} - Database name
+  #   {{ .Year }}         - 4-digit year (2026)
+  #   {{ .Month }}        - 2-digit month (01-12)
+  #   {{ .Day }}          - 2-digit day (01-31)
+  credentialsSecretRef:
+    name: s3-backup-credentials
+    namespace: dbtether
+---
+# AWS S3 storage with OIDC/Pod Identity (no credentials needed)
+# Recommended IAM permissions:
+#   s3:PutObject, s3:GetObject, s3:DeleteObject, s3:ListBucket
+#   s3:PutObjectTagging, s3:GetObjectTagging (optional, for metadata tags)
+apiVersion: dbtether.io/v1alpha1
+kind: BackupStorage
+metadata:
+  name: company-s3-oidc
+spec:
+  s3:
+    bucket: my-company-backups
+    region: eu-central-1
+  # Custom pathTemplate with date organization
+  pathTemplate: "{{ .ClusterName }}/{{ .Year }}/{{ .Month }}"
+  # No credentialsSecretRef = uses IRSA/Pod Identity

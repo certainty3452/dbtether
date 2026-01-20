@@ -36,6 +36,7 @@ spec:
             {{- end }}
             - --metrics-bind-address=:{{ .Values.metrics.port }}
             - --health-probe-bind-address=:{{ .Values.health.port }}
+            - --namespace={{ .Release.Namespace }}
           ports:
             - name: metrics
               containerPort: {{ .Values.metrics.port }}
@@ -55,10 +56,12 @@ spec:
               port: health
             initialDelaySeconds: 5
             periodSeconds: 10
-          {{- with .Values.extraEnv }}
           env:
+            - name: OPERATOR_IMAGE
+              value: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+            {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
-          {{- end }}
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:
@@ -76,4 +79,3 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       terminationGracePeriodSeconds: 10
-

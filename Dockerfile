@@ -20,14 +20,19 @@ COPY pkg/ pkg/
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -a -o manager main.go
 
-# Runtime stage
-FROM gcr.io/distroless/static:nonroot
+# Runtime stage with pg_dump
+FROM alpine:3.20
+
+# Install PostgreSQL client (pg_dump only, minimal)
+RUN apk add --no-cache postgresql16-client \
+    && rm -rf /var/cache/apk/*
 
 WORKDIR /
 
 COPY --from=builder /workspace/manager .
 
+# Run as non-root
+RUN adduser -D -u 65532 nonroot
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]
-

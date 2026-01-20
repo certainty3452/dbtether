@@ -141,6 +141,11 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              ownershipTracked:
+                description: |-
+                  OwnershipTracked indicates if the operator was able to set ownership comment on the database.
+                  For legacy databases owned by other PostgreSQL users, this may be false.
+                type: boolean
               pendingSince:
                 format: date-time
                 type: string
