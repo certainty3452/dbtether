@@ -39,6 +39,10 @@ As a GitOps enthusiast, this operator fits perfectly into my workflow. I hope it
 - **Password rotation** - automatic credential rotation with configurable schedule
 - **Database isolation** - users are granted access only to their assigned database (cannot query other databases)
 - **Configurable deletion policies** - choose between Retain (keep data) or Delete on resource removal
+- **Database backups** - one-time and scheduled backups with `pg_dump` → gzip → cloud storage
+- **Multi-cloud storage** - backup to AWS S3, Google Cloud Storage, or Azure Blob Storage
+- **Retention policies** - automatic cleanup with `keepLast`, `keepDaily`, `keepWeekly`, `keepMonthly`
+- **Cloud-native auth** - IRSA, Workload Identity, Managed Identity for secure storage access
 
 ## Installation
 
@@ -157,6 +161,7 @@ See full documentation in [docs/](docs/README.md):
 | [DatabaseUser](docs/crds/databaseuser.md) | Namespaced | PostgreSQL user with privileges |
 | BackupStorage | Cluster | S3/GCS/Azure storage configuration |
 | Backup | Namespaced | One-time database backup |
+| BackupSchedule | Namespaced | Scheduled backups with retention policy |
 
 ### Quick Reference
 
@@ -188,6 +193,14 @@ See full documentation in [docs/](docs/README.md):
 - `spec.storageRef.name` - Name of BackupStorage (required)
 - `spec.filenameTemplate` - Filename template (default: `{{ .Timestamp }}.sql.gz`)
 - `spec.ttlAfterCompletion` - Job auto-cleanup duration (default: 1h)
+
+**BackupSchedule:**
+- `spec.databaseRef.name` - Name of Database to backup (required)
+- `spec.storageRef.name` - Name of BackupStorage (required)
+- `spec.schedule` - Cron schedule, e.g., `0 2 * * *` for 2 AM daily (required)
+- `spec.retention.keepLast` - Keep N most recent backups
+- `spec.retention.keepDaily` - Keep daily backups for N days
+- `spec.suspend` - Pause scheduling
 
 ## Development
 
@@ -223,7 +236,7 @@ make test-envtest
 
 See [ROADMAP.md](ROADMAP.md) for planned features:
 
-- **Backup & Restore** — scheduled backups, retention policy, restore CRD
+- **Restore** — restore from backup with conflict handling
 - **User & Password Management** — customizable secrets, multi-database access
 - **Database Features** — owner, templates, schemas, deletion protection
 - **Access Control** — namespace isolation, validating webhook, IAM authentication

@@ -8,6 +8,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const (
+	testUserName   = "my-user"
+	testClusterRef = "my-cluster"
+)
+
 func TestDatabaseUserReconciler_GetUsername(t *testing.T) {
 	r := &DatabaseUserReconciler{}
 
@@ -17,8 +22,8 @@ func TestDatabaseUserReconciler_GetUsername(t *testing.T) {
 		metaName     string
 		want         string
 	}{
-		{"uses spec.username when set", "custom_user", "my-user", "custom_user"},
-		{"falls back to metadata.name with dash conversion", "", "my-user", "my_user"},
+		{"uses spec.username when set", "custom_user", testUserName, "custom_user"},
+		{"falls back to metadata.name with dash conversion", "", testUserName, "my_user"},
 		{"prefers spec.username", "explicit", "fallback", "explicit"},
 		{"converts multiple dashes", "", "my-app-user", "my_app_user"},
 		{"no conversion needed", "", "myuser", "myuser"},
@@ -112,7 +117,7 @@ func TestDatabaseUserReconciler_SecretName(t *testing.T) {
 		want     string
 	}{
 		{"simple", "myuser", "myuser-credentials"},
-		{"with-dashes", "my-user", "my-user-credentials"},
+		{"with-dashes", testUserName, "my-user-credentials"},
 	}
 
 	for _, tt := range tests {
@@ -618,9 +623,9 @@ func TestDatabaseUserReconciler_GetClusterFromStatus(t *testing.T) {
 	}{
 		{
 			name:              "uses status when populated",
-			statusClusterName: "my-cluster",
+			statusClusterName: testClusterRef,
 			statusDBName:      "my_database",
-			expectCluster:     "my-cluster",
+			expectCluster:     testClusterRef,
 			expectDB:          "my_database",
 		},
 		{
@@ -733,29 +738,29 @@ func simulatePendingTimeout(phase string, pendingSince, now *metav1.Time) string
 	return phase
 }
 
-func TestDatabaseUserReconciler_StatusParams(t *testing.T) {
+func TestDatabaseUserReconciler_StatusUpdate(t *testing.T) {
 	tests := []struct {
 		name         string
-		params       statusParams
+		update       statusUpdate
 		expectClear  bool
 		expectValues bool
 	}{
 		{
-			name: "status params are applied",
-			params: statusParams{
-				clusterName:  "my-cluster",
-				databaseName: "my_database",
-				username:     "my_user",
+			name: "status update fields are applied",
+			update: statusUpdate{
+				ClusterName:  testClusterRef,
+				DatabaseName: "my_database",
+				Username:     "my_user",
 			},
 			expectClear:  false,
 			expectValues: true,
 		},
 		{
-			name: "empty params don't overwrite",
-			params: statusParams{
-				clusterName:  "",
-				databaseName: "",
-				username:     "",
+			name: "empty fields don't overwrite",
+			update: statusUpdate{
+				ClusterName:  "",
+				DatabaseName: "",
+				Username:     "",
 			},
 			expectClear:  false,
 			expectValues: false,
@@ -768,26 +773,26 @@ func TestDatabaseUserReconciler_StatusParams(t *testing.T) {
 				Status: databasesv1alpha1.DatabaseUserStatus{},
 			}
 
-			// Simulate setStatus params logic
-			if tt.params.clusterName != "" {
-				user.Status.ClusterName = tt.params.clusterName
+			// Simulate applyStatusFields logic
+			if tt.update.ClusterName != "" {
+				user.Status.ClusterName = tt.update.ClusterName
 			}
-			if tt.params.databaseName != "" {
-				user.Status.DatabaseName = tt.params.databaseName
+			if tt.update.DatabaseName != "" {
+				user.Status.DatabaseName = tt.update.DatabaseName
 			}
-			if tt.params.username != "" {
-				user.Status.Username = tt.params.username
+			if tt.update.Username != "" {
+				user.Status.Username = tt.update.Username
 			}
 
 			if tt.expectValues {
-				if user.Status.ClusterName != tt.params.clusterName {
-					t.Errorf("ClusterName = %v, want %v", user.Status.ClusterName, tt.params.clusterName)
+				if user.Status.ClusterName != tt.update.ClusterName {
+					t.Errorf("ClusterName = %v, want %v", user.Status.ClusterName, tt.update.ClusterName)
 				}
-				if user.Status.DatabaseName != tt.params.databaseName {
-					t.Errorf("DatabaseName = %v, want %v", user.Status.DatabaseName, tt.params.databaseName)
+				if user.Status.DatabaseName != tt.update.DatabaseName {
+					t.Errorf("DatabaseName = %v, want %v", user.Status.DatabaseName, tt.update.DatabaseName)
 				}
-				if user.Status.Username != tt.params.username {
-					t.Errorf("Username = %v, want %v", user.Status.Username, tt.params.username)
+				if user.Status.Username != tt.update.Username {
+					t.Errorf("Username = %v, want %v", user.Status.Username, tt.update.Username)
 				}
 			}
 		})

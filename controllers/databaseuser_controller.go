@@ -133,32 +133,36 @@ func (r *DatabaseUserReconciler) getReadyDatabaseAndCluster(ctx context.Context,
 		Namespace: dbNamespace,
 	}, &db); err != nil {
 		if errors.IsNotFound(err) {
-			result, err := r.setStatusWithRequeue(ctx, user, "Pending",
-				fmt.Sprintf("waiting for Database '%s'", user.Spec.DatabaseRef.Name), "", 30*time.Second, false)
+			result, err := r.setStatus(ctx, user, &statusUpdate{
+				Phase: "Pending", Message: fmt.Sprintf("waiting for Database '%s'", user.Spec.DatabaseRef.Name), RequeueAfter: 30 * time.Second,
+			})
 			return nil, nil, &result, err
 		}
 		return nil, nil, &ctrl.Result{}, err
 	}
 
 	if db.Status.Phase != "Ready" {
-		result, err := r.setStatusWithRequeue(ctx, user, "Pending",
-			fmt.Sprintf("waiting for Database '%s' to be ready", db.Name), "", 20*time.Second, false)
+		result, err := r.setStatus(ctx, user, &statusUpdate{
+			Phase: "Pending", Message: fmt.Sprintf("waiting for Database '%s' to be ready", db.Name), RequeueAfter: 20 * time.Second,
+		})
 		return nil, nil, &result, err
 	}
 
 	var cluster databasesv1alpha1.DBCluster
 	if err := r.Get(ctx, types.NamespacedName{Name: db.Spec.ClusterRef.Name}, &cluster); err != nil {
 		if errors.IsNotFound(err) {
-			result, err := r.setStatusWithRequeue(ctx, user, "Pending",
-				fmt.Sprintf("waiting for DBCluster '%s'", db.Spec.ClusterRef.Name), "", 30*time.Second, false)
+			result, err := r.setStatus(ctx, user, &statusUpdate{
+				Phase: "Pending", Message: fmt.Sprintf("waiting for DBCluster '%s'", db.Spec.ClusterRef.Name), RequeueAfter: 30 * time.Second,
+			})
 			return nil, nil, &result, err
 		}
 		return nil, nil, &ctrl.Result{}, err
 	}
 
 	if cluster.Status.Phase != "Connected" {
-		result, err := r.setStatusWithRequeue(ctx, user, "Pending",
-			fmt.Sprintf("waiting for DBCluster '%s' to be connected", cluster.Name), "", 20*time.Second, false)
+		result, err := r.setStatus(ctx, user, &statusUpdate{
+			Phase: "Pending", Message: fmt.Sprintf("waiting for DBCluster '%s' to be connected", cluster.Name), RequeueAfter: 20 * time.Second,
+		})
 		return nil, nil, &result, err
 	}
 
@@ -173,43 +177,51 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 	databaseName := r.getDatabaseNameFromSpec(db)
 
 	// Status params for display fields
-	sp := statusParams{
-		clusterName:  cluster.Name,
-		databaseName: databaseName,
-		username:     username,
+	baseStatus := statusUpdate{
+		ClusterName:  cluster.Name,
+		DatabaseName: databaseName,
+		Username:     username,
 	}
 
 	pgClient, err := r.getPostgresClient(ctx, cluster)
 	if err != nil {
-		return r.setStatusWithRequeue(ctx, user, "Failed",
-			fmt.Sprintf("connection error: %s", err.Error()), "", 60*time.Second, false, sp)
+		baseStatus.Phase = "Failed"
+		baseStatus.Message = fmt.Sprintf("connection error: %s", err.Error())
+		baseStatus.RequeueAfter = 60 * time.Second
+		return r.setStatus(ctx, user, &baseStatus)
 	}
 
 	password, secretName, passwordChanged, err := r.ensureSecret(ctx, user, db, cluster, pgClient)
 	if err != nil {
-		return r.setStatus(ctx, user, "Failed", fmt.Sprintf("secret error: %s", err.Error()), "", false, sp)
+		baseStatus.Phase = "Failed"
+		baseStatus.Message = fmt.Sprintf("secret error: %s", err.Error())
+		return r.setStatus(ctx, user, &baseStatus)
 	}
 
 	if err := r.ensureUserInPostgres(ctx, pgClient, username, password); err != nil {
-		return r.setStatus(ctx, user, "Failed", err.Error(), secretName, false, sp)
+		baseStatus.Phase = "Failed"
+		baseStatus.Message = err.Error()
+		baseStatus.SecretName = secretName
+		return r.setStatus(ctx, user, &baseStatus)
 	}
 
 	if err := r.configureUserAccess(ctx, pgClient, user, db, username); err != nil {
-		return r.setStatus(ctx, user, "Failed", err.Error(), secretName, false, sp)
+		baseStatus.Phase = "Failed"
+		baseStatus.Message = err.Error()
+		baseStatus.SecretName = secretName
+		return r.setStatus(ctx, user, &baseStatus)
 	}
 
 	r.verifyIsolation(ctx, pgClient, username, databaseName)
 
 	logger.Info("user ready", "username", username, "privileges", user.Spec.Privileges)
 
-	// Schedule next rotation check if rotation is enabled
-	if requeue := r.calculateRequeueAfter(user); requeue > 0 {
-		return r.setStatusWithRequeue(ctx, user, "Ready",
-			fmt.Sprintf("user created with %s privileges", user.Spec.Privileges), secretName, requeue, passwordChanged, sp)
-	}
-
-	return r.setStatus(ctx, user, "Ready",
-		fmt.Sprintf("user created with %s privileges", user.Spec.Privileges), secretName, passwordChanged, sp)
+	baseStatus.Phase = "Ready"
+	baseStatus.Message = fmt.Sprintf("user created with %s privileges", user.Spec.Privileges)
+	baseStatus.SecretName = secretName
+	baseStatus.PasswordUpdated = passwordChanged
+	baseStatus.RequeueAfter = r.calculateRequeueAfter(user)
+	return r.setStatus(ctx, user, &baseStatus)
 }
 
 func (r *DatabaseUserReconciler) shouldRotatePassword(user *databasesv1alpha1.DatabaseUser) bool {
@@ -526,69 +538,70 @@ func (r *DatabaseUserReconciler) getPostgresClient(ctx context.Context, cluster 
 	})
 }
 
-type statusParams struct {
-	clusterName  string
-	databaseName string
-	username     string
+// statusUpdate contains all parameters for updating DatabaseUser status
+type statusUpdate struct {
+	Phase           string
+	Message         string
+	SecretName      string
+	PasswordUpdated bool
+	RequeueAfter    time.Duration
+	ClusterName     string
+	DatabaseName    string
+	Username        string
 }
 
-func (r *DatabaseUserReconciler) setStatus(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
-	phase, message, secretName string, passwordUpdated bool, params ...statusParams) (ctrl.Result, error) {
-
+func (r *DatabaseUserReconciler) setStatus(ctx context.Context, user *databasesv1alpha1.DatabaseUser, update *statusUpdate) (ctrl.Result, error) {
 	patch := client.MergeFrom(user.DeepCopy())
 
-	// Handle pending timeout: after 10 minutes, transition to Failed
-	if phase == "Pending" {
-		now := metav1.Now()
-		if user.Status.PendingSince == nil {
-			user.Status.PendingSince = &now
-		} else if now.Sub(user.Status.PendingSince.Time) > PendingTimeout {
-			phase = "Failed"
-			message = fmt.Sprintf("timeout: %s (pending for over 10 minutes)", message)
-		}
-	} else {
-		user.Status.PendingSince = nil
-	}
+	// Handle pending timeout
+	r.handlePendingTimeout(user, update)
 
-	user.Status.Phase = phase
-	user.Status.Message = message
+	user.Status.Phase = update.Phase
+	user.Status.Message = update.Message
 	user.Status.ObservedGeneration = user.Generation
 
-	// Set display fields AFTER DeepCopy so they appear in the patch
-	if len(params) > 0 {
-		p := params[0]
-		if p.clusterName != "" {
-			user.Status.ClusterName = p.clusterName
-		}
-		if p.databaseName != "" {
-			user.Status.DatabaseName = p.databaseName
-		}
-		if p.username != "" {
-			user.Status.Username = p.username
-		}
-	}
-
-	if secretName != "" {
-		user.Status.SecretName = secretName
-	}
-	if passwordUpdated || (user.Status.PasswordUpdatedAt == nil && phase == "Ready") {
-		now := metav1.Now()
-		user.Status.PasswordUpdatedAt = &now
-	}
+	r.applyStatusFields(user, update)
 
 	if err := r.Status().Patch(ctx, user, patch); err != nil {
 		return ctrl.Result{}, err
 	}
+	if update.RequeueAfter > 0 {
+		return ctrl.Result{RequeueAfter: update.RequeueAfter}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
-func (r *DatabaseUserReconciler) setStatusWithRequeue(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
-	phase, message, secretName string, after time.Duration, passwordUpdated bool, params ...statusParams) (ctrl.Result, error) {
-
-	if _, err := r.setStatus(ctx, user, phase, message, secretName, passwordUpdated, params...); err != nil {
-		return ctrl.Result{}, err
+func (r *DatabaseUserReconciler) handlePendingTimeout(user *databasesv1alpha1.DatabaseUser, update *statusUpdate) {
+	if update.Phase == "Pending" {
+		now := metav1.Now()
+		if user.Status.PendingSince == nil {
+			user.Status.PendingSince = &now
+		} else if now.Sub(user.Status.PendingSince.Time) > PendingTimeout {
+			update.Phase = "Failed"
+			update.Message = fmt.Sprintf("timeout: %s (pending for over 10 minutes)", update.Message)
+		}
+	} else {
+		user.Status.PendingSince = nil
 	}
-	return ctrl.Result{RequeueAfter: after}, nil
+}
+
+func (r *DatabaseUserReconciler) applyStatusFields(user *databasesv1alpha1.DatabaseUser, update *statusUpdate) {
+	if update.ClusterName != "" {
+		user.Status.ClusterName = update.ClusterName
+	}
+	if update.DatabaseName != "" {
+		user.Status.DatabaseName = update.DatabaseName
+	}
+	if update.Username != "" {
+		user.Status.Username = update.Username
+	}
+	if update.SecretName != "" {
+		user.Status.SecretName = update.SecretName
+	}
+	if update.PasswordUpdated || (user.Status.PasswordUpdatedAt == nil && update.Phase == "Ready") {
+		now := metav1.Now()
+		user.Status.PasswordUpdatedAt = &now
+	}
 }
 
 func (r *DatabaseUserReconciler) SetupWithManager(mgr ctrl.Manager) error {

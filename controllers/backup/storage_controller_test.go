@@ -6,6 +6,8 @@ import (
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
 )
 
+const testBucketName = "my-bucket"
+
 func TestBackupStorageReconciler_ValidateStorage(t *testing.T) {
 	r := &BackupStorageReconciler{}
 
@@ -20,7 +22,7 @@ func TestBackupStorageReconciler_ValidateStorage(t *testing.T) {
 			storage: &databasesv1alpha1.BackupStorage{
 				Spec: databasesv1alpha1.BackupStorageSpec{
 					S3: &databasesv1alpha1.S3StorageConfig{
-						Bucket: "my-bucket",
+						Bucket: testBucketName,
 						Region: "eu-central-1",
 					},
 				},
@@ -32,7 +34,7 @@ func TestBackupStorageReconciler_ValidateStorage(t *testing.T) {
 			storage: &databasesv1alpha1.BackupStorage{
 				Spec: databasesv1alpha1.BackupStorageSpec{
 					GCS: &databasesv1alpha1.GCSStorageConfig{
-						Bucket:  "my-bucket",
+						Bucket:  testBucketName,
 						Project: "my-project",
 					},
 				},
@@ -64,11 +66,11 @@ func TestBackupStorageReconciler_ValidateStorage(t *testing.T) {
 			storage: &databasesv1alpha1.BackupStorage{
 				Spec: databasesv1alpha1.BackupStorageSpec{
 					S3: &databasesv1alpha1.S3StorageConfig{
-						Bucket: "my-bucket",
+						Bucket: testBucketName,
 						Region: "eu-central-1",
 					},
 					GCS: &databasesv1alpha1.GCSStorageConfig{
-						Bucket:  "my-bucket",
+						Bucket:  testBucketName,
 						Project: "my-project",
 					},
 				},

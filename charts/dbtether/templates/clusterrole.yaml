@@ -134,6 +134,33 @@ rules:
       - backups/finalizers
     verbs:
       - update
+  # BackupSchedule permissions
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - backupschedules
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - backupschedules/status
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - backupschedules/finalizers
+    verbs:
+      - update
   # Job permissions (for backup jobs)
   - apiGroups:
       - batch

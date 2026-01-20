@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -27,17 +28,32 @@ import (
 const backupFinalizer = "dbtether.io/backup-job"
 
 const (
-	// MaxConcurrentJobsPerCluster limits parallel backup jobs per DBCluster to avoid overloading connection pool
-	MaxConcurrentJobsPerCluster = 3
+	// DefaultMaxConcurrentJobsPerCluster is the default limit for parallel backup jobs per DBCluster
+	DefaultMaxConcurrentJobsPerCluster = 3
 	// RequeueDelayWhenThrottled is how long to wait before retrying when job limit is reached
 	RequeueDelayWhenThrottled = 30 * time.Second
 )
 
+// Label keys for backup resources
+const (
+	LabelBackupName      = "dbtether.io/backup"
+	LabelBackupNamespace = "dbtether.io/backup-namespace"
+	LabelCluster         = "dbtether.io/cluster"
+)
+
 type BackupReconciler struct {
 	client.Client
-	Scheme    *runtime.Scheme
-	Image     string
-	Namespace string
+	Scheme               *runtime.Scheme
+	Image                string
+	Namespace            string
+	MaxConcurrentBackups int // limit per DBCluster, default 3
+}
+
+func (r *BackupReconciler) maxConcurrent() int {
+	if r.MaxConcurrentBackups <= 0 {
+		return DefaultMaxConcurrentJobsPerCluster
+	}
+	return r.MaxConcurrentBackups
 }
 
 // +kubebuilder:rbac:groups=dbtether.io,resources=backups,verbs=get;list;watch;create;update;patch;delete
@@ -60,67 +76,139 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return r.handleDeletion(ctx, &backup)
 	}
 
-	// Add finalizer if not present
-	if !controllerutil.ContainsFinalizer(&backup, backupFinalizer) {
-		controllerutil.AddFinalizer(&backup, backupFinalizer)
-		if err := r.Update(ctx, &backup); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, nil
+	// Ensure finalizer
+	if result, done := r.ensureFinalizer(ctx, &backup); done {
+		return result, nil
 	}
 
 	specHash := r.computeSpecHash(&backup)
 
-	// Protection against re-runs: if already completed with same spec, skip
-	if backup.Status.Phase != "" && backup.Status.SpecHash == specHash {
-		if backup.Status.Phase == "Completed" || backup.Status.Phase == "Failed" {
-			logger.V(1).Info("backup already processed", "phase", backup.Status.Phase)
-			return ctrl.Result{}, nil
-		}
+	// Skip if already processed
+	if r.isAlreadyProcessed(&backup, specHash, logger) {
+		return ctrl.Result{}, nil
 	}
 
 	logger.V(1).Info("reconciling backup", "database", backup.Spec.DatabaseRef.Name)
 
-	// If Job already created, just check its status (no need to fetch all resources)
+	// If Job already created, just check its status
 	if backup.Status.JobName != "" {
 		return r.checkJobStatus(ctx, &backup, specHash)
 	}
 
+	return r.createBackupJobIfAllowed(ctx, &backup, specHash, logger)
+}
+
+func (r *BackupReconciler) ensureFinalizer(ctx context.Context, backup *databasesv1alpha1.Backup) (ctrl.Result, bool) {
+	if controllerutil.ContainsFinalizer(backup, backupFinalizer) {
+		return ctrl.Result{}, false
+	}
+	controllerutil.AddFinalizer(backup, backupFinalizer)
+	if err := r.Update(ctx, backup); err != nil {
+		return ctrl.Result{}, true
+	}
+	return ctrl.Result{Requeue: true}, true
+}
+
+func (r *BackupReconciler) isAlreadyProcessed(backup *databasesv1alpha1.Backup, specHash string, logger logr.Logger) bool {
+	if backup.Status.Phase == "" || backup.Status.SpecHash != specHash {
+		return false
+	}
+	if backup.Status.Phase == "Completed" || backup.Status.Phase == "Failed" {
+		logger.V(1).Info("backup already processed", "phase", backup.Status.Phase)
+		return true
+	}
+	return false
+}
+
+func (r *BackupReconciler) createBackupJobIfAllowed(ctx context.Context, backup *databasesv1alpha1.Backup, specHash string, logger logr.Logger) (ctrl.Result, error) {
+	// FIRST: Check if job already exists by labels (prevents race condition with duplicate jobs)
+	existingJob, err := r.findExistingJob(ctx, backup)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if existingJob != nil {
+		// Job already exists - update status and evaluate
+		logger.V(1).Info("job already exists, using existing", "job", existingJob.Name)
+		runID := r.extractRunIDFromJobName(existingJob.Name, backup.Name)
+		if _, err := r.updateStatusWithJobAndRunID(ctx, backup, "Running", "backup job running", specHash, existingJob.Name, runID); err != nil {
+			return ctrl.Result{}, err
+		}
+		return r.evaluateJobStatus(ctx, backup, existingJob, specHash)
+	}
+
 	// Get all required resources for job creation
-	db, cluster, storage, err := r.getResources(ctx, &backup)
+	db, cluster, storage, err := r.getResources(ctx, backup)
 	if err != nil {
-		return r.updateStatus(ctx, &backup, "Failed", err.Error(), specHash)
+		return r.updateStatus(ctx, backup, "Failed", err.Error(), specHash)
 	}
 
-	// Throttling: check concurrent jobs per cluster
-	activeJobs, err := r.countActiveJobsForCluster(ctx, cluster.Name)
-	if err != nil {
-		logger.Error(err, "failed to count active jobs")
-		return ctrl.Result{RequeueAfter: RequeueDelayWhenThrottled}, nil
-	}
-	if activeJobs >= MaxConcurrentJobsPerCluster {
-		logger.Info("throttling: too many concurrent backup jobs for cluster",
-			"cluster", cluster.Name, "active", activeJobs, "max", MaxConcurrentJobsPerCluster)
-		return r.updateStatus(ctx, &backup, "Pending", fmt.Sprintf("waiting for other backups to complete (active: %d/%d)", activeJobs, MaxConcurrentJobsPerCluster), specHash)
+	// Check throttling
+	if result, throttled := r.checkThrottling(ctx, backup, cluster.Name, specHash, logger); throttled {
+		return result, nil
 	}
 
-	// Generate RunID for this backup run (used in job name, filename, and tracking)
+	// Generate RunID for this backup run (only if no existing job)
 	runID := generateRunID()
 
-	// Create Job with all configuration
-	job, err := r.createBackupJob(ctx, &backup, db, cluster, storage, runID)
+	// Create Job
+	job, err := r.createBackupJob(ctx, backup, db, cluster, storage, runID)
 	if err != nil {
-		// If job already exists, find it and check status (race condition handling)
-		if errors.IsAlreadyExists(err) {
-			logger.V(1).Info("job already exists, checking status")
-			return r.findJobByLabels(ctx, &backup, specHash)
-		}
-		logger.Error(err, "failed to create backup job")
-		return r.updateStatus(ctx, &backup, "Failed", fmt.Sprintf("failed to create job: %s", err.Error()), specHash)
+		return r.handleJobCreationError(ctx, backup, specHash, err, logger)
 	}
 
 	logger.Info("backup job created", "job", job.Name, "runId", runID)
-	return r.updateStatusWithJobAndRunID(ctx, &backup, "Running", "backup job started", specHash, job.Name, runID)
+	return r.updateStatusWithJobAndRunID(ctx, backup, "Running", "backup job started", specHash, job.Name, runID)
+}
+
+// findExistingJob looks for an existing job by backup labels
+func (r *BackupReconciler) findExistingJob(ctx context.Context, backup *databasesv1alpha1.Backup) (*batchv1.Job, error) {
+	var jobs batchv1.JobList
+	if err := r.List(ctx, &jobs, client.InNamespace(r.Namespace), client.MatchingLabels{
+		LabelBackupName:      backup.Name,
+		LabelBackupNamespace: backup.Namespace,
+	}); err != nil {
+		return nil, err
+	}
+
+	if len(jobs.Items) == 0 {
+		return nil, nil
+	}
+
+	return &jobs.Items[0], nil
+}
+
+// extractRunIDFromJobName extracts RunID from job name format: backup-{backupName}-{runID}
+func (r *BackupReconciler) extractRunIDFromJobName(jobName, backupName string) string {
+	prefix := fmt.Sprintf("backup-%s-", backupName)
+	if len(jobName) > len(prefix) {
+		return jobName[len(prefix):]
+	}
+	return ""
+}
+
+func (r *BackupReconciler) checkThrottling(ctx context.Context, backup *databasesv1alpha1.Backup, clusterName, specHash string, logger logr.Logger) (ctrl.Result, bool) {
+	activeJobs, err := r.countActiveJobsForCluster(ctx, clusterName)
+	if err != nil {
+		logger.Error(err, "failed to count active jobs")
+		return ctrl.Result{RequeueAfter: RequeueDelayWhenThrottled}, true
+	}
+	maxConcurrent := r.maxConcurrent()
+	if activeJobs >= maxConcurrent {
+		logger.Info("throttling: too many concurrent backup jobs for cluster",
+			"cluster", clusterName, "active", activeJobs, "max", maxConcurrent)
+		result, _ := r.updateStatus(ctx, backup, "Pending", fmt.Sprintf("waiting for other backups to complete (active: %d/%d)", activeJobs, maxConcurrent), specHash)
+		return result, true
+	}
+	return ctrl.Result{}, false
+}
+
+func (r *BackupReconciler) handleJobCreationError(ctx context.Context, backup *databasesv1alpha1.Backup, specHash string, err error, logger logr.Logger) (ctrl.Result, error) {
+	if errors.IsAlreadyExists(err) {
+		logger.V(1).Info("job already exists, checking status")
+		return r.findJobByLabels(ctx, backup, specHash)
+	}
+	logger.Error(err, "failed to create backup job")
+	return r.updateStatus(ctx, backup, "Failed", fmt.Sprintf("failed to create job: %s", err.Error()), specHash)
 }
 
 func (r *BackupReconciler) computeSpecHash(backup *databasesv1alpha1.Backup) string {
@@ -170,8 +258,8 @@ func (r *BackupReconciler) deleteBackupJob(ctx context.Context, backup *database
 	// Find job by labels
 	var jobs batchv1.JobList
 	if err := r.List(ctx, &jobs, client.InNamespace(r.Namespace), client.MatchingLabels{
-		"dbtether.io/backup":           backup.Name,
-		"dbtether.io/backup-namespace": backup.Namespace,
+		LabelBackupName:      backup.Name,
+		LabelBackupNamespace: backup.Namespace,
 	}); err != nil {
 		return err
 	}
@@ -301,10 +389,10 @@ func (r *BackupReconciler) createBackupJob(ctx context.Context, backup *database
 			Name:      jobName,
 			Namespace: r.Namespace,
 			Labels: map[string]string{
-				"dbtether.io/backup":           backup.Name,
-				"dbtether.io/backup-namespace": backup.Namespace,
-				"dbtether.io/database":         backup.Spec.DatabaseRef.Name,
-				"dbtether.io/cluster":          cluster.Name,
+				LabelBackupName:        backup.Name,
+				LabelBackupNamespace:   backup.Namespace,
+				"dbtether.io/database": backup.Spec.DatabaseRef.Name,
+				LabelCluster:           cluster.Name,
 			},
 			// No OwnerReference - cross-namespace not allowed
 			// Cleanup via finalizer on Backup + TTL as fallback
@@ -438,8 +526,8 @@ func (r *BackupReconciler) findJobByLabels(ctx context.Context, backup *database
 
 	var jobs batchv1.JobList
 	if err := r.List(ctx, &jobs, client.InNamespace(r.Namespace), client.MatchingLabels{
-		"dbtether.io/backup":           backup.Name,
-		"dbtether.io/backup-namespace": backup.Namespace,
+		LabelBackupName:      backup.Name,
+		LabelBackupNamespace: backup.Namespace,
 	}); err != nil {
 		return ctrl.Result{}, err
 	}

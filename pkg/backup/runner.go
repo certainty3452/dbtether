@@ -25,6 +25,8 @@ type BackupConfig struct {
 	// Storage
 	StorageType string // "s3", "gcs", "azure"
 	S3Config    storage.S3Config
+	GCSConfig   storage.GCSConfig
+	AzureConfig storage.AzureConfig
 
 	// Output
 	PathTemplate     string
@@ -114,12 +116,29 @@ func RunBackup(ctx context.Context, cfg *BackupConfig) (*BackupResult, error) {
 	// Upload to storage
 	switch cfg.StorageType {
 	case "s3":
-		s3Client, err := storage.NewS3Client(ctx, &cfg.S3Config, nil) // nil logger = use slog.Default()
+		s3Client, err := storage.NewS3Client(ctx, &cfg.S3Config, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create S3 client: %w", err)
 		}
 		if err := s3Client.UploadWithTags(ctx, fullPath, bytes.NewReader(compressed.Bytes()), tags); err != nil {
 			return nil, fmt.Errorf("S3 upload failed: %w", err)
+		}
+	case "gcs":
+		gcsClient, err := storage.NewGCSClient(ctx, &cfg.GCSConfig, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create GCS client: %w", err)
+		}
+		defer func() { _ = gcsClient.Close() }()
+		if err := gcsClient.UploadWithTags(ctx, fullPath, bytes.NewReader(compressed.Bytes()), tags); err != nil {
+			return nil, fmt.Errorf("GCS upload failed: %w", err)
+		}
+	case "azure":
+		azureClient, err := storage.NewAzureClient(ctx, &cfg.AzureConfig, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Azure client: %w", err)
+		}
+		if err := azureClient.UploadWithTags(ctx, fullPath, bytes.NewReader(compressed.Bytes()), tags); err != nil {
+			return nil, fmt.Errorf("azure blob upload failed: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported storage type: %s", cfg.StorageType)

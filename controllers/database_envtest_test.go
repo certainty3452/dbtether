@@ -1,3 +1,5 @@
+//go:build envtest
+
 package controllers
 
 import (
@@ -14,10 +16,12 @@ import (
 
 var _ = Describe("Database Controller", func() {
 	const (
-		clusterName = "db-test-cluster"
-		namespace   = "default"
-		timeout     = time.Second * 10
-		interval    = time.Millisecond * 250
+		clusterName  = "db-test-cluster"
+		namespace    = "default"
+		timeout      = time.Second * 10
+		interval     = time.Millisecond * 250
+		stepCleanup  = "Cleaning up"
+		dbDeleteName = "db-delete-policy"
 	)
 
 	BeforeEach(func() {
@@ -79,7 +83,7 @@ var _ = Describe("Database Controller", func() {
 			Expect(createdDB.Spec.DatabaseName).Should(Equal("mydb"))
 			Expect(createdDB.Spec.DeletionPolicy).Should(Equal("Retain"))
 
-			By("Cleaning up")
+			By(stepCleanup)
 			Expect(k8sClient.Delete(ctx, database)).Should(Succeed())
 		})
 
@@ -110,7 +114,7 @@ var _ = Describe("Database Controller", func() {
 				return db.Status.DatabaseName
 			}, timeout, interval).Should(Equal("implicit_name_db"))
 
-			By("Cleaning up")
+			By(stepCleanup)
 			Expect(k8sClient.Delete(ctx, database)).Should(Succeed())
 		})
 	})
@@ -144,7 +148,7 @@ var _ = Describe("Database Controller", func() {
 				return db.Status.Phase
 			}, timeout, interval).Should(Or(Equal("Pending"), Equal("Failed")))
 
-			By("Cleaning up")
+			By(stepCleanup)
 			Expect(k8sClient.Delete(ctx, database)).Should(Succeed())
 		})
 	})
@@ -178,7 +182,7 @@ var _ = Describe("Database Controller", func() {
 
 			Expect(createdDB.Spec.Extensions).Should(ContainElements("uuid-ossp", "pgcrypto"))
 
-			By("Cleaning up")
+			By(stepCleanup)
 			Expect(k8sClient.Delete(ctx, database)).Should(Succeed())
 		})
 	})
@@ -188,7 +192,7 @@ var _ = Describe("Database Controller", func() {
 			By("Creating a Database with Delete policy")
 			database := &databasesv1alpha1.Database{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "db-delete-policy",
+					Name:      dbDeleteName,
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseSpec{
@@ -205,7 +209,7 @@ var _ = Describe("Database Controller", func() {
 			createdDB := &databasesv1alpha1.Database{}
 			Eventually(func() error {
 				return k8sClient.Get(ctx, types.NamespacedName{
-					Name:      "db-delete-policy",
+					Name:      dbDeleteName,
 					Namespace: namespace,
 				}, createdDB)
 			}, timeout, interval).Should(Succeed())
@@ -218,7 +222,7 @@ var _ = Describe("Database Controller", func() {
 			By("Verifying database is eventually deleted")
 			Eventually(func() bool {
 				err := k8sClient.Get(ctx, types.NamespacedName{
-					Name:      "db-delete-policy",
+					Name:      dbDeleteName,
 					Namespace: namespace,
 				}, createdDB)
 				return err != nil
@@ -255,7 +259,7 @@ var _ = Describe("Database Controller", func() {
 				return db.Status.Phase
 			}, timeout, interval).Should(Or(Equal("Creating"), Equal("Ready"), Equal("Failed")))
 
-			By("Cleaning up")
+			By(stepCleanup)
 			Expect(k8sClient.Delete(ctx, database)).Should(Succeed())
 		})
 	})

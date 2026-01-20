@@ -1,3 +1,5 @@
+//go:build envtest
+
 package controllers
 
 import (
@@ -16,8 +18,9 @@ import (
 
 var _ = Describe("DBCluster Controller", func() {
 	const (
-		timeout  = time.Second * 10
-		interval = time.Millisecond * 250
+		timeout     = time.Second * 10
+		interval    = time.Millisecond * 250
+		stepCleanup = "Cleaning up"
 	)
 
 	Context("When creating a DBCluster", func() {
@@ -60,7 +63,7 @@ var _ = Describe("DBCluster Controller", func() {
 			Expect(createdCluster.Spec.Endpoint).Should(Equal("localhost"))
 			Expect(createdCluster.Spec.Port).Should(Equal(5432))
 
-			By("Cleaning up")
+			By(stepCleanup)
 			Expect(k8sClient.Delete(ctx, cluster)).Should(Succeed())
 			Expect(k8sClient.Delete(ctx, secret)).Should(Succeed())
 		})
@@ -93,7 +96,7 @@ var _ = Describe("DBCluster Controller", func() {
 				return c.Status.Phase
 			}, timeout, interval).Should(Equal("Failed"))
 
-			By("Cleaning up")
+			By(stepCleanup)
 			Expect(k8sClient.Delete(ctx, cluster)).Should(Succeed())
 		})
 	})
@@ -129,7 +132,7 @@ var _ = Describe("DBCluster Controller", func() {
 			Expect(createdCluster.Spec.CredentialsFromEnv).ShouldNot(BeNil())
 			Expect(createdCluster.Spec.CredentialsFromEnv.Username).Should(Equal("TEST_DB_USERNAME"))
 
-			By("Cleaning up")
+			By(stepCleanup)
 			Expect(k8sClient.Delete(ctx, cluster)).Should(Succeed())
 		})
 	})

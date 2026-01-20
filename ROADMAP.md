@@ -48,28 +48,6 @@ This document outlines planned features and improvements for the dbtether operat
 
 ## Backup & Restore
 
-### Scheduled Backups
-
-- [ ] **BackupSchedule CRD** — cron-based scheduling
-- [ ] **Retention policy** — `keepLast`, `keepDaily`, `keepWeekly`, `keepMonthly`
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: BackupSchedule
-metadata:
-  name: nightly-orders
-spec:
-  databaseRef:
-    name: orders-db
-  storageRef:
-    name: company-s3
-  schedule: "0 2 * * *"  # 2 AM daily
-  retention:
-    keepLast: 7
-    keepDaily: 30
-    keepWeekly: 12
-```
-
 ### Restore
 
 - [ ] **Restore CRD** — restore from backup
@@ -91,10 +69,6 @@ spec:
   onConflict: fail  # skip, drop, fail
 ```
 
-### Additional Storage Providers
-
-- [ ] **GCS storage provider** — Google Cloud Storage with Workload Identity
-- [ ] **Azure storage provider** — Azure Blob Storage with Managed Identity
 
 ## Secret Management Integrations
 

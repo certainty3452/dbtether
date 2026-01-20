@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"go.uber.org/zap"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -16,7 +17,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
@@ -31,6 +32,8 @@ var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
 )
+
+const errUnableToCreateController = "unable to create controller"
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -50,11 +53,11 @@ func main() {
 	flag.StringVar(&mode, "mode", "controller", "Run mode: controller (default) or job")
 	flag.StringVar(&operatorNamespace, "namespace", "dbtether", "Namespace for backup Jobs")
 
-	opts := zap.Options{Development: true}
+	opts := ctrlzap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	ctrl.SetLogger(ctrlzap.New(ctrlzap.UseFlagOptions(&opts)))
 
 	if mode == "job" {
 		runBackupJob()
@@ -87,7 +90,7 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		Scheme:        mgr.GetScheme(),
 		PGClientCache: pgClientCache,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DBCluster")
+		setupLog.Error(err, errUnableToCreateController, "controller", "DBCluster")
 		os.Exit(1)
 	}
 
@@ -96,7 +99,7 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		Scheme:        mgr.GetScheme(),
 		PGClientCache: pgClientCache,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Database")
+		setupLog.Error(err, errUnableToCreateController, "controller", "Database")
 		os.Exit(1)
 	}
 
@@ -105,7 +108,7 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		Scheme:        mgr.GetScheme(),
 		PGClientCache: pgClientCache,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "DatabaseUser")
+		setupLog.Error(err, errUnableToCreateController, "controller", "DatabaseUser")
 		os.Exit(1)
 	}
 
@@ -114,7 +117,7 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "BackupStorage")
+		setupLog.Error(err, errUnableToCreateController, "controller", "BackupStorage")
 		os.Exit(1)
 	}
 
@@ -124,15 +127,34 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		operatorImage = "certainty3452/dbtether:latest"
 	}
 
+	// Get max concurrent backups from env (default 3)
+	maxConcurrentBackups := getEnvInt("BACKUP_MAX_CONCURRENT_PER_CLUSTER", 3)
+
 	if err = (&backup.BackupReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		Image:     operatorImage,
-		Namespace: operatorNamespace,
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		Image:                operatorImage,
+		Namespace:            operatorNamespace,
+		MaxConcurrentBackups: maxConcurrentBackups,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Backup")
+		setupLog.Error(err, errUnableToCreateController, "controller", "Backup")
 		os.Exit(1)
 	}
+
+	// Get zap logger for schedule controller
+	zapLog := ctrl.Log.WithName("controllers").WithName("BackupSchedule")
+	sugarLog, _ := zap.NewDevelopment()
+
+	if err = (&backup.BackupScheduleReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Log:       sugarLog.Sugar(),
+		Namespace: operatorNamespace,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, errUnableToCreateController, "controller", "BackupSchedule")
+		os.Exit(1)
+	}
+	_ = zapLog // silence unused
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")

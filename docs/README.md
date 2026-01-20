@@ -9,6 +9,7 @@
 | [DatabaseUser](crds/databaseuser.md) | Namespaced | PostgreSQL user with specific privileges |
 | [BackupStorage](crds/backupstorage.md) | Cluster | Storage destination for backups (S3, GCS, Azure) |
 | [Backup](crds/backup.md) | Namespaced | One-time database backup operation |
+| [BackupSchedule](crds/backupschedule.md) | Namespaced | Scheduled backups with retention policy |
 
 ## Quick Start
 
@@ -128,7 +129,5 @@ kubectl get database -A
 See [ROADMAP.md](../ROADMAP.md) for full roadmap.
 
 **Next up:**
-- [ ] BackupSchedule — cron-based scheduled backups with retention policy
 - [ ] Restore — restore from backup with conflict handling
-- [ ] GCS and Azure storage providers
 - [ ] Multi-database user access

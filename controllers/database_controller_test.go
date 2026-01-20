@@ -8,6 +8,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const annotationForceAdopt = "dbtether.io/force-adopt"
+
 func TestDatabaseReconciler_ShouldDropDatabase(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -154,17 +156,17 @@ func TestDatabaseReconciler_ForceAdoptAnnotation(t *testing.T) {
 		},
 		{
 			name:        "force-adopt true",
-			annotations: map[string]string{"dbtether.io/force-adopt": "true"},
+			annotations: map[string]string{annotationForceAdopt: "true"},
 			wantForce:   true,
 		},
 		{
 			name:        "force-adopt false",
-			annotations: map[string]string{"dbtether.io/force-adopt": "false"},
+			annotations: map[string]string{annotationForceAdopt: "false"},
 			wantForce:   false,
 		},
 		{
 			name:        "force-adopt other value",
-			annotations: map[string]string{"dbtether.io/force-adopt": "yes"},
+			annotations: map[string]string{annotationForceAdopt: "yes"},
 			wantForce:   false, // only "true" works
 		},
 	}
@@ -177,7 +179,7 @@ func TestDatabaseReconciler_ForceAdoptAnnotation(t *testing.T) {
 				},
 			}
 
-			forceAdopt := db.Annotations["dbtether.io/force-adopt"] == "true"
+			forceAdopt := db.Annotations[annotationForceAdopt] == "true"
 			if forceAdopt != tt.wantForce {
 				t.Errorf("forceAdopt = %v, want %v", forceAdopt, tt.wantForce)
 			}

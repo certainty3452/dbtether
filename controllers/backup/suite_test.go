@@ -1,6 +1,6 @@
 //go:build envtest
 
-package controllers
+package backup
 
 import (
 	"context"
@@ -9,41 +9,41 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"go.uber.org/zap"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
-	"github.com/certainty3452/dbtether/pkg/postgres"
 )
 
 var (
-	cfg         *rest.Config
-	k8sClient   client.Client
-	testEnv     *envtest.Environment
-	ctx         context.Context
-	cancel      context.CancelFunc
-	mockPGCache *postgres.MockClientCache
+	cfg       *rest.Config
+	k8sClient client.Client
+	testEnv   *envtest.Environment
+	ctx       context.Context
+	cancel    context.CancelFunc
+	zapLogger *zap.SugaredLogger
 )
 
-func TestControllers(t *testing.T) {
+func TestBackupControllers(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Controller Suite")
+	RunSpecs(t, "Backup Controller Suite")
 }
 
 var _ = BeforeSuite(func() {
-	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
+	logf.SetLogger(ctrlzap.New(ctrlzap.WriteTo(GinkgoWriter), ctrlzap.UseDevMode(true)))
 
 	ctx, cancel = context.WithCancel(context.Background())
 
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "config", "crd", "bases")},
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: true,
 	}
 
@@ -59,7 +59,9 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
 
-	mockPGCache = postgres.NewMockClientCache()
+	// Create zap logger for schedule controller
+	devLogger, _ := zap.NewDevelopment()
+	zapLogger = devLogger.Sugar()
 
 	k8sManager, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme.Scheme,
@@ -69,24 +71,28 @@ var _ = BeforeSuite(func() {
 	})
 	Expect(err).NotTo(HaveOccurred())
 
-	err = (&DBClusterReconciler{
-		Client:        k8sManager.GetClient(),
-		Scheme:        k8sManager.GetScheme(),
-		PGClientCache: mockPGCache,
+	// Register BackupStorage controller
+	err = (&BackupStorageReconciler{
+		Client: k8sManager.GetClient(),
+		Scheme: k8sManager.GetScheme(),
 	}).SetupWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred())
 
-	err = (&DatabaseReconciler{
-		Client:        k8sManager.GetClient(),
-		Scheme:        k8sManager.GetScheme(),
-		PGClientCache: mockPGCache,
+	// Register Backup controller
+	err = (&BackupReconciler{
+		Client:    k8sManager.GetClient(),
+		Scheme:    k8sManager.GetScheme(),
+		Namespace: "default",
+		Image:     "dbtether:test",
 	}).SetupWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred())
 
-	err = (&DatabaseUserReconciler{
-		Client:        k8sManager.GetClient(),
-		Scheme:        k8sManager.GetScheme(),
-		PGClientCache: mockPGCache,
+	// Register BackupSchedule controller
+	err = (&BackupScheduleReconciler{
+		Client:    k8sManager.GetClient(),
+		Scheme:    k8sManager.GetScheme(),
+		Log:       zapLogger,
+		Namespace: "default",
 	}).SetupWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred())
 

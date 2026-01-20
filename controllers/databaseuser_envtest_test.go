@@ -1,3 +1,5 @@
+//go:build envtest
+
 package controllers
 
 import (
@@ -14,11 +16,16 @@ import (
 
 var _ = Describe("DatabaseUser Controller", func() {
 	const (
-		clusterName  = "user-test-cluster"
-		databaseName = "user-test-db"
-		namespace    = "default"
-		timeout      = time.Second * 10
-		interval     = time.Millisecond * 250
+		clusterName      = "user-test-cluster"
+		databaseName     = "user-test-db"
+		namespace        = "default"
+		timeout          = time.Second * 10
+		interval         = time.Millisecond * 250
+		stepCreatingUser = "Creating a DatabaseUser"
+		stepCleaningUp   = "Cleaning up"
+		userPwdTimestamp = "user-pwd-timestamp" //nolint:gosec // test user name, not a credential
+		userToDelete     = "user-to-delete"
+		userSecretRegen  = "user-secret-regen" //nolint:gosec // test user name, not a credential
 	)
 
 	BeforeEach(func() {
@@ -66,7 +73,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 
 	Context("When creating a DatabaseUser", func() {
 		It("Should create a DatabaseUser resource with correct spec", func() {
-			By("Creating a DatabaseUser")
+			By(stepCreatingUser)
 			user := &databasesv1alpha1.DatabaseUser{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-user",
@@ -92,7 +99,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 
 			Expect(createdUser.Spec.Privileges).Should(Equal("readonly"))
 
-			By("Cleaning up")
+			By(stepCleaningUp)
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
 		})
 
@@ -124,7 +131,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 			// Default is 16, but if 0 is stored, controller will use 16 internally
 			Expect(createdUser.Spec.Password.Length).Should(BeNumerically(">=", 0))
 
-			By("Cleaning up")
+			By(stepCleaningUp)
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
 		})
 
@@ -158,17 +165,17 @@ var _ = Describe("DatabaseUser Controller", func() {
 
 			Expect(createdUser.Spec.Password.Length).Should(Equal(32))
 
-			By("Cleaning up")
+			By(stepCleaningUp)
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
 		})
 	})
 
 	Context("When DatabaseUser reaches Ready status", func() {
 		It("Should set passwordUpdatedAt in status", func() {
-			By("Creating a DatabaseUser")
+			By(stepCreatingUser)
 			user := &databasesv1alpha1.DatabaseUser{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "user-pwd-timestamp",
+					Name:      userPwdTimestamp,
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
@@ -184,7 +191,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 			Eventually(func() string {
 				u := &databasesv1alpha1.DatabaseUser{}
 				if err := k8sClient.Get(ctx, types.NamespacedName{
-					Name:      "user-pwd-timestamp",
+					Name:      userPwdTimestamp,
 					Namespace: namespace,
 				}, u); err != nil {
 					return ""
@@ -195,14 +202,14 @@ var _ = Describe("DatabaseUser Controller", func() {
 			By("Verifying passwordUpdatedAt is set")
 			createdUser := &databasesv1alpha1.DatabaseUser{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Name:      "user-pwd-timestamp",
+				Name:      userPwdTimestamp,
 				Namespace: namespace,
 			}, createdUser)).Should(Succeed())
 
 			Expect(createdUser.Status.PasswordUpdatedAt).ShouldNot(BeNil())
 			Expect(createdUser.Status.PasswordUpdatedAt.Time).Should(BeTemporally("~", time.Now(), time.Minute))
 
-			By("Cleaning up")
+			By(stepCleaningUp)
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
 		})
 	})
@@ -236,7 +243,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 				return u.Status.Phase
 			}, timeout, interval).Should(Or(Equal("Pending"), Equal("Failed")))
 
-			By("Cleaning up")
+			By(stepCleaningUp)
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
 		})
 	})
@@ -270,7 +277,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 
 			Expect(createdUser.Spec.Username).Should(Equal("custom_postgres_user"))
 
-			By("Cleaning up")
+			By(stepCleaningUp)
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
 		})
 	})
@@ -310,7 +317,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 				return db.Status.Phase
 			}, timeout, interval).Should(Or(Equal("Ready"), Equal("Creating"), Equal("Failed")))
 
-			By("Creating a DatabaseUser")
+			By(stepCreatingUser)
 			user := &databasesv1alpha1.DatabaseUser{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "user-ready-test",
@@ -337,17 +344,17 @@ var _ = Describe("DatabaseUser Controller", func() {
 				return u.Status.Phase
 			}, timeout, interval).Should(Or(Equal("Ready"), Equal("Creating"), Equal("Pending"), Equal("Failed")))
 
-			By("Cleaning up")
+			By(stepCleaningUp)
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
 		})
 	})
 
 	Context("When DatabaseUser is deleted", func() {
 		It("Should clean up resources", func() {
-			By("Creating a DatabaseUser")
+			By(stepCreatingUser)
 			user := &databasesv1alpha1.DatabaseUser{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "user-to-delete",
+					Name:      userToDelete,
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
@@ -362,7 +369,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 			By("Waiting for user to be created")
 			Eventually(func() error {
 				return k8sClient.Get(ctx, types.NamespacedName{
-					Name:      "user-to-delete",
+					Name:      userToDelete,
 					Namespace: namespace,
 				}, user)
 			}, timeout, interval).Should(Succeed())
@@ -373,7 +380,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 			By("Verifying user is eventually deleted")
 			Eventually(func() bool {
 				err := k8sClient.Get(ctx, types.NamespacedName{
-					Name:      "user-to-delete",
+					Name:      userToDelete,
 					Namespace: namespace,
 				}, user)
 				return err != nil
@@ -410,7 +417,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 
 			Expect(createdUser.Spec.ConnectionLimit).Should(Equal(10))
 
-			By("Cleaning up")
+			By(stepCleaningUp)
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
 		})
 
@@ -442,17 +449,17 @@ var _ = Describe("DatabaseUser Controller", func() {
 
 			Expect(createdUser.Spec.ConnectionLimit).Should(Equal(-1))
 
-			By("Cleaning up")
+			By(stepCleaningUp)
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
 		})
 	})
 
 	Context("When credentials secret is deleted", func() {
 		It("Should create secret with owner reference for auto-cleanup", func() {
-			By("Creating a DatabaseUser")
+			By(stepCreatingUser)
 			user := &databasesv1alpha1.DatabaseUser{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "user-secret-regen",
+					Name:      userSecretRegen,
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
@@ -468,7 +475,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 			Eventually(func() string {
 				u := &databasesv1alpha1.DatabaseUser{}
 				if err := k8sClient.Get(ctx, types.NamespacedName{
-					Name:      "user-secret-regen",
+					Name:      userSecretRegen,
 					Namespace: namespace,
 				}, u); err != nil {
 					return ""
@@ -488,9 +495,9 @@ var _ = Describe("DatabaseUser Controller", func() {
 
 			Expect(secret.OwnerReferences).Should(HaveLen(1))
 			Expect(secret.OwnerReferences[0].Kind).Should(Equal("DatabaseUser"))
-			Expect(secret.OwnerReferences[0].Name).Should(Equal("user-secret-regen"))
+			Expect(secret.OwnerReferences[0].Name).Should(Equal(userSecretRegen))
 
-			By("Cleaning up")
+			By(stepCleaningUp)
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
 		})
 	})

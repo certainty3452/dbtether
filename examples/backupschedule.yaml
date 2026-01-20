@@ -1,0 +1,74 @@
+# Example: BackupSchedule with retention policy
+#
+# Creates automatic nightly backups at 2 AM with retention:
+# - Keep last 7 backups
+# - Keep daily backups for 30 days
+# - Keep weekly backups for 12 weeks
+# - Keep monthly backups for 12 months
+
+apiVersion: dbtether.io/v1alpha1
+kind: BackupSchedule
+metadata:
+  name: orders-nightly
+  namespace: orders-team
+spec:
+  # Database to backup
+  databaseRef:
+    name: orders-db
+    # namespace: orders-team  # optional, defaults to same namespace
+
+  # Storage destination
+  storageRef:
+    name: company-s3
+
+  # Cron schedule: "minute hour day month weekday"
+  # Examples:
+  #   "0 2 * * *"    - daily at 2:00 AM
+  #   "0 */6 * * *"  - every 6 hours
+  #   "0 0 * * 0"    - weekly on Sunday at midnight
+  #   "0 3 1 * *"    - monthly on 1st at 3:00 AM
+  schedule: "0 2 * * *"
+
+  # Optional: customize backup filename
+  # filenameTemplate: "{{ .Timestamp }}-{{ .RunID }}.sql.gz"
+
+  # Retention policy - files not matching any rule are deleted
+  retention:
+    keepLast: 7       # Always keep the 7 most recent backups
+    keepDaily: 30     # Keep one backup per day for 30 days
+    keepWeekly: 12    # Keep one backup per week for 12 weeks
+    keepMonthly: 12   # Keep one backup per month for 12 months
+
+  # Set to true to pause scheduling (existing backups are not affected)
+  suspend: false
+
+---
+# Example: Minimal BackupSchedule (no retention, just scheduling)
+apiVersion: dbtether.io/v1alpha1
+kind: BackupSchedule
+metadata:
+  name: test-hourly
+  namespace: dev-team
+spec:
+  databaseRef:
+    name: test-db
+  storageRef:
+    name: dev-s3
+  schedule: "0 * * * *"  # Every hour
+
+---
+# Example: Weekly backup with minimal retention
+apiVersion: dbtether.io/v1alpha1
+kind: BackupSchedule
+metadata:
+  name: analytics-weekly
+  namespace: data-team
+spec:
+  databaseRef:
+    name: analytics-db
+  storageRef:
+    name: company-s3
+  schedule: "0 3 * * 0"  # Every Sunday at 3:00 AM
+  retention:
+    keepLast: 4  # Keep last 4 weekly backups
+

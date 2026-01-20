@@ -1,11 +1,13 @@
 # Default values for dbtether
 
 replicaCount: 1
+# Number of old ReplicaSets to retain (Kubernetes default is 10)
+revisionHistoryLimit: ""
 
 image:
   repository: certainty3452/dbtether
   pullPolicy: IfNotPresent
-  tag: "0.2.4"
+  tag: "0.2.7"
 
 imagePullSecrets: []
 nameOverride: ""
@@ -57,10 +59,47 @@ metrics:
 health:
   port: 8081
 
+# Probes configuration
+# Startup probe - gives time for leader election and initialization
+# failureThreshold * periodSeconds = max startup time (default: 30 * 10 = 300s = 5 min)
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: health
+  periodSeconds: 10
+  timeoutSeconds: 1
+  successThreshold: 1
+  failureThreshold: 30
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: health
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  timeoutSeconds: 1
+  successThreshold: 1
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: health
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 1
+  successThreshold: 1
+  failureThreshold: 3
+
 # Logging configuration
 logging:
   level: info  # debug, info, warn, error
   format: json  # json, console
+
+# Backup configuration
+backup:
+  # Maximum concurrent backup jobs per DBCluster (prevents connection pool exhaustion)
+  maxConcurrentPerCluster: 3
 
 # Extra environment variables for the operator pod
 # Use this for credentialsFromEnv in DBCluster resources

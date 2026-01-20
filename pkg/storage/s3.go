@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -166,4 +167,35 @@ func (c *S3Client) Delete(ctx context.Context, key string) error {
 		return fmt.Errorf("failed to delete from S3: %w", err)
 	}
 	return nil
+}
+
+// List lists all objects with the given prefix
+func (c *S3Client) List(ctx context.Context, prefix string) ([]StorageObject, error) {
+	var objects []StorageObject
+
+	paginator := s3.NewListObjectsV2Paginator(c.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(c.bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
+		}
+
+		for _, obj := range page.Contents {
+			lastMod := time.Time{}
+			if obj.LastModified != nil {
+				lastMod = *obj.LastModified
+			}
+			objects = append(objects, StorageObject{
+				Key:          aws.ToString(obj.Key),
+				Size:         aws.ToInt64(obj.Size),
+				LastModified: lastMod,
+			})
+		}
+	}
+
+	return objects, nil
 }

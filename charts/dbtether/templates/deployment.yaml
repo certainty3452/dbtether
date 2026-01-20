@@ -7,6 +7,9 @@ metadata:
     {{- include "dbtether.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  {{- if .Values.revisionHistoryLimit }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "dbtether.selectorLabels" . | nindent 6 }}
@@ -44,21 +47,23 @@ spec:
             - name: health
               containerPort: {{ .Values.health.port }}
               protocol: TCP
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: health
-            initialDelaySeconds: 15
-            periodSeconds: 20
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
           readinessProbe:
-            httpGet:
-              path: /readyz
-              port: health
-            initialDelaySeconds: 5
-            periodSeconds: 10
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           env:
             - name: OPERATOR_IMAGE
               value: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+            - name: BACKUP_MAX_CONCURRENT_PER_CLUSTER
+              value: "{{ .Values.backup.maxConcurrentPerCluster | default 3 }}"
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

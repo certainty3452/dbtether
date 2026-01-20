@@ -33,3 +33,47 @@ spec:
   # Custom pathTemplate with date organization
   pathTemplate: "{{ .ClusterName }}/{{ .Year }}/{{ .Month }}"
   # No credentialsSecretRef = uses IRSA/Pod Identity
+---
+# Google Cloud Storage with Workload Identity
+# Uses Application Default Credentials:
+#   - Workload Identity on GKE (recommended)
+#   - GOOGLE_APPLICATION_CREDENTIALS env var
+#   - gcloud auth application-default login (local dev)
+apiVersion: dbtether.io/v1alpha1
+kind: BackupStorage
+metadata:
+  name: company-gcs
+spec:
+  gcs:
+    bucket: my-company-backups
+    project: my-gcp-project
+  pathTemplate: "{{ .ClusterName }}/{{ .DatabaseName }}/{{ .Year }}"
+---
+# Azure Blob Storage with Managed Identity
+# Uses DefaultAzureCredential:
+#   - Managed Identity on AKS (recommended)
+#   - Environment vars: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_CLIENT_SECRET
+#   - Azure CLI credentials (local dev)
+apiVersion: dbtether.io/v1alpha1
+kind: BackupStorage
+metadata:
+  name: company-azure
+spec:
+  azure:
+    container: pg-backups
+    storageAccount: companybackupstorage
+  pathTemplate: "{{ .ClusterName }}/{{ .DatabaseName }}"
+---
+# S3-compatible storage (MinIO, Ceph, etc.)
+apiVersion: dbtether.io/v1alpha1
+kind: BackupStorage
+metadata:
+  name: minio-storage
+spec:
+  s3:
+    bucket: backups
+    region: us-east-1
+    endpoint: https://minio.internal:9000
+  credentialsSecretRef:
+    name: minio-credentials
+    namespace: dbtether

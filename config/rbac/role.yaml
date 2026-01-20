@@ -32,6 +32,7 @@ rules:
   - dbtether.io
   resources:
   - backups
+  - backupschedules
   - backupstorages
   - databases
   - databaseusers
@@ -58,6 +59,7 @@ rules:
   - dbtether.io
   resources:
   - backups/status
+  - backupschedules/status
   - backupstorages/status
   - databases/status
   - databaseusers/status
