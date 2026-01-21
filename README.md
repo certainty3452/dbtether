@@ -47,15 +47,26 @@ As a GitOps enthusiast, this operator fits perfectly into my workflow. I hope it
 
 ## Installation
 
-### Using Helm
+### Using Helm (recommended)
 
 ```bash
-helm install dbtether ./charts/dbtether \
-  -n postgres-operator-system \
+# Install from OCI registry (Helm 3.8+)
+helm install dbtether oci://ghcr.io/certainty3452/charts/dbtether \
+  --namespace dbtether \
   --create-namespace
+
+# Or with specific version
+helm install dbtether oci://ghcr.io/certainty3452/charts/dbtether \
+  --version 0.3.1 \
+  --namespace dbtether \
+  --create-namespace
+
+# Upgrade
+helm upgrade dbtether oci://ghcr.io/certainty3452/charts/dbtether \
+  --namespace dbtether
 ```
 
-### Using kubectl
+### Using kubectl (from source)
 
 ```bash
 # Install CRDs
@@ -64,6 +75,13 @@ kubectl apply -f config/crd/bases/
 # Install RBAC and operator
 kubectl apply -f config/rbac/
 kubectl apply -f config/manager/
+```
+
+### Docker Image
+
+```bash
+docker pull ghcr.io/certainty3452/dbtether:latest
+# Multi-arch: linux/amd64, linux/arm64
 ```
 
 ## Usage
