@@ -37,6 +37,7 @@ rules:
   - databases
   - databaseusers
   - dbclusters
+  - restores
   verbs:
   - create
   - delete
@@ -53,6 +54,7 @@ rules:
   - databases/finalizers
   - databaseusers/finalizers
   - dbclusters/finalizers
+  - restores/finalizers
   verbs:
   - update
 - apiGroups:
@@ -64,6 +66,7 @@ rules:
   - databases/status
   - databaseusers/status
   - dbclusters/status
+  - restores/status
   verbs:
   - get
   - patch

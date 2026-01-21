@@ -497,7 +497,7 @@ func TestMockClient_Download(t *testing.T) {
 	// Download and verify
 	reader, err := mockClient.Download(ctx, "test.sql.gz")
 	require.NoError(t, err)
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	data, err := io.ReadAll(reader)
 	require.NoError(t, err)

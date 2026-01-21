@@ -111,7 +111,7 @@ func (m *MockClient) List(ctx context.Context, prefix string) ([]StorageObject, 
 
 	var objects []StorageObject
 	for key, obj := range m.objects {
-		if len(prefix) == 0 || len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+		if prefix == "" || len(key) >= len(prefix) && key[:len(prefix)] == prefix {
 			objects = append(objects, StorageObject{
 				Key:          key,
 				Size:         int64(len(obj.data)),
@@ -190,4 +190,3 @@ func (m *MockClient) Keys() []string {
 
 // Verify MockClient implements StorageClient
 var _ StorageClient = (*MockClient)(nil)
-

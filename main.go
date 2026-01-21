@@ -59,12 +59,16 @@ func main() {
 
 	ctrl.SetLogger(ctrlzap.New(ctrlzap.UseFlagOptions(&opts)))
 
-	if mode == "job" {
+	switch mode {
+	case "job":
 		runBackupJob()
 		return
+	case "restore":
+		runRestoreJob()
+		return
+	default:
+		runController(metricsAddr, probeAddr, enableLeaderElection, operatorNamespace)
 	}
-
-	runController(metricsAddr, probeAddr, enableLeaderElection, operatorNamespace)
 }
 
 func runController(metricsAddr, probeAddr string, enableLeaderElection bool, operatorNamespace string) {
@@ -156,6 +160,17 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 	}
 	_ = zapLog // silence unused
 
+	// Restore controller
+	if err = (&backup.RestoreReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Image:     operatorImage,
+		Namespace: operatorNamespace,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, errUnableToCreateController, "controller", "Restore")
+		os.Exit(1)
+	}
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
@@ -231,6 +246,67 @@ func runBackupJob() {
 		setupLog.Error(err, "failed to update job annotations (non-fatal)")
 		// Non-fatal: backup succeeded, just can't report details back
 	}
+}
+
+func runRestoreJob() {
+	cfg := backuppkg.RestoreConfig{
+		// Database connection
+		Host:     getEnvRequired("DB_HOST"),
+		Port:     getEnvInt("DB_PORT", 5432),
+		Database: getEnvRequired("DB_NAME"),
+		User:     getEnvRequired("DB_USER"),
+		Password: getEnvRequired("DB_PASSWORD"),
+		SSLMode:  getEnv("DB_SSLMODE", "require"),
+
+		// Source
+		SourcePath: getEnvRequired("SOURCE_PATH"),
+
+		// Storage
+		StorageType: getEnvRequired("STORAGE_TYPE"),
+
+		// Conflict handling
+		OnConflict: getEnv("ON_CONFLICT", "fail"),
+	}
+
+	// Configure storage based on type
+	switch cfg.StorageType {
+	case "s3":
+		cfg.S3Config = &storage.S3Config{
+			Bucket:    os.Getenv("S3_BUCKET"),
+			Region:    os.Getenv("S3_REGION"),
+			Endpoint:  os.Getenv("S3_ENDPOINT"),
+			AccessKey: os.Getenv("AWS_ACCESS_KEY_ID"),
+			SecretKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+		}
+	case "gcs":
+		cfg.GCSConfig = &storage.GCSConfig{
+			Bucket:  os.Getenv("GCS_BUCKET"),
+			Project: os.Getenv("GCS_PROJECT"),
+		}
+	case "azure":
+		cfg.AzureConfig = &storage.AzureConfig{
+			Container:      os.Getenv("AZURE_CONTAINER"),
+			StorageAccount: os.Getenv("AZURE_ACCOUNT"),
+		}
+	}
+
+	setupLog.Info("starting restore job",
+		"database", cfg.Database,
+		"source", cfg.SourcePath,
+		"storage", cfg.StorageType,
+		"onConflict", cfg.OnConflict,
+	)
+
+	ctx := context.Background()
+	if err := backuppkg.RunRestore(ctx, &cfg); err != nil {
+		setupLog.Error(err, "restore failed")
+		os.Exit(1)
+	}
+
+	setupLog.Info("restore completed successfully",
+		"database", cfg.Database,
+		"source", cfg.SourcePath,
+	)
 }
 
 func getEnvRequired(key string) string {

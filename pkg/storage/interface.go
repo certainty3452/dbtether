@@ -40,4 +40,3 @@ var (
 	// _ StorageClient = (*GCSClient)(nil)   // TODO: update GCS to match interface
 	// _ StorageClient = (*AzureClient)(nil) // TODO: update Azure to match interface
 )
-

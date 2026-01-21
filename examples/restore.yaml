@@ -1,0 +1,78 @@
+# Option 1: Restore from the latest backup of a database (RECOMMENDED)
+apiVersion: dbtether.io/v1alpha1
+kind: Restore
+metadata:
+  name: restore-orders-latest
+  namespace: default
+spec:
+  source:
+    # Automatically find the latest completed backup for this database
+    latestFrom:
+      databaseRef:
+        name: orders-db
+      # namespace: default  # optional, defaults to same namespace
+  target:
+    databaseRef:
+      name: orders-db-restored
+  onConflict: drop
+
+---
+# Option 2: Restore from a specific Backup CRD
+apiVersion: dbtether.io/v1alpha1
+kind: Restore
+metadata:
+  name: restore-orders-from-backup
+  namespace: default
+spec:
+  source:
+    # Reference to an existing completed Backup
+    backupRef:
+      name: orders-backup-20260120-1400
+      # namespace: default  # optional, defaults to same namespace
+  target:
+    databaseRef:
+      name: orders-db-restored
+  # How to handle existing data:
+  # - fail: abort if database is not empty (default)
+  # - drop: drop and recreate database before restore
+  # - overwrite: restore over existing data
+  onConflict: fail
+
+---
+# Option 3: Restore from a direct path in storage
+apiVersion: dbtether.io/v1alpha1
+kind: Restore
+metadata:
+  name: restore-orders-from-path
+  namespace: default
+spec:
+  source:
+    # Direct path to backup file
+    path: "microservices/orders_db/20260120-140000.sql.gz"
+    storageRef:
+      name: company-s3-backup
+  target:
+    databaseRef:
+      name: orders-db-restored
+  onConflict: drop  # Drop existing database and restore clean
+
+---
+# Cross-namespace restore (e.g., restore prod backup to dev)
+apiVersion: dbtether.io/v1alpha1
+kind: Restore
+metadata:
+  name: restore-dev-from-prod
+  namespace: dev
+spec:
+  source:
+    # Latest backup from prod database
+    latestFrom:
+      databaseRef:
+        name: prod-orders-db
+      namespace: prod  # cross-namespace lookup
+  target:
+    databaseRef:
+      name: dev-database
+  onConflict: drop
+  ttlAfterCompletion: 1h  # Auto-delete Restore CRD after 1 hour
+

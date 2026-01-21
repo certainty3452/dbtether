@@ -46,30 +46,6 @@ This document outlines planned features and improvements for the dbtether operat
 - [ ] **GCP IAM Authentication** for Cloud SQL
   - Use Workload Identity
 
-## Backup & Restore
-
-### Restore
-
-- [ ] **Restore CRD** — restore from backup
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: Restore
-metadata:
-  name: restore-orders
-spec:
-  source:
-    backupRef:
-      name: orders-backup
-    # OR direct path
-    # path: "s3://bucket/path/backup.sql.gz"
-  target:
-    databaseRef:
-      name: orders-db-restored
-  onConflict: fail  # skip, drop, fail
-```
-
-
 ## Secret Management Integrations
 
 Goal: Allow storing credentials in external secret stores instead of (or in addition to) Kubernetes Secrets.
