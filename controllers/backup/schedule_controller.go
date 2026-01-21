@@ -167,7 +167,9 @@ func (r *BackupScheduleReconciler) scheduleNextRun(
 		requeueAfter = time.Second
 	}
 
-	go r.runRetentionCleanup(context.Background(), schedule, log)
+	// Deep copy schedule for goroutine to avoid race condition
+	scheduleCopy := schedule.DeepCopy()
+	go r.runRetentionCleanup(context.Background(), scheduleCopy, log)
 
 	nextRunMeta := metav1.NewTime(nextRun)
 	return r.updateStatusWithRequeue(ctx, schedule, "Active", "", nil, &nextRunMeta, requeueAfter)
@@ -231,6 +233,22 @@ func (r *BackupScheduleReconciler) runRetentionCleanup(ctx context.Context, sche
 		return
 	}
 
+	// Get resources needed for cleanup
+	s3Client, prefix, err := r.prepareRetentionCleanup(ctx, schedule, log)
+	if err != nil || s3Client == nil {
+		return // Error already logged or storage not supported
+	}
+
+	// Apply retention policy and delete old files
+	r.executeRetentionCleanup(ctx, s3Client, prefix, schedule, log)
+
+	// Also cleanup old Backup CRDs
+	r.cleanupBackupCRDs(ctx, schedule, log)
+}
+
+// prepareRetentionCleanup fetches resources and creates S3 client for retention cleanup.
+// Returns nil client if storage is not S3 (which is currently the only supported type).
+func (r *BackupScheduleReconciler) prepareRetentionCleanup(ctx context.Context, schedule *dbtether.BackupSchedule, log *zap.SugaredLogger) (*storage.S3Client, string, error) {
 	// Get Database to build path
 	var db dbtether.Database
 	if err := r.Get(ctx, types.NamespacedName{
@@ -240,7 +258,7 @@ func (r *BackupScheduleReconciler) runRetentionCleanup(ctx context.Context, sche
 		if !errors.IsNotFound(err) {
 			log.Warnw("retention cleanup: failed to get database", "error", err)
 		}
-		return
+		return nil, "", err
 	}
 
 	// Get DBCluster for cluster name
@@ -249,7 +267,7 @@ func (r *BackupScheduleReconciler) runRetentionCleanup(ctx context.Context, sche
 		if !errors.IsNotFound(err) {
 			log.Warnw("retention cleanup: failed to get cluster", "error", err)
 		}
-		return
+		return nil, "", err
 	}
 
 	// Get BackupStorage
@@ -258,13 +276,13 @@ func (r *BackupScheduleReconciler) runRetentionCleanup(ctx context.Context, sche
 		if !errors.IsNotFound(err) {
 			log.Warnw("retention cleanup: failed to get backup storage", "error", err)
 		}
-		return
+		return nil, "", err
 	}
 
 	// Only S3 is supported for now
 	if backupStorage.Spec.S3 == nil {
 		log.Debugw("retention cleanup: only S3 storage is supported", "storage", backupStorage.Name)
-		return
+		return nil, "", nil
 	}
 
 	// Create S3 client
@@ -272,23 +290,26 @@ func (r *BackupScheduleReconciler) runRetentionCleanup(ctx context.Context, sche
 		Bucket:   backupStorage.Spec.S3.Bucket,
 		Region:   backupStorage.Spec.S3.Region,
 		Endpoint: backupStorage.Spec.S3.Endpoint,
-		// IRSA/Pod Identity will be used - no credentials needed here
 	}
 
 	s3Client, err := storage.NewS3Client(ctx, s3Cfg, slog.Default())
 	if err != nil {
 		log.Warnw("retention cleanup: failed to create S3 client", "error", err)
-		return
+		return nil, "", err
 	}
 
 	// Build prefix from path template
 	prefix, err := r.buildStoragePath(&backupStorage, &cluster, &db)
 	if err != nil {
 		log.Warnw("retention cleanup: failed to build storage path", "error", err)
-		return
+		return nil, "", err
 	}
 
-	// Apply retention policy
+	return s3Client, prefix, nil
+}
+
+// executeRetentionCleanup applies retention policy and deletes old S3 files.
+func (r *BackupScheduleReconciler) executeRetentionCleanup(ctx context.Context, s3Client *storage.S3Client, prefix string, schedule *dbtether.BackupSchedule, log *zap.SugaredLogger) {
 	retentionManager := pkgbackup.NewRetentionManager(log)
 	toDelete, err := retentionManager.ApplyRetention(ctx, s3Client, prefix, schedule.Spec.Retention)
 	if err != nil {
@@ -298,15 +319,12 @@ func (r *BackupScheduleReconciler) runRetentionCleanup(ctx context.Context, sche
 
 	if len(toDelete) == 0 {
 		log.Debugw("retention cleanup: no files to delete", "prefix", prefix, "retention", schedule.Spec.Retention)
-	} else {
-		// Delete old S3 files
-		if err := retentionManager.DeleteFiles(ctx, s3Client, toDelete); err != nil {
-			log.Warnw("retention cleanup: failed to delete some S3 files", "error", err)
-		}
+		return
 	}
 
-	// Also cleanup old Backup CRDs
-	r.cleanupBackupCRDs(ctx, schedule, log)
+	if err := retentionManager.DeleteFiles(ctx, s3Client, toDelete); err != nil {
+		log.Warnw("retention cleanup: failed to delete some S3 files", "error", err)
+	}
 }
 
 // cleanupBackupCRDs deletes old Backup CRDs based on retention policy

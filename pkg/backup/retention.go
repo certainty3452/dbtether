@@ -23,11 +23,21 @@ type BackupFile struct {
 // RetentionManager handles backup retention policy
 type RetentionManager struct {
 	Log *zap.SugaredLogger
+	// Now is a function that returns the current time.
+	// If nil, time.Now() is used. Set this for testing.
+	Now func() time.Time
 }
 
 // NewRetentionManager creates a new RetentionManager
 func NewRetentionManager(log *zap.SugaredLogger) *RetentionManager {
 	return &RetentionManager{Log: log}
+}
+
+func (m *RetentionManager) now() time.Time {
+	if m.Now != nil {
+		return m.Now()
+	}
+	return time.Now()
 }
 
 // ApplyRetention applies retention policy and returns files to delete
@@ -95,7 +105,7 @@ func (m *RetentionManager) listBackupFiles(ctx context.Context, storageClient st
 		return nil, err
 	}
 
-	var files []BackupFile
+	files := make([]BackupFile, 0, len(objects))
 	for _, obj := range objects {
 		// Try to parse timestamp from filename first
 		timestamp, err := parseTimestampFromKey(obj.Key)
@@ -121,7 +131,7 @@ func (m *RetentionManager) listBackupFiles(ctx context.Context, storageClient st
 
 func (m *RetentionManager) calculateKeepSet(files []BackupFile, policy *dbtether.RetentionPolicy) map[string]bool {
 	keep := make(map[string]bool)
-	now := time.Now()
+	now := m.now()
 
 	m.applyKeepLast(files, policy, keep)
 	m.applyKeepDaily(files, policy, keep, now)

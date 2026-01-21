@@ -86,10 +86,21 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		os.Exit(1)
 	}
 
+	setupMainControllers(mgr)
+	setupBackupControllers(mgr, operatorNamespace)
+	setupHealthChecks(mgr)
+
+	setupLog.Info("starting manager")
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		setupLog.Error(err, "problem running manager")
+		os.Exit(1)
+	}
+}
+
+func setupMainControllers(mgr ctrl.Manager) {
 	pgClientCache := postgres.NewClientCache()
 
-	// Main controllers
-	if err = (&controllers.DBClusterReconciler{
+	if err := (&controllers.DBClusterReconciler{
 		Client:        mgr.GetClient(),
 		Scheme:        mgr.GetScheme(),
 		PGClientCache: pgClientCache,
@@ -98,7 +109,7 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		os.Exit(1)
 	}
 
-	if err = (&controllers.DatabaseReconciler{
+	if err := (&controllers.DatabaseReconciler{
 		Client:        mgr.GetClient(),
 		Scheme:        mgr.GetScheme(),
 		PGClientCache: pgClientCache,
@@ -107,7 +118,7 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		os.Exit(1)
 	}
 
-	if err = (&controllers.DatabaseUserReconciler{
+	if err := (&controllers.DatabaseUserReconciler{
 		Client:        mgr.GetClient(),
 		Scheme:        mgr.GetScheme(),
 		PGClientCache: pgClientCache,
@@ -115,9 +126,10 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		setupLog.Error(err, errUnableToCreateController, "controller", "DatabaseUser")
 		os.Exit(1)
 	}
+}
 
-	// Backup controllers
-	if err = (&backup.BackupStorageReconciler{
+func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string) {
+	if err := (&backup.BackupStorageReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
@@ -125,16 +137,13 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		os.Exit(1)
 	}
 
-	// Get operator image from env (set by Helm)
 	operatorImage := os.Getenv("OPERATOR_IMAGE")
 	if operatorImage == "" {
 		operatorImage = "certainty3452/dbtether:latest"
 	}
-
-	// Get max concurrent backups from env (default 3)
 	maxConcurrentBackups := getEnvInt("BACKUP_MAX_CONCURRENT_PER_CLUSTER", 3)
 
-	if err = (&backup.BackupReconciler{
+	if err := (&backup.BackupReconciler{
 		Client:               mgr.GetClient(),
 		Scheme:               mgr.GetScheme(),
 		Image:                operatorImage,
@@ -145,11 +154,8 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		os.Exit(1)
 	}
 
-	// Get zap logger for schedule controller
-	zapLog := ctrl.Log.WithName("controllers").WithName("BackupSchedule")
 	sugarLog, _ := zap.NewDevelopment()
-
-	if err = (&backup.BackupScheduleReconciler{
+	if err := (&backup.BackupScheduleReconciler{
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),
 		Log:       sugarLog.Sugar(),
@@ -158,10 +164,8 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		setupLog.Error(err, errUnableToCreateController, "controller", "BackupSchedule")
 		os.Exit(1)
 	}
-	_ = zapLog // silence unused
 
-	// Restore controller
-	if err = (&backup.RestoreReconciler{
+	if err := (&backup.RestoreReconciler{
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),
 		Image:     operatorImage,
@@ -170,20 +174,15 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		setupLog.Error(err, errUnableToCreateController, "controller", "Restore")
 		os.Exit(1)
 	}
+}
 
+func setupHealthChecks(mgr ctrl.Manager) {
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
 	}
-
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
-		os.Exit(1)
-	}
-
-	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
 }

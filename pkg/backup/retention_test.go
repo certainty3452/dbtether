@@ -74,6 +74,7 @@ func TestCalculateKeepSet(t *testing.T) {
 
 	// Create test files spanning several days
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
+	rm.Now = func() time.Time { return now }
 	files := []BackupFile{
 		{Key: "backup-20260120-100000.sql.gz", Timestamp: now.Add(-2 * time.Hour)},       // today 10:00
 		{Key: "backup-20260120-020000.sql.gz", Timestamp: now.Add(-10 * time.Hour)},      // today 02:00
@@ -161,6 +162,7 @@ func TestCalculateKeepSet_Weekly(t *testing.T) {
 
 	// Create test files spanning several weeks (each Monday at 2am)
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC) // Monday Jan 20
+	rm.Now = func() time.Time { return now }
 	files := []BackupFile{
 		{Key: "backup-20260120-020000.sql.gz", Timestamp: now.Add(-10 * time.Hour)},                 // This week (Mon Jan 20)
 		{Key: "backup-20260113-020000.sql.gz", Timestamp: now.Add(-7*24*time.Hour - 10*time.Hour)},  // Week -1 (Mon Jan 13)
@@ -183,6 +185,7 @@ func TestCalculateKeepSet_Weekly(t *testing.T) {
 func TestCalculateKeepSet_Monthly(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	rm := NewRetentionManager(logger.Sugar())
+	rm.Now = func() time.Time { return time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC) }
 
 	// Create test files spanning several months (now = Jan 20, 2026)
 	files := []BackupFile{
@@ -213,6 +216,7 @@ func TestCalculateKeepSet_MultiplePerDay(t *testing.T) {
 
 	// Multiple backups per day - only first (newest) should be kept for daily
 	now := time.Date(2026, 1, 20, 18, 0, 0, 0, time.UTC)
+	rm.Now = func() time.Time { return now }
 	files := []BackupFile{
 		{Key: "backup-20260120-160000.sql.gz", Timestamp: now.Add(-2 * time.Hour)},  // 16:00
 		{Key: "backup-20260120-140000.sql.gz", Timestamp: now.Add(-4 * time.Hour)},  // 14:00
@@ -257,6 +261,7 @@ func TestCalculateKeepSet_AllPoliciesCombined(t *testing.T) {
 	//   Jan 7  = week 2026-W02
 	//   Dec 15 = week 2025-W51
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
+	rm.Now = func() time.Time { return now }
 	files := []BackupFile{
 		// Recent files (keepLast territory)
 		{Key: "backup-20260120-100000.sql.gz", Timestamp: now.Add(-2 * time.Hour)},

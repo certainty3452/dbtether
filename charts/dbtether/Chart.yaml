@@ -4,6 +4,8 @@ description: A Kubernetes operator for managing PostgreSQL databases in external
 type: application
 version: 0.3.1
 appVersion: "0.3.1"
+home: https://github.com/certainty3452/dbtether
+# icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
   - postgresql
   - postgres
@@ -12,10 +14,65 @@ keywords:
   - kubernetes
   - aurora
   - rds
+  - backup
+  - restore
   - dbtether
 maintainers:
-  - name: dbtether
-    url: https://github.com/certainty3452/dbtether
+  - name: certainty3452
+    url: https://github.com/certainty3452
 sources:
   - https://github.com/certainty3452/dbtether
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/operator: "true"
+  artifacthub.io/operatorCapabilities: Full Lifecycle
+  artifacthub.io/category: database
+  artifacthub.io/crds: |
+    - kind: DBCluster
+      version: v1alpha1
+      name: dbclusters.dbtether.io
+      displayName: Database Cluster
+      description: Connection to external PostgreSQL cluster (RDS, Aurora, etc.)
+    - kind: Database
+      version: v1alpha1
+      name: databases.dbtether.io
+      displayName: Database
+      description: PostgreSQL database managed by the operator
+    - kind: DatabaseUser
+      version: v1alpha1
+      name: databaseusers.dbtether.io
+      displayName: Database User
+      description: PostgreSQL user with automatic password rotation
+    - kind: BackupStorage
+      version: v1alpha1
+      name: backupstorages.dbtether.io
+      displayName: Backup Storage
+      description: S3/GCS/Azure storage configuration for backups
+    - kind: Backup
+      version: v1alpha1
+      name: backups.dbtether.io
+      displayName: Backup
+      description: One-time database backup
+    - kind: BackupSchedule
+      version: v1alpha1
+      name: backupschedules.dbtether.io
+      displayName: Backup Schedule
+      description: Scheduled database backups with retention policy
+    - kind: Restore
+      version: v1alpha1
+      name: restores.dbtether.io
+      displayName: Restore
+      description: Restore database from backup
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://github.com/certainty3452/dbtether#readme
+    - name: Source
+      url: https://github.com/certainty3452/dbtether
+  artifacthub.io/changes: |
+    - kind: added
+      description: Restore CRD with latestFrom support
+    - kind: added
+      description: Multi-cloud backup storage (S3, GCS, Azure)
+    - kind: added
+      description: Retention policies for backups
 

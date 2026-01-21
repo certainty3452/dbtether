@@ -235,4 +235,3 @@ func TestRestoreSource_Priority(t *testing.T) {
 		assert.True(t, hasLatestFrom)
 	})
 }
-

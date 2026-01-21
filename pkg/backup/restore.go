@@ -141,7 +141,7 @@ func dropAndRecreateDatabase(ctx context.Context, cfg *RestoreConfig, logger *sl
 		WHERE datname = '%s' AND pid <> pg_backend_pid()
 	`, cfg.Database)
 
-	cmd := exec.CommandContext(ctx, "psql", connStr, "-c", dropConnsSQL)
+	cmd := exec.CommandContext(ctx, "psql", connStr, "-c", dropConnsSQL) //nolint:gosec // intentional variable-based command
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", cfg.Password))
 	if output, err := cmd.CombinedOutput(); err != nil {
 		logger.Warn("failed to terminate connections", "output", string(output))
@@ -149,7 +149,7 @@ func dropAndRecreateDatabase(ctx context.Context, cfg *RestoreConfig, logger *sl
 
 	// Drop database
 	dropSQL := fmt.Sprintf("DROP DATABASE IF EXISTS %s", quoteIdentifier(cfg.Database))
-	cmd = exec.CommandContext(ctx, "psql", connStr, "-c", dropSQL)
+	cmd = exec.CommandContext(ctx, "psql", connStr, "-c", dropSQL) //nolint:gosec // intentional variable-based command
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", cfg.Password))
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to drop database: %s: %w", string(output), err)
@@ -157,7 +157,7 @@ func dropAndRecreateDatabase(ctx context.Context, cfg *RestoreConfig, logger *sl
 
 	// Create database
 	createSQL := fmt.Sprintf("CREATE DATABASE %s", quoteIdentifier(cfg.Database))
-	cmd = exec.CommandContext(ctx, "psql", connStr, "-c", createSQL)
+	cmd = exec.CommandContext(ctx, "psql", connStr, "-c", createSQL) //nolint:gosec // intentional variable-based command
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", cfg.Password))
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to create database: %s: %w", string(output), err)
@@ -176,7 +176,7 @@ func isDatabaseEmpty(ctx context.Context, cfg *RestoreConfig) (bool, error) {
 	// Count tables in public schema
 	sql := `SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public'`
 
-	cmd := exec.CommandContext(ctx, "psql", connStr, "-t", "-c", sql)
+	cmd := exec.CommandContext(ctx, "psql", connStr, "-t", "-c", sql) //nolint:gosec // intentional variable-based command
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", cfg.Password))
 	output, err := cmd.Output()
 	if err != nil {
@@ -210,7 +210,7 @@ func restoreWithPsql(ctx context.Context, cfg *RestoreConfig, backupData io.Read
 		reader = gzReader
 	}
 
-	cmd := exec.CommandContext(ctx, "psql", connStr)
+	cmd := exec.CommandContext(ctx, "psql", connStr) //nolint:gosec // intentional variable-based command
 	cmd.Stdin = reader
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", cfg.Password))
 

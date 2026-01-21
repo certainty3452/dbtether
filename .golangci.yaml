@@ -4,11 +4,6 @@ run:
   timeout: 5m
   modules-download-mode: readonly
 
-formatters:
-  enable:
-    - gofmt
-    - goimports
-
 linters:
   enable:
     - staticcheck
@@ -60,13 +55,18 @@ linters:
       excludes:
         - G104
 
-issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - funlen
-        - gosec
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - funlen
+          - gosec
 
-    - path: zz_generated\.deepcopy\.go
-      linters:
-        - all
+      - path: zz_generated\.deepcopy\.go
+        linters:
+          - all
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

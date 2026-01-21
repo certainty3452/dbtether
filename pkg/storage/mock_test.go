@@ -72,7 +72,7 @@ func TestMockClient_Download(t *testing.T) {
 
 	reader, err := client.Download(ctx, "download/file.txt")
 	require.NoError(t, err)
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 
 	downloaded, err := io.ReadAll(reader)
 	require.NoError(t, err)
@@ -249,4 +249,3 @@ func TestMockClient_ConcurrentAccess(t *testing.T) {
 
 	assert.Equal(t, 10, client.Count())
 }
-

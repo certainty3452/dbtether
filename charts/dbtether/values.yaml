@@ -5,7 +5,7 @@ replicaCount: 1
 revisionHistoryLimit: ""
 
 image:
-  repository: certainty3452/dbtether
+  repository: ghcr.io/certainty3452/dbtether
   pullPolicy: IfNotPresent
   tag: "0.3.1"
 
