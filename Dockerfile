@@ -21,10 +21,11 @@ ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -a -o manager main.go
 
 # Runtime stage with pg_dump
-FROM alpine:3.20
+FROM alpine:3.23
 
-# Install PostgreSQL client (pg_dump only, minimal)
-RUN apk add --no-cache postgresql16-client \
+# Install PostgreSQL 18 client (compatible with PG 9.x - 18.x)
+RUN apk upgrade --no-cache \
+    && apk add --no-cache postgresql18-client \
     && rm -rf /var/cache/apk/*
 
 WORKDIR /

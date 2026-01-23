@@ -2,11 +2,6 @@
 
 This document outlines planned features and improvements for the dbtether operator.
 
-## User & Password Management
-
-- [ ] **Customizable secret keys** via `spec.secretTemplate`
-  - Choose between `DATABASE_*`, `DB_*`, or custom keys
-
 - [ ] **Multi-database access** — decouple user from single database binding:
   - `spec.databaseRefs[]` instead of `spec.databaseRef` — grant access to multiple databases
   - Phase 1: same-namespace only
@@ -18,6 +13,9 @@ This document outlines planned features and improvements for the dbtether operat
 - [ ] **Database templates** via `spec.template` (for encoding/collation)
 - [ ] **Schema management** via `spec.schemas` (create additional schemas beyond public)
 - [ ] **Deletion protection** via `spec.deletionProtection`
+  - Prevents accidental CRD deletion (not just database in PostgreSQL)
+  - Implementation: Finalizer (simple) or ValidatingWebhook (better UX)
+  - User must first set `deletionProtection: false`, then delete
 - [ ] **Explicit adoption mode** via `spec.adopt: true` for existing databases
 
 ## Observability
@@ -37,7 +35,7 @@ This document outlines planned features and improvements for the dbtether operat
 
 - [ ] **AWS IAM Authentication** for RDS/Aurora
   - Use AWS IAM roles instead of long-lived passwords
-  - Operator gets temporary credentials via IRSA (IAM Roles for Service Accounts)
+  - Support both IRSA and EKS Pod Identity Agent
   - Eliminates secret sprawl, enables CloudTrail audit
 
 - [ ] **Azure AD Authentication** for Azure Database for PostgreSQL

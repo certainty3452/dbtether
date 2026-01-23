@@ -13,9 +13,7 @@ A Kubernetes operator for managing PostgreSQL databases in external clusters (AW
 ## Installation
 
 ```bash
-helm install dbtether oci://ghcr.io/certainty3452/charts/dbtether \
-  --namespace dbtether \
-  --create-namespace
+helm upgrade -i dbtether oci://ghcr.io/certainty3452/charts/dbtether -n dbtether --create-namespace
 ```
 
 ## CRDs Overview

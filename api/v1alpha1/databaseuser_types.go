@@ -35,6 +35,9 @@ type DatabaseUserSpec struct {
 	// +kubebuilder:validation:Enum=Delete;Retain
 	// +kubebuilder:default=Delete
 	DeletionPolicy string `json:"deletionPolicy,omitempty"`
+
+	// +optional
+	Secret *SecretConfig `json:"secret,omitempty"`
 }
 
 type DatabaseReference struct {
@@ -66,6 +69,39 @@ type RotationConfig struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=365
 	Days int `json:"days"`
+}
+
+type SecretConfig struct {
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Name string `json:"name,omitempty"`
+
+	// +optional
+	// +kubebuilder:validation:Enum=raw;DB;DATABASE;POSTGRES;custom
+	// +kubebuilder:default=raw
+	Template string `json:"template,omitempty"`
+
+	// +optional
+	Keys *SecretKeys `json:"keys,omitempty"`
+
+	// +optional
+	// +kubebuilder:validation:Enum=Fail;Adopt;Merge
+	// +kubebuilder:default=Fail
+	OnConflict string `json:"onConflict,omitempty"`
+}
+
+type SecretKeys struct {
+	// +optional
+	Host string `json:"host,omitempty"`
+	// +optional
+	Port string `json:"port,omitempty"`
+	// +optional
+	Database string `json:"database,omitempty"`
+	// +optional
+	User string `json:"user,omitempty"`
+	// +optional
+	Password string `json:"password,omitempty"`
 }
 
 type DatabaseUserStatus struct {

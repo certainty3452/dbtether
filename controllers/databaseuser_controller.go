@@ -47,7 +47,7 @@ func (r *DatabaseUserReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// Check if secret still exists before early exit
 	if user.Status.Phase == "Ready" && user.Status.ObservedGeneration == user.Generation {
-		secretName := user.Name + "-credentials"
+		secretName := r.getSecretName(&user)
 		var secret corev1.Secret
 		if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: user.Namespace}, &secret); err == nil {
 			return ctrl.Result{}, nil
@@ -88,6 +88,72 @@ func (r *DatabaseUserReconciler) getDatabaseNameFromSpec(db *databasesv1alpha1.D
 		return db.Spec.DatabaseName
 	}
 	return strings.ReplaceAll(db.Name, "-", "_")
+}
+
+func (r *DatabaseUserReconciler) getSecretName(user *databasesv1alpha1.DatabaseUser) string {
+	if user.Spec.Secret != nil && user.Spec.Secret.Name != "" {
+		return user.Spec.Secret.Name
+	}
+	return user.Name + "-credentials"
+}
+
+func (r *DatabaseUserReconciler) getSecretKeys(user *databasesv1alpha1.DatabaseUser) (host, port, db, username, password string) {
+	host, port, db, username, password = "host", "port", "database", "user", "password"
+
+	if user.Spec.Secret == nil {
+		return
+	}
+
+	switch user.Spec.Secret.Template {
+	case "DB":
+		return "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"
+	case "DATABASE":
+		return "DATABASE_HOST", "DATABASE_PORT", "DATABASE_NAME", "DATABASE_USER", "DATABASE_PASSWORD"
+	case "POSTGRES":
+		return "POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DATABASE", "POSTGRES_USER", "POSTGRES_PASSWORD"
+	case "custom":
+		host, port, db, username, password = r.applyCustomKeys(user.Spec.Secret.Keys, host, port, db, username, password)
+	}
+	return
+}
+
+func (r *DatabaseUserReconciler) applyCustomKeys(k *databasesv1alpha1.SecretKeys, host, port, db, username, password string) (outHost, outPort, outDB, outUser, outPwd string) {
+	outHost, outPort, outDB, outUser, outPwd = host, port, db, username, password
+	if k == nil {
+		return
+	}
+	if k.Host != "" {
+		outHost = k.Host
+	}
+	if k.Port != "" {
+		outPort = k.Port
+	}
+	if k.Database != "" {
+		outDB = k.Database
+	}
+	if k.User != "" {
+		outUser = k.User
+	}
+	if k.Password != "" {
+		outPwd = k.Password
+	}
+	return
+}
+
+func (r *DatabaseUserReconciler) isSecretOwnedByUser(secret *corev1.Secret, user *databasesv1alpha1.DatabaseUser) bool {
+	for _, ref := range secret.OwnerReferences {
+		if ref.Kind == "DatabaseUser" && ref.Name == user.Name && ref.UID == user.UID {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *DatabaseUserReconciler) getOnConflictPolicy(user *databasesv1alpha1.DatabaseUser) string {
+	if user.Spec.Secret != nil && user.Spec.Secret.OnConflict != "" {
+		return user.Spec.Secret.OnConflict
+	}
+	return "Fail"
 }
 
 func (r *DatabaseUserReconciler) ensureFinalizer(ctx context.Context, user *databasesv1alpha1.DatabaseUser) (*ctrl.Result, error) {
@@ -332,18 +398,32 @@ func (r *DatabaseUserReconciler) ensureSecret(ctx context.Context, user *databas
 	pgClient postgres.ClientInterface) (password, secretName string, passwordChanged bool, err error) {
 
 	logger := log.FromContext(ctx)
-	secretName = user.Name + "-credentials"
+	secretName = r.getSecretName(user)
 	username := r.getUsername(user)
 
 	var secret corev1.Secret
 	err = r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: user.Namespace}, &secret)
 
-	// Secret exists - check if rotation is needed
+	// Secret exists
 	if err == nil {
-		if r.shouldRotatePassword(user) {
-			return r.rotatePassword(ctx, user, &secret, cluster, db, pgClient, username)
+		if r.isSecretOwnedByUser(&secret, user) {
+			if r.shouldRotatePassword(user) {
+				return r.rotatePassword(ctx, user, &secret, cluster, db, pgClient, username)
+			}
+			_, _, _, _, pwdKey := r.getSecretKeys(user)
+			return string(secret.Data[pwdKey]), secretName, false, nil
 		}
-		return string(secret.Data["DATABASE_PASSWORD"]), secretName, false, nil
+
+		// Not our secret - handle based on onConflict policy
+		policy := r.getOnConflictPolicy(user)
+		switch policy {
+		case "Adopt":
+			return r.adoptSecret(ctx, user, &secret, cluster, db, pgClient, username)
+		case "Merge":
+			return r.mergeSecret(ctx, user, &secret, cluster, db, pgClient, username)
+		default:
+			return "", "", false, fmt.Errorf("secret %s already exists and is not owned by this DatabaseUser", secretName)
+		}
 	}
 
 	if !errors.IsNotFound(err) {
@@ -370,6 +450,7 @@ func (r *DatabaseUserReconciler) ensureSecret(ctx context.Context, user *databas
 		}
 	}
 
+	hostKey, portKey, dbKey, userKey, pwdKey := r.getSecretKeys(user)
 	secret = corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      secretName,
@@ -379,11 +460,11 @@ func (r *DatabaseUserReconciler) ensureSecret(ctx context.Context, user *databas
 			},
 		},
 		StringData: map[string]string{
-			"DATABASE_HOST":     cluster.Spec.Endpoint,
-			"DATABASE_PORT":     fmt.Sprintf("%d", cluster.Spec.Port),
-			"DATABASE_NAME":     r.getDatabaseNameFromSpec(db),
-			"DATABASE_USER":     username,
-			"DATABASE_PASSWORD": password,
+			hostKey: cluster.Spec.Endpoint,
+			portKey: fmt.Sprintf("%d", cluster.Spec.Port),
+			dbKey:   r.getDatabaseNameFromSpec(db),
+			userKey: username,
+			pwdKey:  password,
 		},
 	}
 
@@ -422,11 +503,12 @@ func (r *DatabaseUserReconciler) rotatePassword(ctx context.Context, user *datab
 	}
 
 	// Update secret in-place
-	secret.Data["DATABASE_PASSWORD"] = []byte(password)
-	secret.Data["DATABASE_HOST"] = []byte(cluster.Spec.Endpoint)
-	secret.Data["DATABASE_PORT"] = []byte(fmt.Sprintf("%d", cluster.Spec.Port))
-	secret.Data["DATABASE_NAME"] = []byte(r.getDatabaseNameFromSpec(db))
-	secret.Data["DATABASE_USER"] = []byte(username)
+	hostKey, portKey, dbKey, userKey, pwdKey := r.getSecretKeys(user)
+	secret.Data[pwdKey] = []byte(password)
+	secret.Data[hostKey] = []byte(cluster.Spec.Endpoint)
+	secret.Data[portKey] = []byte(fmt.Sprintf("%d", cluster.Spec.Port))
+	secret.Data[dbKey] = []byte(r.getDatabaseNameFromSpec(db))
+	secret.Data[userKey] = []byte(username)
 
 	if err := r.Update(ctx, secret); err != nil {
 		return "", "", false, fmt.Errorf("failed to update secret: %w", err)
@@ -434,6 +516,87 @@ func (r *DatabaseUserReconciler) rotatePassword(ctx context.Context, user *datab
 
 	logger.Info("password rotated successfully", "username", username)
 	return password, secretName, true, nil
+}
+
+func (r *DatabaseUserReconciler) adoptSecret(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	secret *corev1.Secret, cluster *databasesv1alpha1.DBCluster, db *databasesv1alpha1.Database,
+	pgClient postgres.ClientInterface, username string) (password, secretName string, passwordChanged bool, err error) {
+
+	logger := log.FromContext(ctx)
+	logger.Info("adopting existing secret", "secret", secret.Name)
+
+	length := user.Spec.Password.Length
+	if length == 0 {
+		length = postgres.DefaultPasswordLength
+	}
+	password, err = postgres.GeneratePassword(length)
+	if err != nil {
+		return "", "", false, fmt.Errorf("failed to generate password: %w", err)
+	}
+
+	if err = pgClient.SetPassword(ctx, username, password); err != nil {
+		return "", "", false, fmt.Errorf("failed to set password during adopt: %w", err)
+	}
+
+	if err = controllerutil.SetControllerReference(user, secret, r.Scheme); err != nil {
+		return "", "", false, fmt.Errorf("failed to set controller reference: %w", err)
+	}
+
+	hostKey, portKey, dbKey, userKey, pwdKey := r.getSecretKeys(user)
+	secret.Data = map[string][]byte{
+		hostKey: []byte(cluster.Spec.Endpoint),
+		portKey: []byte(fmt.Sprintf("%d", cluster.Spec.Port)),
+		dbKey:   []byte(r.getDatabaseNameFromSpec(db)),
+		userKey: []byte(username),
+		pwdKey:  []byte(password),
+	}
+
+	if err = r.Update(ctx, secret); err != nil {
+		return "", "", false, fmt.Errorf("failed to update secret during adopt: %w", err)
+	}
+
+	return password, secret.Name, true, nil
+}
+
+func (r *DatabaseUserReconciler) mergeSecret(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	secret *corev1.Secret, cluster *databasesv1alpha1.DBCluster, db *databasesv1alpha1.Database,
+	pgClient postgres.ClientInterface, username string) (password, secretName string, passwordChanged bool, err error) {
+
+	logger := log.FromContext(ctx)
+	logger.Info("merging into existing secret", "secret", secret.Name)
+
+	length := user.Spec.Password.Length
+	if length == 0 {
+		length = postgres.DefaultPasswordLength
+	}
+	password, err = postgres.GeneratePassword(length)
+	if err != nil {
+		return "", "", false, fmt.Errorf("failed to generate password: %w", err)
+	}
+
+	if err = pgClient.SetPassword(ctx, username, password); err != nil {
+		return "", "", false, fmt.Errorf("failed to set password during merge: %w", err)
+	}
+
+	if err = controllerutil.SetControllerReference(user, secret, r.Scheme); err != nil {
+		return "", "", false, fmt.Errorf("failed to set controller reference: %w", err)
+	}
+
+	if secret.Data == nil {
+		secret.Data = make(map[string][]byte)
+	}
+	hostKey, portKey, dbKey, userKey, pwdKey := r.getSecretKeys(user)
+	secret.Data[hostKey] = []byte(cluster.Spec.Endpoint)
+	secret.Data[portKey] = []byte(fmt.Sprintf("%d", cluster.Spec.Port))
+	secret.Data[dbKey] = []byte(r.getDatabaseNameFromSpec(db))
+	secret.Data[userKey] = []byte(username)
+	secret.Data[pwdKey] = []byte(password)
+
+	if err = r.Update(ctx, secret); err != nil {
+		return "", "", false, fmt.Errorf("failed to update secret during merge: %w", err)
+	}
+
+	return password, secret.Name, true, nil
 }
 
 func (r *DatabaseUserReconciler) handleDeletion(ctx context.Context, user *databasesv1alpha1.DatabaseUser) (ctrl.Result, error) {

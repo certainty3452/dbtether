@@ -7,6 +7,8 @@ bin/
 
 # Test
 cover.out
+coverage.out
+coverage_envtest.out
 *.test
 
 # Dependency
@@ -34,6 +36,7 @@ debug
 .env
 .env.local
 
-# Build
+# Build (contains local image refs)
 Makefile
+
 

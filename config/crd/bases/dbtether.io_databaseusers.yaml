@@ -113,6 +113,42 @@ spec:
                 required:
                 - days
                 type: object
+              secret:
+                properties:
+                  keys:
+                    properties:
+                      database:
+                        type: string
+                      host:
+                        type: string
+                      password:
+                        type: string
+                      port:
+                        type: string
+                      user:
+                        type: string
+                    type: object
+                  name:
+                    maxLength: 253
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  onConflict:
+                    default: Fail
+                    enum:
+                    - Fail
+                    - Adopt
+                    - Merge
+                    type: string
+                  template:
+                    default: raw
+                    enum:
+                    - raw
+                    - DB
+                    - DATABASE
+                    - POSTGRES
+                    - custom
+                    type: string
+                type: object
               username:
                 maxLength: 63
                 pattern: ^[a-z_][a-z0-9_]*$

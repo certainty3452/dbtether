@@ -501,4 +501,310 @@ var _ = Describe("DatabaseUser Controller", func() {
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
 		})
 	})
+
+	Context("When DatabaseUser has custom secret config", func() {
+		It("Should accept custom secret name", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-custom-secret-name",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					DatabaseRef: databasesv1alpha1.DatabaseReference{
+						Name: databaseName,
+					},
+					Privileges: "readonly",
+					Secret: &databasesv1alpha1.SecretConfig{
+						Name: "my-custom-creds",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying spec.secret.name is stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-custom-secret-name",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Secret).ShouldNot(BeNil())
+			Expect(createdUser.Spec.Secret.Name).Should(Equal("my-custom-creds"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should accept DB template", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-db-template",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					DatabaseRef: databasesv1alpha1.DatabaseReference{
+						Name: databaseName,
+					},
+					Privileges: "readonly",
+					Secret: &databasesv1alpha1.SecretConfig{
+						Template: "DB",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying spec.secret.template is stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-db-template",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Secret).ShouldNot(BeNil())
+			Expect(createdUser.Spec.Secret.Template).Should(Equal("DB"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should accept DATABASE template", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-database-template",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					DatabaseRef: databasesv1alpha1.DatabaseReference{
+						Name: databaseName,
+					},
+					Privileges: "readwrite",
+					Secret: &databasesv1alpha1.SecretConfig{
+						Template: "DATABASE",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying spec.secret.template is stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-database-template",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Secret).ShouldNot(BeNil())
+			Expect(createdUser.Spec.Secret.Template).Should(Equal("DATABASE"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should accept custom template with keys", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-custom-keys",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					DatabaseRef: databasesv1alpha1.DatabaseReference{
+						Name: databaseName,
+					},
+					Privileges: "admin",
+					Secret: &databasesv1alpha1.SecretConfig{
+						Name:     "pg-credentials",
+						Template: "custom",
+						Keys: &databasesv1alpha1.SecretKeys{
+							Host:     "PGHOST",
+							Port:     "PGPORT",
+							Database: "PGDATABASE",
+							User:     "PGUSER",
+							Password: "PGPASSWORD",
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying spec.secret config is stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-custom-keys",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Secret).ShouldNot(BeNil())
+			Expect(createdUser.Spec.Secret.Name).Should(Equal("pg-credentials"))
+			Expect(createdUser.Spec.Secret.Template).Should(Equal("custom"))
+			Expect(createdUser.Spec.Secret.Keys).ShouldNot(BeNil())
+			Expect(createdUser.Spec.Secret.Keys.Host).Should(Equal("PGHOST"))
+			Expect(createdUser.Spec.Secret.Keys.Port).Should(Equal("PGPORT"))
+			Expect(createdUser.Spec.Secret.Keys.Database).Should(Equal("PGDATABASE"))
+			Expect(createdUser.Spec.Secret.Keys.User).Should(Equal("PGUSER"))
+			Expect(createdUser.Spec.Secret.Keys.Password).Should(Equal("PGPASSWORD"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should accept partial custom keys", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-partial-keys",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					DatabaseRef: databasesv1alpha1.DatabaseReference{
+						Name: databaseName,
+					},
+					Privileges: "readonly",
+					Secret: &databasesv1alpha1.SecretConfig{
+						Template: "custom",
+						Keys: &databasesv1alpha1.SecretKeys{
+							Password: "SECRET_PWD",
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying partial keys are stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-partial-keys",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Secret).ShouldNot(BeNil())
+			Expect(createdUser.Spec.Secret.Keys).ShouldNot(BeNil())
+			Expect(createdUser.Spec.Secret.Keys.Password).Should(Equal("SECRET_PWD"))
+			Expect(createdUser.Spec.Secret.Keys.Host).Should(BeEmpty())
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+	})
+
+	Context("When DatabaseUser has onConflict config", func() {
+		It("Should accept Fail onConflict policy", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-conflict-fail",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					DatabaseRef: databasesv1alpha1.DatabaseReference{
+						Name: databaseName,
+					},
+					Privileges: "readonly",
+					Secret: &databasesv1alpha1.SecretConfig{
+						OnConflict: "Fail",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying spec.secret.onConflict is stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-conflict-fail",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Secret).ShouldNot(BeNil())
+			Expect(createdUser.Spec.Secret.OnConflict).Should(Equal("Fail"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should accept Adopt onConflict policy", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-conflict-adopt",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					DatabaseRef: databasesv1alpha1.DatabaseReference{
+						Name: databaseName,
+					},
+					Privileges: "readwrite",
+					Secret: &databasesv1alpha1.SecretConfig{
+						OnConflict: "Adopt",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying spec.secret.onConflict is stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-conflict-adopt",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Secret).ShouldNot(BeNil())
+			Expect(createdUser.Spec.Secret.OnConflict).Should(Equal("Adopt"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should accept Merge onConflict policy", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-conflict-merge",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					DatabaseRef: databasesv1alpha1.DatabaseReference{
+						Name: databaseName,
+					},
+					Privileges: "admin",
+					Secret: &databasesv1alpha1.SecretConfig{
+						Name:       "merged-secret",
+						OnConflict: "Merge",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying spec.secret config is stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-conflict-merge",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Secret).ShouldNot(BeNil())
+			Expect(createdUser.Spec.Secret.Name).Should(Equal("merged-secret"))
+			Expect(createdUser.Spec.Secret.OnConflict).Should(Equal("Merge"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+	})
 })

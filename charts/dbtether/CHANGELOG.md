@@ -1,0 +1,20 @@
+# Changelog
+
+All notable changes to the dbtether Helm chart will be documented in this file.
+
+## [0.4.0] - 2026-01-26
+
+### Added
+- Custom secret name for DatabaseUser via `spec.secret.name`
+- Secret key templates: `raw`, `DB`, `DATABASE`, `POSTGRES`, `custom`
+- Custom secret keys support via `spec.secret.keys` for legacy app compatibility
+
+### Changed
+- **BREAKING**: Default secret key format changed from `DATABASE_*` to `raw` (host, port, database, user, password)
+
+## [0.3.1] - Previous
+
+### Added
+- Restore CRD with latestFrom support
+- Multi-cloud backup storage (S3, GCS, Azure)
+- Retention policies for backups

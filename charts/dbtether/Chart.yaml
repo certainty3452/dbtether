@@ -2,8 +2,8 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.3.1
-appVersion: "0.3.1"
+version: 0.4.0
+appVersion: "0.4.0"
 home: https://github.com/certainty3452/dbtether
 # icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
@@ -70,9 +70,7 @@ annotations:
       url: https://github.com/certainty3452/dbtether
   artifacthub.io/changes: |
     - kind: added
-      description: Restore CRD with latestFrom support
+      description: Custom secret name for DatabaseUser via spec.secret.name
     - kind: added
-      description: Multi-cloud backup storage (S3, GCS, Azure)
-    - kind: added
-      description: Retention policies for backups
+      description: Secret key templates (raw, DB, DATABASE, POSTGRES, custom)
 

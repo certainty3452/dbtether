@@ -5,7 +5,9 @@ import (
 	"time"
 
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
@@ -110,21 +112,348 @@ func TestDatabaseUserReconciler_PasswordLength(t *testing.T) {
 	}
 }
 
-func TestDatabaseUserReconciler_SecretName(t *testing.T) {
+func TestDatabaseUserReconciler_GetSecretName(t *testing.T) {
+	r := &DatabaseUserReconciler{}
+
 	tests := []struct {
-		name     string
-		userName string
-		want     string
+		name string
+		user *databasesv1alpha1.DatabaseUser
+		want string
 	}{
-		{"simple", "myuser", "myuser-credentials"},
-		{"with-dashes", testUserName, "my-user-credentials"},
+		{
+			name: "default when secret is nil",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-user"},
+				Spec:       databasesv1alpha1.DatabaseUserSpec{},
+			},
+			want: "my-user-credentials",
+		},
+		{
+			name: "default when secret.name is empty",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-user"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{},
+				},
+			},
+			want: "my-user-credentials",
+		},
+		{
+			name: "custom name",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-user"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Name: "custom-secret"},
+				},
+			},
+			want: "custom-secret",
+		},
+		{
+			name: "custom name with template",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-user"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{
+						Name:     "db-creds",
+						Template: "DATABASE",
+					},
+				},
+			},
+			want: "db-creds",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			secretName := tt.userName + "-credentials"
-			if secretName != tt.want {
-				t.Errorf("secretName = %v, want %v", secretName, tt.want)
+			got := r.getSecretName(tt.user)
+			if got != tt.want {
+				t.Errorf("getSecretName() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDatabaseUserReconciler_GetSecretKeys(t *testing.T) {
+	r := &DatabaseUserReconciler{}
+
+	tests := []struct {
+		name     string
+		user     *databasesv1alpha1.DatabaseUser
+		wantHost string
+		wantPort string
+		wantDB   string
+		wantUser string
+		wantPwd  string
+	}{
+		{
+			name: "default raw template (nil secret)",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{},
+			},
+			wantHost: "host", wantPort: "port", wantDB: "database",
+			wantUser: "user", wantPwd: "password",
+		},
+		{
+			name: "explicit raw template",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Template: "raw"},
+				},
+			},
+			wantHost: "host", wantPort: "port", wantDB: "database",
+			wantUser: "user", wantPwd: "password",
+		},
+		{
+			name: "empty template defaults to raw",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Template: ""},
+				},
+			},
+			wantHost: "host", wantPort: "port", wantDB: "database",
+			wantUser: "user", wantPwd: "password",
+		},
+		{
+			name: "DB template",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Template: "DB"},
+				},
+			},
+			wantHost: "DB_HOST", wantPort: "DB_PORT", wantDB: "DB_NAME",
+			wantUser: "DB_USER", wantPwd: "DB_PASSWORD",
+		},
+		{
+			name: "DATABASE template",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Template: "DATABASE"},
+				},
+			},
+			wantHost: "DATABASE_HOST", wantPort: "DATABASE_PORT", wantDB: "DATABASE_NAME",
+			wantUser: "DATABASE_USER", wantPwd: "DATABASE_PASSWORD",
+		},
+		{
+			name: "POSTGRES template",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Template: "POSTGRES"},
+				},
+			},
+			wantHost: "POSTGRES_HOST", wantPort: "POSTGRES_PORT", wantDB: "POSTGRES_DATABASE",
+			wantUser: "POSTGRES_USER", wantPwd: "POSTGRES_PASSWORD",
+		},
+		{
+			name: "custom template with all keys",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{
+						Template: "custom",
+						Keys: &databasesv1alpha1.SecretKeys{
+							Host: "PGHOST", Port: "PGPORT", Database: "PGDATABASE",
+							User: "PGUSER", Password: "PGPASSWORD",
+						},
+					},
+				},
+			},
+			wantHost: "PGHOST", wantPort: "PGPORT", wantDB: "PGDATABASE",
+			wantUser: "PGUSER", wantPwd: "PGPASSWORD",
+		},
+		{
+			name: "custom template with partial keys",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{
+						Template: "custom",
+						Keys:     &databasesv1alpha1.SecretKeys{Password: "SECRET_PWD"},
+					},
+				},
+			},
+			wantHost: "host", wantPort: "port", wantDB: "database",
+			wantUser: "user", wantPwd: "SECRET_PWD",
+		},
+		{
+			name: "custom template with nil keys uses defaults",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Template: "custom"},
+				},
+			},
+			wantHost: "host", wantPort: "port", wantDB: "database",
+			wantUser: "user", wantPwd: "password",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotHost, gotPort, gotDB, gotUser, gotPwd := r.getSecretKeys(tt.user)
+			if gotHost != tt.wantHost {
+				t.Errorf("host = %v, want %v", gotHost, tt.wantHost)
+			}
+			if gotPort != tt.wantPort {
+				t.Errorf("port = %v, want %v", gotPort, tt.wantPort)
+			}
+			if gotDB != tt.wantDB {
+				t.Errorf("database = %v, want %v", gotDB, tt.wantDB)
+			}
+			if gotUser != tt.wantUser {
+				t.Errorf("user = %v, want %v", gotUser, tt.wantUser)
+			}
+			if gotPwd != tt.wantPwd {
+				t.Errorf("password = %v, want %v", gotPwd, tt.wantPwd)
+			}
+		})
+	}
+}
+
+func TestDatabaseUserReconciler_IsSecretOwnedByUser(t *testing.T) {
+	r := &DatabaseUserReconciler{}
+
+	userUID := types.UID("test-uid-123")
+	otherUID := types.UID("other-uid-456")
+
+	tests := []struct {
+		name   string
+		secret *corev1.Secret
+		user   *databasesv1alpha1.DatabaseUser
+		want   bool
+	}{
+		{
+			name: "secret owned by this user",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{Kind: "DatabaseUser", Name: "my-user", UID: userUID},
+					},
+				},
+			},
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-user", UID: userUID},
+			},
+			want: true,
+		},
+		{
+			name: "secret owned by different user",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{Kind: "DatabaseUser", Name: "other-user", UID: otherUID},
+					},
+				},
+			},
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-user", UID: userUID},
+			},
+			want: false,
+		},
+		{
+			name: "secret with no owner",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{},
+			},
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-user", UID: userUID},
+			},
+			want: false,
+		},
+		{
+			name: "secret owned by different kind",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{Kind: "Database", Name: "my-user", UID: userUID},
+					},
+				},
+			},
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-user", UID: userUID},
+			},
+			want: false,
+		},
+		{
+			name: "secret with same name but different UID",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{Kind: "DatabaseUser", Name: "my-user", UID: otherUID},
+					},
+				},
+			},
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-user", UID: userUID},
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := r.isSecretOwnedByUser(tt.secret, tt.user)
+			if got != tt.want {
+				t.Errorf("isSecretOwnedByUser() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDatabaseUserReconciler_GetOnConflictPolicy(t *testing.T) {
+	r := &DatabaseUserReconciler{}
+
+	tests := []struct {
+		name string
+		user *databasesv1alpha1.DatabaseUser
+		want string
+	}{
+		{
+			name: "default when secret is nil",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{},
+			},
+			want: "Fail",
+		},
+		{
+			name: "default when onConflict is empty",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{},
+				},
+			},
+			want: "Fail",
+		},
+		{
+			name: "explicit Fail",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{OnConflict: "Fail"},
+				},
+			},
+			want: "Fail",
+		},
+		{
+			name: "Adopt policy",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{OnConflict: "Adopt"},
+				},
+			},
+			want: "Adopt",
+		},
+		{
+			name: "Merge policy",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{OnConflict: "Merge"},
+				},
+			},
+			want: "Merge",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := r.getOnConflictPolicy(tt.user)
+			if got != tt.want {
+				t.Errorf("getOnConflictPolicy() = %v, want %v", got, tt.want)
 			}
 		})
 	}

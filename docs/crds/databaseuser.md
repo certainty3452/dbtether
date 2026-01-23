@@ -35,6 +35,10 @@ spec:
 | `rotation.days` | int | ❌ | — | Password rotation interval in days (1-365) |
 | `connectionLimit` | int | ❌ | `-1` | Max concurrent connections (`-1` = unlimited) |
 | `deletionPolicy` | enum | ❌ | `Delete` | What to do with user when resource is deleted |
+| `secret.name` | string | ❌ | `{name}-credentials` | Custom secret name |
+| `secret.template` | enum | ❌ | `raw` | Key format: `raw`, `DB`, `DATABASE`, `POSTGRES`, `custom` |
+| `secret.keys` | object | ❌ | — | Custom key names (when template is `custom`) |
+| `secret.onConflict` | enum | ❌ | `Fail` | Behavior if secret already exists: `Fail`, `Adopt`, `Merge` |
 
 ## username
 
@@ -115,6 +119,72 @@ password:
 - Stored only in Kubernetes Secret
 - **Regeneration**: Deleting the Secret triggers automatic password regeneration
 
+## secret
+
+Secret configuration for customizing the generated credentials:
+
+```yaml
+secret:
+  name: my-custom-secret      # Custom secret name (default: {name}-credentials)
+  template: DATABASE          # Key format: raw, DB, DATABASE, POSTGRES, custom (default: raw)
+  keys:                       # Custom key names (only when template: custom)
+    host: PGHOST
+    port: PGPORT
+    database: PGDATABASE
+    user: PGUSER
+    password: PGPASSWORD
+```
+
+### Secret Name
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `secret.name` | `{metadata.name}-credentials` | Override generated secret name |
+
+### Key Templates
+
+| Template | host | port | database | user | password |
+|----------|------|------|----------|------|----------|
+| `raw` (default) | `host` | `port` | `database` | `user` | `password` |
+| `DB` | `DB_HOST` | `DB_PORT` | `DB_NAME` | `DB_USER` | `DB_PASSWORD` |
+| `DATABASE` | `DATABASE_HOST` | `DATABASE_PORT` | `DATABASE_NAME` | `DATABASE_USER` | `DATABASE_PASSWORD` |
+| `POSTGRES` | `POSTGRES_HOST` | `POSTGRES_PORT` | `POSTGRES_DATABASE` | `POSTGRES_USER` | `POSTGRES_PASSWORD` |
+| `custom` | custom | custom | custom | custom | custom |
+
+### Custom Keys
+
+When `template: custom`, you can override individual keys. Unspecified keys use `raw` defaults:
+
+```yaml
+secret:
+  template: custom
+  keys:
+    password: SECRET_PWD  # only password is custom
+# Result: host, port, database, user, SECRET_PWD
+```
+
+### onConflict
+
+Controls behavior when a secret with the specified name already exists but is not owned by this DatabaseUser:
+
+| Policy | Behavior |
+|--------|----------|
+| `Fail` (default) | Error if secret exists and is not owned by this DatabaseUser |
+| `Adopt` | Take ownership, regenerate credentials, overwrite secret data |
+| `Merge` | Take ownership, add/update our keys while keeping existing keys |
+
+```yaml
+secret:
+  name: shared-config
+  template: POSTGRES
+  onConflict: Merge  # keep existing keys, add database credentials
+```
+
+**Use cases:**
+- `Fail` — strict mode, prevents accidental credential conflicts
+- `Adopt` — take over orphaned secrets or secrets from deleted resources
+- `Merge` — add database credentials to existing config secrets (e.g., secrets with Redis, API keys, etc.)
+
 ## deletionPolicy
 
 Determines what happens to the PostgreSQL user when the Kubernetes resource is deleted.
@@ -169,23 +239,44 @@ rotation:
 
 ## Generated Secret
 
-Operator creates a Secret with connection details:
+Operator creates a Secret with connection details. The secret name and key names depend on `spec.secret` configuration:
 
+**Default (template: raw):**
 ```yaml
 apiVersion: v1
 kind: Secret
 metadata:
-  name: <databaseuser-name>-credentials
+  name: <databaseuser-name>-credentials  # or spec.secret.name
   namespace: <databaseuser-namespace>
   ownerReferences:
     - kind: DatabaseUser
       name: <databaseuser-name>
 data:
-  username: <base64>
-  password: <base64>
   host: <base64>
   port: <base64>
   database: <base64>
+  user: <base64>
+  password: <base64>
+```
+
+**With template: DATABASE:**
+```yaml
+data:
+  DATABASE_HOST: <base64>
+  DATABASE_PORT: <base64>
+  DATABASE_NAME: <base64>
+  DATABASE_USER: <base64>
+  DATABASE_PASSWORD: <base64>
+```
+
+**With template: DB:**
+```yaml
+data:
+  DB_HOST: <base64>
+  DB_PORT: <base64>
+  DB_NAME: <base64>
+  DB_USER: <base64>
+  DB_PASSWORD: <base64>
 ```
 
 **Lifecycle:**
@@ -338,6 +429,45 @@ spec:
     length: 32
   rotation:
     days: 30  # rotate every 30 days
+```
+
+### User with custom secret name and DATABASE template
+
+```yaml
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: api-user
+  namespace: my-team
+spec:
+  databaseRef:
+    name: my-app-db
+  privileges: readwrite
+  secret:
+    name: api-db-credentials
+    template: DATABASE
+```
+
+### User with fully custom secret keys (legacy app compatibility)
+
+```yaml
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: legacy-connector
+  namespace: my-team
+spec:
+  databaseRef:
+    name: my-app-db
+  privileges: readonly
+  secret:
+    template: custom
+    keys:
+      host: POSTGRES_HOST
+      port: POSTGRES_PORT
+      database: POSTGRES_DB
+      user: POSTGRES_USER
+      password: POSTGRES_PASSWORD
 ```
 
 ## Troubleshooting

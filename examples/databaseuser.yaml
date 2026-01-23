@@ -50,3 +50,92 @@ spec:
     name: payments-db
   privileges: readwrite
   deletionPolicy: Retain    # user NOT dropped when resource deleted
+---
+# User with custom secret name and DATABASE template
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: api-user
+  namespace: team-alpha
+spec:
+  databaseRef:
+    name: orders-db
+  privileges: readwrite
+  secret:
+    name: api-db-credentials
+    template: DATABASE      # keys: DATABASE_HOST, DATABASE_PORT, etc.
+---
+# User with DB template (shorter key names)
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: worker-user
+  namespace: team-alpha
+spec:
+  databaseRef:
+    name: orders-db
+  privileges: readwrite
+  secret:
+    template: DB            # keys: DB_HOST, DB_PORT, etc.
+---
+# User with POSTGRES template (for standard PostgreSQL env vars)
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: postgres-app
+  namespace: team-alpha
+spec:
+  databaseRef:
+    name: orders-db
+  privileges: readwrite
+  secret:
+    template: POSTGRES      # keys: POSTGRES_HOST, POSTGRES_PORT, etc.
+---
+# User with fully custom secret keys (for legacy app compatibility)
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: legacy-connector
+  namespace: team-alpha
+spec:
+  databaseRef:
+    name: orders-db
+  privileges: readonly
+  secret:
+    name: postgres-config
+    template: custom
+    keys:
+      host: PGHOST
+      port: PGPORT
+      database: PGDATABASE
+      user: PGUSER
+      password: PGPASSWORD
+---
+# User with onConflict: Adopt - take over existing secret
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: adopt-user
+  namespace: team-alpha
+spec:
+  databaseRef:
+    name: orders-db
+  privileges: readwrite
+  secret:
+    name: orphaned-secret
+    onConflict: Adopt     # take ownership and overwrite
+---
+# User with onConflict: Merge - add credentials to existing secret
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: merge-user
+  namespace: team-alpha
+spec:
+  databaseRef:
+    name: orders-db
+  privileges: readwrite
+  secret:
+    name: app-config       # existing secret with REDIS_URL, API_KEY, etc.
+    template: raw
+    onConflict: Merge      # keeps existing keys, adds: host, port, database, user, password

@@ -64,3 +64,25 @@ jobs:
           go run sigs.k8s.io/controller-tools/cmd/controller-gen@latest rbac:roleName=manager-role crd paths="./..." output:crd:artifacts:config=config/crd/bases
           git diff --exit-code config/crd/bases/
 
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner (filesystem)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'  # Fail on CRITICAL/HIGH
+          ignore-unfixed: true
+
+      - name: Run Trivy vulnerability scanner (config)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'  # Don't fail on misconfigs, just report
+

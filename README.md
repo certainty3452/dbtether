@@ -3,6 +3,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/certainty3452/dbtether)](https://go.dev/)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.31+-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io/)
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/dbtether)](https://artifacthub.io/packages/helm/dbtether/dbtether)
 
 > Kubernetes operator for external PostgreSQL databases - manage AWS Aurora, RDS, and self-hosted databases and users declaratively via CRDs.
 
@@ -50,20 +51,7 @@ As a GitOps enthusiast, this operator fits perfectly into my workflow. I hope it
 ### Using Helm (recommended)
 
 ```bash
-# Install from OCI registry (Helm 3.8+)
-helm install dbtether oci://ghcr.io/certainty3452/charts/dbtether \
-  --namespace dbtether \
-  --create-namespace
-
-# Or with specific version
-helm install dbtether oci://ghcr.io/certainty3452/charts/dbtether \
-  --version 0.3.1 \
-  --namespace dbtether \
-  --create-namespace
-
-# Upgrade
-helm upgrade dbtether oci://ghcr.io/certainty3452/charts/dbtether \
-  --namespace dbtether
+helm upgrade -i dbtether oci://ghcr.io/certainty3452/charts/dbtether -n dbtether --create-namespace
 ```
 
 ### Using kubectl (from source)
@@ -200,6 +188,10 @@ See full documentation in [docs/](docs/README.md):
 - `spec.privileges` - `readonly`, `readwrite`, or `admin` (required)
 - `spec.username` - PostgreSQL username (defaults to metadata.name)
 - `spec.password.length` - Password length (default 16, range 12-64)
+- `spec.secret.name` - Custom secret name (default: `{name}-credentials`)
+- `spec.secret.template` - Key format: `raw` (default), `DB`, `DATABASE`, `POSTGRES`, `custom`
+- `spec.secret.keys` - Custom key names (when template is `custom`)
+- `spec.secret.onConflict` - If secret exists: `Fail` (default), `Adopt`, `Merge`
 
 **BackupStorage:**
 - `spec.s3.bucket` - S3 bucket name (required for S3)
