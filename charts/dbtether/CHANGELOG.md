@@ -2,6 +2,12 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.4.1] - 2026-01-26
+
+### Fixed
+- Image tag in values.yaml now correctly matches chart appVersion
+- Release pipeline now auto-updates image.tag and syncs CRDs
+
 ## [0.4.0] - 2026-01-26
 
 ### Added

@@ -64,6 +64,41 @@ jobs:
           go run sigs.k8s.io/controller-tools/cmd/controller-gen@latest rbac:roleName=manager-role crd paths="./..." output:crd:artifacts:config=config/crd/bases
           git diff --exit-code config/crd/bases/
 
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify image.tag matches appVersion
+        run: |
+          APP_VERSION=$(grep '^appVersion:' charts/dbtether/Chart.yaml | sed 's/appVersion: *"\(.*\)"/\1/')
+          IMAGE_TAG=$(grep '^\s*tag:' charts/dbtether/values.yaml | sed 's/.*tag: *"\(.*\)"/\1/')
+          
+          echo "Chart appVersion: $APP_VERSION"
+          echo "Image tag: $IMAGE_TAG"
+          
+          if [ "$APP_VERSION" != "$IMAGE_TAG" ]; then
+            echo "ERROR: image.tag ($IMAGE_TAG) does not match appVersion ($APP_VERSION)"
+            echo "Please update charts/dbtether/values.yaml to match Chart.yaml appVersion"
+            exit 1
+          fi
+          echo "✓ Versions match"
+
+      - name: Verify chart CRDs match generated CRDs
+        run: |
+          echo "Comparing config/crd/bases/ with charts/dbtether/crds/"
+          if ! diff -q config/crd/bases/ charts/dbtether/crds/ > /dev/null 2>&1; then
+            echo "ERROR: Chart CRDs are out of sync with generated CRDs"
+            echo "Please copy CRDs: cp config/crd/bases/*.yaml charts/dbtether/crds/"
+            diff config/crd/bases/ charts/dbtether/crds/
+            exit 1
+          fi
+          echo "✓ CRDs are in sync"
+
+      - name: Lint Helm chart
+        run: |
+          helm lint charts/dbtether
+
   security:
     runs-on: ubuntu-latest
     steps:

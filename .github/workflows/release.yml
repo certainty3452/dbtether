@@ -141,10 +141,20 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
-      - name: Update Chart version
+      - name: Update Chart version and image tag
         run: |
+          # Update Chart.yaml version and appVersion
           sed -i "s/^version:.*/version: ${{ steps.version.outputs.VERSION }}/" charts/dbtether/Chart.yaml
           sed -i "s/^appVersion:.*/appVersion: \"${{ steps.version.outputs.VERSION }}\"/" charts/dbtether/Chart.yaml
+          
+          # Update image.tag in values.yaml to match the release version
+          sed -i 's/^\(\s*tag:\s*\)"[^"]*"/\1"${{ steps.version.outputs.VERSION }}"/' charts/dbtether/values.yaml
+
+      - name: Sync CRDs from config to chart
+        run: |
+          # Ensure chart CRDs are always up-to-date with generated CRDs
+          cp -v config/crd/bases/*.yaml charts/dbtether/crds/
+          echo "CRDs synced successfully"
 
       - name: Package and push Helm chart to OCI
         run: |
