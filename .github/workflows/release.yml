@@ -143,18 +143,53 @@ jobs:
 
       - name: Update Chart version and image tag
         run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          
           # Update Chart.yaml version and appVersion
-          sed -i "s/^version:.*/version: ${{ steps.version.outputs.VERSION }}/" charts/dbtether/Chart.yaml
-          sed -i "s/^appVersion:.*/appVersion: \"${{ steps.version.outputs.VERSION }}\"/" charts/dbtether/Chart.yaml
+          sed -i "s/^version:.*/version: ${VERSION}/" charts/dbtether/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/dbtether/Chart.yaml
           
           # Update image.tag in values.yaml to match the release version
-          sed -i 's/^\(\s*tag:\s*\)"[^"]*"/\1"${{ steps.version.outputs.VERSION }}"/' charts/dbtether/values.yaml
+          sed -i "s/^\(\s*tag:\s*\)\"[^\"]*\"/\1\"${VERSION}\"/" charts/dbtether/values.yaml
 
       - name: Sync CRDs from config to chart
         run: |
           # Ensure chart CRDs are always up-to-date with generated CRDs
           cp -v config/crd/bases/*.yaml charts/dbtether/crds/
-          echo "CRDs synced successfully"
+
+      - name: Verify chart before packaging
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          
+          echo "=== Verifying chart release $VERSION ==="
+          
+          # Verify Chart.yaml
+          CHART_VERSION=$(grep '^version:' charts/dbtether/Chart.yaml | awk '{print $2}')
+          APP_VERSION=$(grep '^appVersion:' charts/dbtether/Chart.yaml | sed 's/appVersion: *"\(.*\)"/\1/')
+          IMAGE_TAG=$(grep '^\s*tag:' charts/dbtether/values.yaml | sed 's/.*tag: *"\(.*\)"/\1/')
+          
+          echo "Chart version: $CHART_VERSION"
+          echo "App version: $APP_VERSION"  
+          echo "Image tag: $IMAGE_TAG"
+          echo "Expected: $VERSION"
+          
+          # Fail if any version doesn't match
+          if [ "$CHART_VERSION" != "$VERSION" ] || [ "$APP_VERSION" != "$VERSION" ] || [ "$IMAGE_TAG" != "$VERSION" ]; then
+            echo "ERROR: Version mismatch detected!"
+            exit 1
+          fi
+          
+          # Verify CRDs are synced
+          if ! diff -q config/crd/bases/ charts/dbtether/crds/ > /dev/null 2>&1; then
+            echo "ERROR: CRDs sync failed!"
+            exit 1
+          fi
+          
+          echo "✓ All versions match $VERSION"
+          echo "✓ CRDs synced"
+          
+          # Lint chart
+          helm lint charts/dbtether
 
       - name: Package and push Helm chart to OCI
         run: |

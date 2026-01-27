@@ -2,11 +2,20 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.4.2] - 2026-01-26
+
+### Fixed
+- Race condition in DBCluster/BackupStorage/DatabaseUser controllers causing double reconciliations
+
 ## [0.4.1] - 2026-01-26
 
 ### Fixed
 - Image tag in values.yaml now correctly matches chart appVersion
 - Release pipeline now auto-updates image.tag and syncs CRDs
+
+### Added
+- CI check for chart version consistency (image.tag matches appVersion)
+- CI check for CRD synchronization between config/crd/bases and charts/dbtether/crds
 
 ## [0.4.0] - 2026-01-26
 

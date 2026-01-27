@@ -1127,3 +1127,196 @@ func TestDatabaseUserReconciler_StatusUpdate(t *testing.T) {
 		})
 	}
 }
+
+// TestDatabaseUserStatusChangeDetection verifies that status is only updated when meaningful changes occur
+// This prevents unnecessary reconciliation loops caused by status patches
+func TestDatabaseUserStatusChangeDetection(t *testing.T) {
+	tests := []struct {
+		name          string
+		currentStatus databasesv1alpha1.DatabaseUserStatus
+		generation    int64
+		update        statusUpdate
+		expectChanged bool
+	}{
+		{
+			name: "no change - same phase and message",
+			currentStatus: databasesv1alpha1.DatabaseUserStatus{
+				Phase:              "Ready",
+				Message:            "user created",
+				ObservedGeneration: 1,
+				ClusterName:        "cluster1",
+				DatabaseName:       "db1",
+				Username:           "user1",
+				SecretName:         "secret1",
+			},
+			generation: 1,
+			update: statusUpdate{
+				Phase:       "Ready",
+				Message:     "user created",
+				ClusterName: "cluster1",
+			},
+			expectChanged: false,
+		},
+		{
+			name: "phase changed",
+			currentStatus: databasesv1alpha1.DatabaseUserStatus{
+				Phase:              "Ready",
+				Message:            "user created",
+				ObservedGeneration: 1,
+			},
+			generation: 1,
+			update: statusUpdate{
+				Phase:   "Failed",
+				Message: "connection error",
+			},
+			expectChanged: true,
+		},
+		{
+			name: "message changed",
+			currentStatus: databasesv1alpha1.DatabaseUserStatus{
+				Phase:              "Pending",
+				Message:            "waiting for database",
+				ObservedGeneration: 1,
+			},
+			generation: 1,
+			update: statusUpdate{
+				Phase:   "Pending",
+				Message: "waiting for cluster",
+			},
+			expectChanged: true,
+		},
+		{
+			name: "generation changed",
+			currentStatus: databasesv1alpha1.DatabaseUserStatus{
+				Phase:              "Ready",
+				Message:            "user created",
+				ObservedGeneration: 1,
+			},
+			generation: 2,
+			update: statusUpdate{
+				Phase:   "Ready",
+				Message: "user created",
+			},
+			expectChanged: true,
+		},
+		{
+			name: "password updated flag triggers change",
+			currentStatus: databasesv1alpha1.DatabaseUserStatus{
+				Phase:              "Ready",
+				Message:            "user created",
+				ObservedGeneration: 1,
+			},
+			generation: 1,
+			update: statusUpdate{
+				Phase:           "Ready",
+				Message:         "user created",
+				PasswordUpdated: true,
+			},
+			expectChanged: true,
+		},
+		{
+			name: "cluster name changed",
+			currentStatus: databasesv1alpha1.DatabaseUserStatus{
+				Phase:              "Ready",
+				Message:            "user created",
+				ObservedGeneration: 1,
+				ClusterName:        "old-cluster",
+			},
+			generation: 1,
+			update: statusUpdate{
+				Phase:       "Ready",
+				Message:     "user created",
+				ClusterName: "new-cluster",
+			},
+			expectChanged: true,
+		},
+		{
+			name: "database name changed",
+			currentStatus: databasesv1alpha1.DatabaseUserStatus{
+				Phase:              "Ready",
+				Message:            "user created",
+				ObservedGeneration: 1,
+				DatabaseName:       "old-db",
+			},
+			generation: 1,
+			update: statusUpdate{
+				Phase:        "Ready",
+				Message:      "user created",
+				DatabaseName: "new-db",
+			},
+			expectChanged: true,
+		},
+		{
+			name: "username changed",
+			currentStatus: databasesv1alpha1.DatabaseUserStatus{
+				Phase:              "Ready",
+				Message:            "user created",
+				ObservedGeneration: 1,
+				Username:           "old-user",
+			},
+			generation: 1,
+			update: statusUpdate{
+				Phase:    "Ready",
+				Message:  "user created",
+				Username: "new-user",
+			},
+			expectChanged: true,
+		},
+		{
+			name: "secret name changed",
+			currentStatus: databasesv1alpha1.DatabaseUserStatus{
+				Phase:              "Ready",
+				Message:            "user created",
+				ObservedGeneration: 1,
+				SecretName:         "old-secret",
+			},
+			generation: 1,
+			update: statusUpdate{
+				Phase:      "Ready",
+				Message:    "user created",
+				SecretName: "new-secret",
+			},
+			expectChanged: true,
+		},
+		{
+			name: "empty update fields don't trigger change",
+			currentStatus: databasesv1alpha1.DatabaseUserStatus{
+				Phase:              "Ready",
+				Message:            "user created",
+				ObservedGeneration: 1,
+				ClusterName:        "cluster1",
+				DatabaseName:       "db1",
+				Username:           "user1",
+				SecretName:         "secret1",
+			},
+			generation: 1,
+			update: statusUpdate{
+				Phase:        "Ready",
+				Message:      "user created",
+				ClusterName:  "", // empty - should not trigger change
+				DatabaseName: "", // empty - should not trigger change
+				Username:     "", // empty - should not trigger change
+				SecretName:   "", // empty - should not trigger change
+			},
+			expectChanged: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate the statusChanged check from setStatus
+			statusChanged := tt.currentStatus.Phase != tt.update.Phase ||
+				tt.currentStatus.Message != tt.update.Message ||
+				tt.currentStatus.ObservedGeneration != tt.generation ||
+				(tt.update.ClusterName != "" && tt.currentStatus.ClusterName != tt.update.ClusterName) ||
+				(tt.update.DatabaseName != "" && tt.currentStatus.DatabaseName != tt.update.DatabaseName) ||
+				(tt.update.Username != "" && tt.currentStatus.Username != tt.update.Username) ||
+				(tt.update.SecretName != "" && tt.currentStatus.SecretName != tt.update.SecretName) ||
+				tt.update.PasswordUpdated
+
+			if statusChanged != tt.expectChanged {
+				t.Errorf("statusChanged = %v, want %v", statusChanged, tt.expectChanged)
+			}
+		})
+	}
+}

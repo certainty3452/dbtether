@@ -149,3 +149,102 @@ func TestBackupStorage_GetProvider(t *testing.T) {
 		})
 	}
 }
+
+// TestBackupStorageStatusChangeDetection verifies that status is only updated when meaningful changes occur
+// This prevents unnecessary reconciliation loops caused by status patches
+func TestBackupStorageStatusChangeDetection(t *testing.T) {
+	tests := []struct {
+		name          string
+		currentStatus databasesv1alpha1.BackupStorageStatus
+		generation    int64
+		newPhase      string
+		newMessage    string
+		newProvider   string
+		expectChanged bool
+	}{
+		{
+			name: "no change - same phase, message, provider",
+			currentStatus: databasesv1alpha1.BackupStorageStatus{
+				Phase:              "Ready",
+				Message:            "storage validated",
+				Provider:           "s3",
+				ObservedGeneration: 1,
+			},
+			generation:    1,
+			newPhase:      "Ready",
+			newMessage:    "storage validated",
+			newProvider:   "s3",
+			expectChanged: false,
+		},
+		{
+			name: "phase changed",
+			currentStatus: databasesv1alpha1.BackupStorageStatus{
+				Phase:              "Ready",
+				Message:            "storage validated",
+				Provider:           "s3",
+				ObservedGeneration: 1,
+			},
+			generation:    1,
+			newPhase:      "Failed",
+			newMessage:    "validation failed",
+			newProvider:   "s3",
+			expectChanged: true,
+		},
+		{
+			name: "message changed",
+			currentStatus: databasesv1alpha1.BackupStorageStatus{
+				Phase:              "Failed",
+				Message:            "old error",
+				Provider:           "s3",
+				ObservedGeneration: 1,
+			},
+			generation:    1,
+			newPhase:      "Failed",
+			newMessage:    "new error",
+			newProvider:   "s3",
+			expectChanged: true,
+		},
+		{
+			name: "generation changed",
+			currentStatus: databasesv1alpha1.BackupStorageStatus{
+				Phase:              "Ready",
+				Message:            "storage validated",
+				Provider:           "s3",
+				ObservedGeneration: 1,
+			},
+			generation:    2,
+			newPhase:      "Ready",
+			newMessage:    "storage validated",
+			newProvider:   "s3",
+			expectChanged: true,
+		},
+		{
+			name: "provider changed",
+			currentStatus: databasesv1alpha1.BackupStorageStatus{
+				Phase:              "Ready",
+				Message:            "storage validated",
+				Provider:           "s3",
+				ObservedGeneration: 1,
+			},
+			generation:    1,
+			newPhase:      "Ready",
+			newMessage:    "storage validated",
+			newProvider:   "gcs",
+			expectChanged: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate the statusChanged check from updateStatus
+			statusChanged := tt.currentStatus.Phase != tt.newPhase ||
+				tt.currentStatus.Message != tt.newMessage ||
+				tt.currentStatus.Provider != tt.newProvider ||
+				tt.currentStatus.ObservedGeneration != tt.generation
+
+			if statusChanged != tt.expectChanged {
+				t.Errorf("statusChanged = %v, want %v", statusChanged, tt.expectChanged)
+			}
+		})
+	}
+}

@@ -2,8 +2,8 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.4.1
-appVersion: "0.4.1"
+version: 0.4.2
+appVersion: "0.4.2"
 home: https://github.com/certainty3452/dbtether
 # icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
@@ -70,9 +70,5 @@ annotations:
       url: https://github.com/certainty3452/dbtether
   artifacthub.io/changes: |
     - kind: fixed
-      description: Image tag now correctly matches chart appVersion
-    - kind: added
-      description: CI verification for image tag and CRD consistency
-    - kind: added
-      description: Release pipeline auto-updates image tag and syncs CRDs
+      description: Race condition causing double reconciliations in controllers
 

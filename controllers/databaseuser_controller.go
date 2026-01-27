@@ -714,20 +714,33 @@ type statusUpdate struct {
 }
 
 func (r *DatabaseUserReconciler) setStatus(ctx context.Context, user *databasesv1alpha1.DatabaseUser, update *statusUpdate) (ctrl.Result, error) {
-	patch := client.MergeFrom(user.DeepCopy())
-
-	// Handle pending timeout
+	// Handle pending timeout (may modify update)
 	r.handlePendingTimeout(user, update)
 
-	user.Status.Phase = update.Phase
-	user.Status.Message = update.Message
-	user.Status.ObservedGeneration = user.Generation
+	// Check if status actually changed to avoid triggering unnecessary reconciliations
+	statusChanged := user.Status.Phase != update.Phase ||
+		user.Status.Message != update.Message ||
+		user.Status.ObservedGeneration != user.Generation ||
+		(update.ClusterName != "" && user.Status.ClusterName != update.ClusterName) ||
+		(update.DatabaseName != "" && user.Status.DatabaseName != update.DatabaseName) ||
+		(update.Username != "" && user.Status.Username != update.Username) ||
+		(update.SecretName != "" && user.Status.SecretName != update.SecretName) ||
+		update.PasswordUpdated
 
-	r.applyStatusFields(user, update)
+	if statusChanged {
+		patch := client.MergeFrom(user.DeepCopy())
 
-	if err := r.Status().Patch(ctx, user, patch); err != nil {
-		return ctrl.Result{}, err
+		user.Status.Phase = update.Phase
+		user.Status.Message = update.Message
+		user.Status.ObservedGeneration = user.Generation
+
+		r.applyStatusFields(user, update)
+
+		if err := r.Status().Patch(ctx, user, patch); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
+
 	if update.RequeueAfter > 0 {
 		return ctrl.Result{RequeueAfter: update.RequeueAfter}, nil
 	}

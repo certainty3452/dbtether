@@ -141,18 +141,26 @@ func (r *DBClusterReconciler) getCredentialsFromSecret(ctx context.Context, ref 
 }
 
 func (r *DBClusterReconciler) updateStatus(ctx context.Context, cluster *databasesv1alpha1.DBCluster, phase, message, version string) (ctrl.Result, error) {
-	patch := client.MergeFrom(cluster.DeepCopy())
-	cluster.Status.Phase = phase
-	cluster.Status.Message = message
-	cluster.Status.LastCheckTime = metav1.Now()
-	cluster.Status.ObservedGeneration = cluster.Generation
+	// Check if status actually changed to avoid triggering unnecessary reconciliations
+	statusChanged := cluster.Status.Phase != phase ||
+		cluster.Status.Message != message ||
+		cluster.Status.ObservedGeneration != cluster.Generation ||
+		(version != "" && cluster.Status.PostgresVersion != version)
 
-	if version != "" {
-		cluster.Status.PostgresVersion = version
-	}
+	if statusChanged {
+		patch := client.MergeFrom(cluster.DeepCopy())
+		cluster.Status.Phase = phase
+		cluster.Status.Message = message
+		cluster.Status.LastCheckTime = metav1.Now()
+		cluster.Status.ObservedGeneration = cluster.Generation
 
-	if err := r.Status().Patch(ctx, cluster, patch); err != nil {
-		return ctrl.Result{}, err
+		if version != "" {
+			cluster.Status.PostgresVersion = version
+		}
+
+		if err := r.Status().Patch(ctx, cluster, patch); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	if phase == "Failed" {

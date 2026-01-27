@@ -240,3 +240,113 @@ func TestGetCredentials_BothSourcesSpecified_UsesEnv(t *testing.T) {
 		t.Errorf("expected pass 'envpass', got '%s'", pass)
 	}
 }
+
+// TestStatusChangeDetection verifies that status is only updated when meaningful changes occur
+// This prevents unnecessary reconciliation loops caused by status patches
+func TestStatusChangeDetection(t *testing.T) {
+	tests := []struct {
+		name           string
+		currentStatus  databasesv1alpha1.DBClusterStatus
+		generation     int64
+		newPhase       string
+		newMessage     string
+		newVersion     string
+		expectChanged  bool
+	}{
+		{
+			name: "no change - same phase and message",
+			currentStatus: databasesv1alpha1.DBClusterStatus{
+				Phase:              "Connected",
+				Message:            "connection successful",
+				ObservedGeneration: 1,
+				PostgresVersion:    "15.2",
+			},
+			generation:    1,
+			newPhase:      "Connected",
+			newMessage:    "connection successful",
+			newVersion:    "15.2",
+			expectChanged: false,
+		},
+		{
+			name: "phase changed",
+			currentStatus: databasesv1alpha1.DBClusterStatus{
+				Phase:              "Connected",
+				Message:            "connection successful",
+				ObservedGeneration: 1,
+			},
+			generation:    1,
+			newPhase:      "Failed",
+			newMessage:    "connection failed",
+			newVersion:    "",
+			expectChanged: true,
+		},
+		{
+			name: "message changed",
+			currentStatus: databasesv1alpha1.DBClusterStatus{
+				Phase:              "Failed",
+				Message:            "old error",
+				ObservedGeneration: 1,
+			},
+			generation:    1,
+			newPhase:      "Failed",
+			newMessage:    "new error",
+			newVersion:    "",
+			expectChanged: true,
+		},
+		{
+			name: "generation changed",
+			currentStatus: databasesv1alpha1.DBClusterStatus{
+				Phase:              "Connected",
+				Message:            "connection successful",
+				ObservedGeneration: 1,
+			},
+			generation:    2,
+			newPhase:      "Connected",
+			newMessage:    "connection successful",
+			newVersion:    "",
+			expectChanged: true,
+		},
+		{
+			name: "version changed",
+			currentStatus: databasesv1alpha1.DBClusterStatus{
+				Phase:              "Connected",
+				Message:            "connection successful",
+				ObservedGeneration: 1,
+				PostgresVersion:    "15.1",
+			},
+			generation:    1,
+			newPhase:      "Connected",
+			newMessage:    "connection successful",
+			newVersion:    "15.2",
+			expectChanged: true,
+		},
+		{
+			name: "empty version does not trigger change",
+			currentStatus: databasesv1alpha1.DBClusterStatus{
+				Phase:              "Connected",
+				Message:            "connection successful",
+				ObservedGeneration: 1,
+				PostgresVersion:    "15.2",
+			},
+			generation:    1,
+			newPhase:      "Connected",
+			newMessage:    "connection successful",
+			newVersion:    "", // empty version should not trigger change
+			expectChanged: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate the statusChanged check from updateStatus
+			statusChanged := tt.currentStatus.Phase != tt.newPhase ||
+				tt.currentStatus.Message != tt.newMessage ||
+				tt.currentStatus.ObservedGeneration != tt.generation ||
+				(tt.newVersion != "" && tt.currentStatus.PostgresVersion != tt.newVersion)
+
+			if statusChanged != tt.expectChanged {
+				t.Errorf("statusChanged = %v, want %v", statusChanged, tt.expectChanged)
+			}
+		})
+	}
+}

@@ -69,17 +69,23 @@ func (r *BackupStorageReconciler) validateStorage(storage *databasesv1alpha1.Bac
 func (r *BackupStorageReconciler) updateStatus(ctx context.Context, storage *databasesv1alpha1.BackupStorage,
 	phase, message string) (ctrl.Result, error) {
 
-	patch := client.MergeFrom(storage.DeepCopy())
-	storage.Status.Phase = phase
-	storage.Status.Message = message
-	storage.Status.Provider = storage.GetProvider()
-	storage.Status.ObservedGeneration = storage.Generation
+	// Check if status actually changed to avoid triggering unnecessary reconciliations
+	statusChanged := storage.Status.Phase != phase ||
+		storage.Status.Message != message ||
+		storage.Status.Provider != storage.GetProvider() ||
+		storage.Status.ObservedGeneration != storage.Generation
 
-	now := metav1.Now()
-	storage.Status.LastValidation = now
+	if statusChanged {
+		patch := client.MergeFrom(storage.DeepCopy())
+		storage.Status.Phase = phase
+		storage.Status.Message = message
+		storage.Status.Provider = storage.GetProvider()
+		storage.Status.ObservedGeneration = storage.Generation
+		storage.Status.LastValidation = metav1.Now()
 
-	if err := r.Status().Patch(ctx, storage, patch); err != nil {
-		return ctrl.Result{}, err
+		if err := r.Status().Patch(ctx, storage, patch); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	if phase == "Failed" {
