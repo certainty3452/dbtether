@@ -264,6 +264,10 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 		return r.setStatus(ctx, user, &baseStatus)
 	}
 
+	if user.Status.SecretName != "" && user.Status.SecretName != secretName {
+		r.deleteOldSecret(ctx, user.Namespace, user.Status.SecretName, user)
+	}
+
 	if err := r.ensureUserInPostgres(ctx, pgClient, username, password); err != nil {
 		baseStatus.Phase = "Failed"
 		baseStatus.Message = err.Error()
@@ -675,6 +679,26 @@ func (r *DatabaseUserReconciler) getClusterAndDatabaseForDeletion(ctx context.Co
 	}
 
 	return db.Spec.ClusterRef.Name, r.getDatabaseNameFromSpec(&db)
+}
+
+func (r *DatabaseUserReconciler) deleteOldSecret(ctx context.Context, namespace, secretName string, user *databasesv1alpha1.DatabaseUser) {
+	logger := log.FromContext(ctx)
+
+	var oldSecret corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, &oldSecret); err != nil {
+		return
+	}
+
+	if !r.isSecretOwnedByUser(&oldSecret, user) {
+		logger.Info("skipping old secret deletion - not owned by this user", "secret", secretName)
+		return
+	}
+
+	if err := r.Delete(ctx, &oldSecret); err != nil {
+		logger.Error(err, "failed to delete old secret", "secret", secretName)
+	} else {
+		logger.Info("deleted old secret after name change", "secret", secretName)
+	}
 }
 
 func (r *DatabaseUserReconciler) getPostgresClient(ctx context.Context, cluster *databasesv1alpha1.DBCluster) (postgres.ClientInterface, error) {

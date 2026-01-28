@@ -2,6 +2,11 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.4.3] - 2025-01-26
+
+### Fixed
+- Old secret is now deleted when `spec.secret.name` changes
+
 ## [0.4.2] - 2026-01-26
 
 ### Fixed

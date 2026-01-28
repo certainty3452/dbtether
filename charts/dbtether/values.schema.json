@@ -1,0 +1,583 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DBTether Helm Chart Values",
+  "description": "Configuration values for the DBTether Kubernetes operator Helm chart",
+  "type": "object",
+  "properties": {
+    "replicaCount": {
+      "type": "integer",
+      "description": "Number of operator pod replicas",
+      "default": 1,
+      "minimum": 1
+    },
+    "revisionHistoryLimit": {
+      "type": ["integer", "string"],
+      "description": "Number of old ReplicaSets to retain (Kubernetes default is 10). Empty string uses Kubernetes default.",
+      "default": ""
+    },
+    "image": {
+      "type": "object",
+      "description": "Container image configuration",
+      "properties": {
+        "repository": {
+          "type": "string",
+          "description": "Container image repository",
+          "default": "ghcr.io/certainty3452/dbtether"
+        },
+        "pullPolicy": {
+          "type": "string",
+          "description": "Image pull policy",
+          "enum": ["Always", "IfNotPresent", "Never"],
+          "default": "IfNotPresent"
+        },
+        "tag": {
+          "type": "string",
+          "description": "Image tag. Automatically updated by release pipeline from git tag.",
+          "default": ""
+        }
+      },
+      "additionalProperties": false
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "description": "List of image pull secrets for private registries",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Name of the image pull secret"
+          }
+        },
+        "required": ["name"]
+      },
+      "default": []
+    },
+    "nameOverride": {
+      "type": "string",
+      "description": "Override the name of the chart",
+      "default": ""
+    },
+    "fullnameOverride": {
+      "type": "string",
+      "description": "Override the full name of the release",
+      "default": ""
+    },
+    "serviceAccount": {
+      "type": "object",
+      "description": "Service account configuration",
+      "properties": {
+        "create": {
+          "type": "boolean",
+          "description": "Whether to create a service account",
+          "default": true
+        },
+        "annotations": {
+          "type": "object",
+          "description": "Annotations to add to the service account",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "name": {
+          "type": "string",
+          "description": "The name of the service account to use. If not set and create is true, a name is generated.",
+          "default": ""
+        }
+      },
+      "additionalProperties": false
+    },
+    "podAnnotations": {
+      "type": "object",
+      "description": "Annotations to add to the operator pod",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {}
+    },
+    "podSecurityContext": {
+      "type": "object",
+      "description": "Pod security context configuration",
+      "properties": {
+        "runAsNonRoot": {
+          "type": "boolean",
+          "description": "Run container as non-root user",
+          "default": true
+        },
+        "seccompProfile": {
+          "type": "object",
+          "description": "Seccomp profile configuration",
+          "properties": {
+            "type": {
+              "type": "string",
+              "description": "Seccomp profile type",
+              "enum": ["RuntimeDefault", "Unconfined", "Localhost"],
+              "default": "RuntimeDefault"
+            }
+          }
+        },
+        "fsGroup": {
+          "type": "integer",
+          "description": "FSGroup for the pod"
+        },
+        "runAsUser": {
+          "type": "integer",
+          "description": "User ID to run the container as"
+        },
+        "runAsGroup": {
+          "type": "integer",
+          "description": "Group ID to run the container as"
+        }
+      },
+      "additionalProperties": true
+    },
+    "securityContext": {
+      "type": "object",
+      "description": "Container security context configuration",
+      "properties": {
+        "allowPrivilegeEscalation": {
+          "type": "boolean",
+          "description": "Allow privilege escalation",
+          "default": false
+        },
+        "capabilities": {
+          "type": "object",
+          "description": "Linux capabilities configuration",
+          "properties": {
+            "drop": {
+              "type": "array",
+              "description": "Capabilities to drop",
+              "items": {
+                "type": "string"
+              },
+              "default": ["ALL"]
+            },
+            "add": {
+              "type": "array",
+              "description": "Capabilities to add",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "readOnlyRootFilesystem": {
+          "type": "boolean",
+          "description": "Mount root filesystem as read-only",
+          "default": true
+        },
+        "runAsNonRoot": {
+          "type": "boolean",
+          "description": "Run container as non-root user"
+        },
+        "runAsUser": {
+          "type": "integer",
+          "description": "User ID to run the container as"
+        }
+      },
+      "additionalProperties": true
+    },
+    "resources": {
+      "type": "object",
+      "description": "Resource requests and limits",
+      "properties": {
+        "limits": {
+          "type": "object",
+          "description": "Resource limits",
+          "properties": {
+            "cpu": {
+              "type": "string",
+              "description": "CPU limit",
+              "default": "500m"
+            },
+            "memory": {
+              "type": "string",
+              "description": "Memory limit",
+              "default": "256Mi"
+            }
+          },
+          "additionalProperties": true
+        },
+        "requests": {
+          "type": "object",
+          "description": "Resource requests",
+          "properties": {
+            "cpu": {
+              "type": "string",
+              "description": "CPU request",
+              "default": "100m"
+            },
+            "memory": {
+              "type": "string",
+              "description": "Memory request",
+              "default": "128Mi"
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "nodeSelector": {
+      "type": "object",
+      "description": "Node selector for pod scheduling",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {}
+    },
+    "tolerations": {
+      "type": "array",
+      "description": "Tolerations for pod scheduling",
+      "items": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "operator": {
+            "type": "string",
+            "enum": ["Exists", "Equal"]
+          },
+          "value": {
+            "type": "string"
+          },
+          "effect": {
+            "type": "string",
+            "enum": ["NoSchedule", "PreferNoSchedule", "NoExecute"]
+          },
+          "tolerationSeconds": {
+            "type": "integer"
+          }
+        }
+      },
+      "default": []
+    },
+    "affinity": {
+      "type": "object",
+      "description": "Affinity rules for pod scheduling",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "leaderElection": {
+      "type": "object",
+      "description": "Leader election configuration for HA deployments",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable leader election",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "metrics": {
+      "type": "object",
+      "description": "Prometheus metrics configuration",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable metrics endpoint",
+          "default": true
+        },
+        "port": {
+          "type": "integer",
+          "description": "Metrics server port",
+          "default": 8080,
+          "minimum": 1,
+          "maximum": 65535
+        }
+      },
+      "additionalProperties": false
+    },
+    "health": {
+      "type": "object",
+      "description": "Health probe server configuration",
+      "properties": {
+        "port": {
+          "type": "integer",
+          "description": "Health probe server port",
+          "default": 8081,
+          "minimum": 1,
+          "maximum": 65535
+        }
+      },
+      "additionalProperties": false
+    },
+    "startupProbe": {
+      "type": "object",
+      "description": "Startup probe configuration. Gives time for leader election and initialization.",
+      "properties": {
+        "httpGet": {
+          "type": "object",
+          "description": "HTTP GET probe configuration",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "HTTP path to probe",
+              "default": "/healthz"
+            },
+            "port": {
+              "type": ["string", "integer"],
+              "description": "Port name or number to probe",
+              "default": "health"
+            }
+          }
+        },
+        "periodSeconds": {
+          "type": "integer",
+          "description": "How often to perform the probe (seconds)",
+          "default": 10,
+          "minimum": 1
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "description": "Probe timeout (seconds)",
+          "default": 1,
+          "minimum": 1
+        },
+        "successThreshold": {
+          "type": "integer",
+          "description": "Minimum consecutive successes for probe to be considered successful",
+          "default": 1,
+          "minimum": 1
+        },
+        "failureThreshold": {
+          "type": "integer",
+          "description": "Minimum consecutive failures for probe to be considered failed. failureThreshold * periodSeconds = max startup time",
+          "default": 30,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "livenessProbe": {
+      "type": "object",
+      "description": "Liveness probe configuration",
+      "properties": {
+        "httpGet": {
+          "type": "object",
+          "description": "HTTP GET probe configuration",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "HTTP path to probe",
+              "default": "/healthz"
+            },
+            "port": {
+              "type": ["string", "integer"],
+              "description": "Port name or number to probe",
+              "default": "health"
+            }
+          }
+        },
+        "initialDelaySeconds": {
+          "type": "integer",
+          "description": "Seconds after container start before probe is initiated",
+          "default": 15,
+          "minimum": 0
+        },
+        "periodSeconds": {
+          "type": "integer",
+          "description": "How often to perform the probe (seconds)",
+          "default": 20,
+          "minimum": 1
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "description": "Probe timeout (seconds)",
+          "default": 1,
+          "minimum": 1
+        },
+        "successThreshold": {
+          "type": "integer",
+          "description": "Minimum consecutive successes for probe to be considered successful",
+          "default": 1,
+          "minimum": 1
+        },
+        "failureThreshold": {
+          "type": "integer",
+          "description": "Minimum consecutive failures for probe to be considered failed",
+          "default": 3,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "readinessProbe": {
+      "type": "object",
+      "description": "Readiness probe configuration",
+      "properties": {
+        "httpGet": {
+          "type": "object",
+          "description": "HTTP GET probe configuration",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "HTTP path to probe",
+              "default": "/readyz"
+            },
+            "port": {
+              "type": ["string", "integer"],
+              "description": "Port name or number to probe",
+              "default": "health"
+            }
+          }
+        },
+        "initialDelaySeconds": {
+          "type": "integer",
+          "description": "Seconds after container start before probe is initiated",
+          "default": 5,
+          "minimum": 0
+        },
+        "periodSeconds": {
+          "type": "integer",
+          "description": "How often to perform the probe (seconds)",
+          "default": 10,
+          "minimum": 1
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "description": "Probe timeout (seconds)",
+          "default": 1,
+          "minimum": 1
+        },
+        "successThreshold": {
+          "type": "integer",
+          "description": "Minimum consecutive successes for probe to be considered successful",
+          "default": 1,
+          "minimum": 1
+        },
+        "failureThreshold": {
+          "type": "integer",
+          "description": "Minimum consecutive failures for probe to be considered failed",
+          "default": 3,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "logging": {
+      "type": "object",
+      "description": "Logging configuration",
+      "properties": {
+        "level": {
+          "type": "string",
+          "description": "Log level",
+          "enum": ["debug", "info", "warn", "error"],
+          "default": "info"
+        },
+        "format": {
+          "type": "string",
+          "description": "Log output format",
+          "enum": ["json", "console"],
+          "default": "json"
+        }
+      },
+      "additionalProperties": false
+    },
+    "backup": {
+      "type": "object",
+      "description": "Backup configuration",
+      "properties": {
+        "maxConcurrentPerCluster": {
+          "type": "integer",
+          "description": "Maximum concurrent backup jobs per DBCluster (prevents connection pool exhaustion)",
+          "default": 3,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "extraEnv": {
+      "type": "array",
+      "description": "Extra environment variables for the operator pod. Use this for credentialsFromEnv in DBCluster resources.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Environment variable name"
+          },
+          "value": {
+            "type": "string",
+            "description": "Environment variable value (mutually exclusive with valueFrom)"
+          },
+          "valueFrom": {
+            "type": "object",
+            "description": "Source for the environment variable value",
+            "properties": {
+              "secretKeyRef": {
+                "type": "object",
+                "description": "Reference to a secret key",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "Name of the secret"
+                  },
+                  "key": {
+                    "type": "string",
+                    "description": "Key in the secret"
+                  }
+                },
+                "required": ["name", "key"]
+              },
+              "configMapKeyRef": {
+                "type": "object",
+                "description": "Reference to a configmap key",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "Name of the configmap"
+                  },
+                  "key": {
+                    "type": "string",
+                    "description": "Key in the configmap"
+                  }
+                },
+                "required": ["name", "key"]
+              },
+              "fieldRef": {
+                "type": "object",
+                "description": "Reference to a field",
+                "properties": {
+                  "fieldPath": {
+                    "type": "string",
+                    "description": "Path of the field to select"
+                  }
+                },
+                "required": ["fieldPath"]
+              }
+            }
+          }
+        },
+        "required": ["name"]
+      },
+      "default": [],
+      "examples": [
+        [
+          {
+            "name": "AURORA_USERNAME",
+            "valueFrom": {
+              "secretKeyRef": {
+                "name": "aurora-credentials",
+                "key": "username"
+              }
+            }
+          },
+          {
+            "name": "AURORA_PASSWORD",
+            "valueFrom": {
+              "secretKeyRef": {
+                "name": "aurora-credentials",
+                "key": "password"
+              }
+            }
+          }
+        ]
+      ]
+    }
+  },
+  "additionalProperties": false
+}

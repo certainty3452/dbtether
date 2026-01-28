@@ -2,8 +2,8 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.4.2
-appVersion: "0.4.2"
+version: 0.4.3
+appVersion: "0.4.3"
 home: https://github.com/certainty3452/dbtether
 # icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
@@ -71,4 +71,6 @@ annotations:
   artifacthub.io/changes: |
     - kind: fixed
       description: Race condition causing double reconciliations in controllers
+    - kind: fixed
+      description: Old secret cleanup when DatabaseUser spec.secret.name changes
 

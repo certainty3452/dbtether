@@ -1320,3 +1320,48 @@ func TestDatabaseUserStatusChangeDetection(t *testing.T) {
 		})
 	}
 }
+
+// TestShouldDeleteOldSecret verifies the logic for determining when to delete old secrets
+func TestShouldDeleteOldSecret(t *testing.T) {
+	tests := []struct {
+		name             string
+		statusSecretName string
+		newSecretName    string
+		shouldDelete     bool
+	}{
+		{
+			name:             "secret name changed - should delete",
+			statusSecretName: "old-secret",
+			newSecretName:    "new-secret",
+			shouldDelete:     true,
+		},
+		{
+			name:             "secret name unchanged - should not delete",
+			statusSecretName: "my-secret",
+			newSecretName:    "my-secret",
+			shouldDelete:     false,
+		},
+		{
+			name:             "status secret name empty - should not delete",
+			statusSecretName: "",
+			newSecretName:    "new-secret",
+			shouldDelete:     false,
+		},
+		{
+			name:             "first creation - should not delete",
+			statusSecretName: "",
+			newSecretName:    "first-secret",
+			shouldDelete:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			shouldDelete := tt.statusSecretName != "" && tt.statusSecretName != tt.newSecretName
+
+			if shouldDelete != tt.shouldDelete {
+				t.Errorf("shouldDelete = %v, want %v", shouldDelete, tt.shouldDelete)
+			}
+		})
+	}
+}

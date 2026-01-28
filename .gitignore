@@ -17,6 +17,7 @@ vendor/
 # IDE
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 *~
@@ -38,5 +39,4 @@ debug
 
 # Build (contains local image refs)
 Makefile
-
 
