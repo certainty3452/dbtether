@@ -1,43 +1,76 @@
-# Application user - no deletionPolicy means default (Delete)
+# Simple case - single database
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
-  name: orders-api          # creates "orders_api" user in PostgreSQL
+  name: orders-api
   namespace: team-alpha
 spec:
-  databaseRef:
+  database:
     name: orders-db
   privileges: readwrite
-  # deletionPolicy not specified = Delete (user dropped when resource deleted)
 ---
-# Admin user with explicit Delete policy and password rotation
+# Admin user for migrations with password rotation
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
   name: orders-migrations
   namespace: team-alpha
 spec:
-  databaseRef:
+  database:
     name: orders-db
-  username: orders_admin    # explicit username
+  username: orders_admin
   privileges: admin
   password:
     length: 32
   rotation:
     days: 30
-  deletionPolicy: Delete    # explicit: user will be dropped
+  deletionPolicy: Delete
 ---
-# Readonly user for analytics with connection limit
+# Readonly user with connection limit
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
-  name: orders-readonly     # creates "orders_readonly" user
+  name: orders-readonly
   namespace: team-alpha
 spec:
-  databaseRef:
+  database:
     name: orders-db
   privileges: readonly
   connectionLimit: 5
+---
+# Multiple databases - one user, different privileges per database
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: airbyte-service
+  namespace: platform
+spec:
+  databases:
+    - name: airbyte-db
+      privileges: readwrite
+    - name: temporal-db
+      privileges: readwrite
+    - name: temporal-visibility-db
+      privileges: readonly
+  privileges: readonly  # default for databases without explicit privileges
+  password:
+    length: 24
+---
+# Multiple databases with separate secret per database
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: multi-db-service
+  namespace: platform
+spec:
+  databases:
+    - name: db1
+    - name: db2
+    - name: db3
+  privileges: readwrite
+  secretGeneration: perDatabase  # creates 3 secrets with same password, different database field
+  secret:
+    template: POSTGRES
 ---
 # User with Retain policy - user stays in PostgreSQL after resource deletion
 apiVersion: dbtether.io/v1alpha1
@@ -46,10 +79,10 @@ metadata:
   name: shared-service
   namespace: team-alpha
 spec:
-  databaseRef:
+  database:
     name: payments-db
   privileges: readwrite
-  deletionPolicy: Retain    # user NOT dropped when resource deleted
+  deletionPolicy: Retain
 ---
 # User with custom secret name and DATABASE template
 apiVersion: dbtether.io/v1alpha1
@@ -58,25 +91,12 @@ metadata:
   name: api-user
   namespace: team-alpha
 spec:
-  databaseRef:
+  database:
     name: orders-db
   privileges: readwrite
   secret:
     name: api-db-credentials
-    template: DATABASE      # keys: DATABASE_HOST, DATABASE_PORT, etc.
----
-# User with DB template (shorter key names)
-apiVersion: dbtether.io/v1alpha1
-kind: DatabaseUser
-metadata:
-  name: worker-user
-  namespace: team-alpha
-spec:
-  databaseRef:
-    name: orders-db
-  privileges: readwrite
-  secret:
-    template: DB            # keys: DB_HOST, DB_PORT, etc.
+    template: DATABASE
 ---
 # User with POSTGRES template (for standard PostgreSQL env vars)
 apiVersion: dbtether.io/v1alpha1
@@ -85,11 +105,11 @@ metadata:
   name: postgres-app
   namespace: team-alpha
 spec:
-  databaseRef:
+  database:
     name: orders-db
   privileges: readwrite
   secret:
-    template: POSTGRES      # keys: POSTGRES_HOST, POSTGRES_PORT, etc.
+    template: POSTGRES
 ---
 # User with fully custom secret keys (for legacy app compatibility)
 apiVersion: dbtether.io/v1alpha1
@@ -98,7 +118,7 @@ metadata:
   name: legacy-connector
   namespace: team-alpha
 spec:
-  databaseRef:
+  database:
     name: orders-db
   privileges: readonly
   secret:
@@ -118,12 +138,12 @@ metadata:
   name: adopt-user
   namespace: team-alpha
 spec:
-  databaseRef:
+  database:
     name: orders-db
   privileges: readwrite
   secret:
     name: orphaned-secret
-    onConflict: Adopt     # take ownership and overwrite
+    onConflict: Adopt
 ---
 # User with onConflict: Merge - add credentials to existing secret
 apiVersion: dbtether.io/v1alpha1
@@ -132,10 +152,22 @@ metadata:
   name: merge-user
   namespace: team-alpha
 spec:
-  databaseRef:
+  database:
     name: orders-db
   privileges: readwrite
   secret:
-    name: app-config       # existing secret with REDIS_URL, API_KEY, etc.
+    name: app-config
     template: raw
-    onConflict: Merge      # keeps existing keys, adds: host, port, database, user, password
+    onConflict: Merge
+---
+# Cross-namespace database reference
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: analytics-reader
+  namespace: analytics
+spec:
+  database:
+    name: main-db
+    namespace: production
+  privileges: readonly

@@ -1,6 +1,6 @@
 # DatabaseUser
 
-Represents a PostgreSQL user with specific privileges for a database.
+Represents a PostgreSQL user with specific privileges for one or more databases.
 
 **API Version:** `dbtether.io/v1alpha1`  
 **Kind:** `DatabaseUser`  
@@ -9,36 +9,80 @@ Represents a PostgreSQL user with specific privileges for a database.
 ## Example
 
 ```yaml
+# Simple case - single database
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
   name: my-app-readonly
   namespace: my-team
 spec:
-  databaseRef:
+  database:
     name: my-app-db
   privileges: readonly
-  password:
-    length: 16
+```
+
+```yaml
+# Multiple databases - same user, different privileges
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: airbyte-service
+  namespace: platform
+spec:
+  databases:
+    - name: airbyte-db
+      privileges: readwrite
+    - name: temporal-db
+      privileges: readwrite
+    - name: temporal-visibility-db
+      privileges: readonly
+  privileges: readonly  # default for databases without explicit privileges
 ```
 
 ## Spec
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `databaseRef.name` | string | ✅ | — | Name of the Database resource |
-| `databaseRef.namespace` | string | ❌ | same as user | Namespace of the Database resource |
+| `database` | object | ❌* | — | Single database reference (mutually exclusive with `databases`) |
+| `databases` | array | ❌* | — | Multiple database references (mutually exclusive with `database`) |
 | `username` | string | ❌ | metadata.name | PostgreSQL username (see below) |
-| `privileges` | enum | ✅ | — | Privilege preset: `readonly`, `readwrite`, `admin` |
+| `privileges` | enum | ❌ | `readonly` | Default privilege preset: `readonly`, `readwrite`, `admin` |
 | `additionalGrants` | array | ❌ | `[]` | Additional table-level grants |
 | `password.length` | int | ❌ | `16` | Password length (12-64) |
 | `rotation.days` | int | ❌ | — | Password rotation interval in days (1-365) |
 | `connectionLimit` | int | ❌ | `-1` | Max concurrent connections (`-1` = unlimited) |
 | `deletionPolicy` | enum | ❌ | `Delete` | What to do with user when resource is deleted |
-| `secret.name` | string | ❌ | `{name}-credentials` | Custom secret name |
-| `secret.template` | enum | ❌ | `raw` | Key format: `raw`, `DB`, `DATABASE`, `POSTGRES`, `custom` |
-| `secret.keys` | object | ❌ | — | Custom key names (when template is `custom`) |
-| `secret.onConflict` | enum | ❌ | `Fail` | Behavior if secret already exists: `Fail`, `Adopt`, `Merge` |
+| `secret` | object | ❌ | — | Secret configuration (see below) |
+| `secretGeneration` | enum | ❌ | `primary` | How to generate secrets: `primary` or `perDatabase` |
+
+\* One of `database` or `databases` is required.
+
+### database / databases
+
+You must specify either `database` (for single database) or `databases` (for multiple databases).
+
+**Single database:**
+```yaml
+spec:
+  database:
+    name: my-app-db
+    namespace: other-namespace  # optional, defaults to user's namespace
+    privileges: readwrite       # optional, overrides spec.privileges
+```
+
+**Multiple databases:**
+```yaml
+spec:
+  databases:
+    - name: db1
+      privileges: readwrite
+    - name: db2
+      privileges: readonly
+    - name: db3
+      # uses spec.privileges (default: readonly)
+```
+
+All databases must be on the same DBCluster.
 
 ## username
 
@@ -48,8 +92,6 @@ spec:
 |---------------|-----------------|-----------------|
 | `my-app-user` | (not set) | `my_app_user` |
 | `my-app-user` | `custom_user` | `custom_user` |
-
-Use explicit `username` only when you need a different name than the resource name.
 
 | Constraint | Value |
 |------------|-------|
@@ -66,58 +108,62 @@ Preset privilege levels applied to the `public` schema:
 | `readwrite` | readonly + `INSERT`, `UPDATE`, `DELETE`, sequence usage |
 | `admin` | readwrite + `CREATE` on schema, `TRUNCATE`, `REFERENCES`, `TRIGGER` |
 
-### SQL Executed
+Can be set at spec level (default for all databases) or per-database.
 
-**readonly:**
-```sql
-GRANT USAGE ON SCHEMA public TO <user>;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO <user>;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO <user>;
-```
+## secretGeneration
 
-**readwrite:**
-```sql
--- includes readonly +
-GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO <user>;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO <user>;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT INSERT, UPDATE, DELETE ON TABLES TO <user>;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO <user>;
-```
+Controls how secrets are created for multiple databases:
 
-**admin:**
-```sql
--- includes readwrite +
-GRANT CREATE ON SCHEMA public TO <user>;
-GRANT TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA public TO <user>;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT TRUNCATE, REFERENCES, TRIGGER ON TABLES TO <user>;
-```
+| Mode | Behavior |
+|------|----------|
+| `primary` (default) | Single secret with first database as primary, includes `databases` field listing all |
+| `perDatabase` | Separate secret for each database (same password, different `database` field) |
 
-## additionalGrants
+### primary mode (default)
 
-Additional grants on specific tables (on top of preset):
+Creates one secret with:
+- `database`: first database name
+- `databases`: comma-separated list of all databases (only for `template: raw` with >1 database)
 
 ```yaml
-additionalGrants:
-  - tables: ["audit_log", "events"]
-    privileges: [INSERT]
+# Secret with raw template and multiple databases:
+# airbyte-service-credentials
+data:
+  host: cluster.endpoint
+  port: "5432"
+  database: airbyte_db         # first database
+  databases: airbyte_db,temporal_db,temporal_visibility_db  # informational
+  user: airbyte_service
+  password: <generated>
+
+# Secret with POSTGRES template (no databases field):
+data:
+  POSTGRES_HOST: cluster.endpoint
+  POSTGRES_PORT: "5432"
+  POSTGRES_DATABASE: airbyte_db
+  POSTGRES_USER: airbyte_service
+  POSTGRES_PASSWORD: <generated>
 ```
 
-Available privileges: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`
+### perDatabase mode
 
-## password
-
-Password configuration:
+Creates one secret per database:
 
 ```yaml
-password:
-  length: 24  # default: 16, range: 12-64
+spec:
+  databases:
+    - name: airbyte-db
+    - name: temporal-db
+  secretGeneration: perDatabase
+  secret:
+    template: POSTGRES
 ```
 
-- Auto-generated using cryptographically secure random
-- Characters: lowercase, uppercase, digits, and safe special chars (`._-,^`)
-- Guarantees at least 3 of each character type
-- Stored only in Kubernetes Secret
-- **Regeneration**: Deleting the Secret triggers automatic password regeneration
+Creates secrets:
+- `airbyte-service-airbyte-db-credentials` with `POSTGRES_DATABASE: airbyte_db`
+- `airbyte-service-temporal-db-credentials` with `POSTGRES_DATABASE: temporal_db`
+
+All secrets share the same password.
 
 ## secret
 
@@ -126,20 +172,15 @@ Secret configuration for customizing the generated credentials:
 ```yaml
 secret:
   name: my-custom-secret      # Custom secret name (default: {name}-credentials)
-  template: DATABASE          # Key format: raw, DB, DATABASE, POSTGRES, custom (default: raw)
+  template: DATABASE          # Key format: raw, DB, DATABASE, POSTGRES, custom
   keys:                       # Custom key names (only when template: custom)
     host: PGHOST
     port: PGPORT
     database: PGDATABASE
     user: PGUSER
     password: PGPASSWORD
+  onConflict: Merge           # Fail, Adopt, Merge
 ```
-
-### Secret Name
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `secret.name` | `{metadata.name}-credentials` | Override generated secret name |
 
 ### Key Templates
 
@@ -151,21 +192,16 @@ secret:
 | `POSTGRES` | `POSTGRES_HOST` | `POSTGRES_PORT` | `POSTGRES_DATABASE` | `POSTGRES_USER` | `POSTGRES_PASSWORD` |
 | `custom` | custom | custom | custom | custom | custom |
 
-### Custom Keys
+**Note:** The `databases` field (comma-separated list of all databases) is only added when:
+- `secretGeneration` is `primary` (default)
+- `template` is `raw` or not specified
+- User has access to more than 1 database
 
-When `template: custom`, you can override individual keys. Unspecified keys use `raw` defaults:
-
-```yaml
-secret:
-  template: custom
-  keys:
-    password: SECRET_PWD  # only password is custom
-# Result: host, port, database, user, SECRET_PWD
-```
+This field is always named `databases` (not template-specific) and is informational only.
 
 ### onConflict
 
-Controls behavior when a secret with the specified name already exists but is not owned by this DatabaseUser:
+Controls behavior when a secret with the specified name already exists:
 
 | Policy | Behavior |
 |--------|----------|
@@ -173,128 +209,17 @@ Controls behavior when a secret with the specified name already exists but is no
 | `Adopt` | Take ownership, regenerate credentials, overwrite secret data |
 | `Merge` | Take ownership, add/update our keys while keeping existing keys |
 
-```yaml
-secret:
-  name: shared-config
-  template: POSTGRES
-  onConflict: Merge  # keep existing keys, add database credentials
-```
-
-**Use cases:**
-- `Fail` — strict mode, prevents accidental credential conflicts
-- `Adopt` — take over orphaned secrets or secrets from deleted resources
-- `Merge` — add database credentials to existing config secrets (e.g., secrets with Redis, API keys, etc.)
-
-## deletionPolicy
-
-Determines what happens to the PostgreSQL user when the Kubernetes resource is deleted.
-
-| Policy | Behavior on delete |
-|--------|--------------------|
-| `Delete` (default) | User is dropped from PostgreSQL (`DROP USER`) |
-| `Retain` | User remains in PostgreSQL, only Kubernetes resource is deleted |
-
-**Note:** Unlike Database CRD, default is `Delete` since users are typically ephemeral.
-
-## connectionLimit
-
-Limit concurrent PostgreSQL connections per user:
-
-```yaml
-connectionLimit: 10  # max 10 concurrent connections
-```
-
-| Value | Meaning |
-|-------|---------|
-| `-1` | Unlimited (PostgreSQL default) |
-| `0` | Not set (uses PostgreSQL default) |
-| `>0` | Maximum concurrent connections |
-
-**SQL Executed:**
-```sql
-ALTER USER <username> CONNECTION LIMIT <limit>;
-```
-
-## rotation
-
-Automatic password rotation based on age:
-
-```yaml
-rotation:
-  days: 30  # rotate every 30 days
-```
-
-| Value | Meaning |
-|-------|---------|
-| `1-365` | Rotate password after specified number of days |
-| not set | No automatic rotation |
-
-**How it works:**
-1. Operator tracks when password was last set (`status.passwordUpdatedAt`)
-2. On each reconcile, checks if age exceeds `rotation.days`
-3. If expired: deletes Secret → regenerates password → updates PostgreSQL
-4. Schedules next check via `RequeueAfter`
-
-**Manual rotation:** Delete the generated Secret, operator will create new one with new password.
-
-## Generated Secret
-
-Operator creates a Secret with connection details. The secret name and key names depend on `spec.secret` configuration:
-
-**Default (template: raw):**
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: <databaseuser-name>-credentials  # or spec.secret.name
-  namespace: <databaseuser-namespace>
-  ownerReferences:
-    - kind: DatabaseUser
-      name: <databaseuser-name>
-data:
-  host: <base64>
-  port: <base64>
-  database: <base64>
-  user: <base64>
-  password: <base64>
-```
-
-**With template: DATABASE:**
-```yaml
-data:
-  DATABASE_HOST: <base64>
-  DATABASE_PORT: <base64>
-  DATABASE_NAME: <base64>
-  DATABASE_USER: <base64>
-  DATABASE_PASSWORD: <base64>
-```
-
-**With template: DB:**
-```yaml
-data:
-  DB_HOST: <base64>
-  DB_PORT: <base64>
-  DB_NAME: <base64>
-  DB_USER: <base64>
-  DB_PASSWORD: <base64>
-```
-
-**Lifecycle:**
-- Secret deleted manually → operator recreates with NEW password
-- DatabaseUser deleted → Secret deleted via ownerReference
-
 ## Database Isolation
 
-**Critical security feature:** Users can ONLY connect to their assigned database.
+**Critical security feature:** Users can ONLY connect to their assigned databases.
 
-When creating user, operator executes:
-```sql
-CREATE USER <username> WITH PASSWORD 'xxx' NOCREATEDB NOCREATEROLE NOINHERIT;
-REVOKE CONNECT ON DATABASE postgres FROM <username>;
-GRANT CONNECT ON DATABASE <target_db> TO <username>;
-```
+For each reconcile:
+1. Get list of databases user currently has access to
+2. Revoke access from databases NOT in the spec
+3. Grant access to databases IN the spec
+4. Apply privileges per database
 
-Operator verifies isolation on each reconcile and logs warning if user has unexpected access.
+This ensures users cannot access databases they shouldn't, even if database list changes.
 
 ## Status
 
@@ -302,16 +227,124 @@ Operator verifies isolation on each reconcile and logs warning if user has unexp
 |-------|------|-------------|
 | `phase` | enum | `Pending`, `Creating`, `Ready`, `Failed` |
 | `message` | string | Detailed status message |
-| `secretName` | string | Name of generated credentials Secret |
+| `clusterName` | string | DBCluster this user belongs to |
+| `username` | string | PostgreSQL username |
+| `databases` | array | Per-database access status |
+| `secretName` | string | Primary secret name |
 | `passwordUpdatedAt` | timestamp | When password was last created or rotated |
 | `observedGeneration` | int64 | Which spec version has been processed |
 
-## Existing User Handling
+### databases status
 
-If PostgreSQL user already exists:
-- **Adopt**: reset password, apply privileges
-- Log warning: "adopting existing user"
-- Secret is created/updated with new password
+Each database has its own status:
+
+```yaml
+status:
+  databases:
+    - name: airbyte-db
+      databaseName: airbyte_db
+      phase: Ready
+      privileges: readwrite
+      secretName: airbyte-service-airbyte-db-credentials  # if perDatabase
+    - name: temporal-db
+      databaseName: temporal_db
+      phase: Ready
+      privileges: readonly
+```
+
+## Examples
+
+### Simple single database user
+
+```yaml
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: orders-api
+  namespace: team-alpha
+spec:
+  database:
+    name: orders-db
+  privileges: readwrite
+```
+
+### Multiple databases with different privileges
+
+```yaml
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: airbyte-service
+  namespace: platform
+spec:
+  databases:
+    - name: airbyte-db
+      privileges: readwrite
+    - name: temporal-db
+      privileges: readwrite
+    - name: temporal-visibility-db
+      privileges: readonly
+  privileges: readonly
+  password:
+    length: 24
+```
+
+### Multiple databases with separate secrets per database
+
+```yaml
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: airbyte-service
+  namespace: platform
+spec:
+  databases:
+    - name: airbyte-db
+    - name: temporal-db
+    - name: temporal-visibility-db
+  privileges: readwrite
+  secretGeneration: perDatabase
+  secret:
+    template: POSTGRES
+```
+
+Creates three secrets:
+- `airbyte-service-airbyte-db-credentials`
+- `airbyte-service-temporal-db-credentials`
+- `airbyte-service-temporal-visibility-db-credentials`
+
+### Cross-namespace database reference
+
+```yaml
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: analytics-reader
+  namespace: analytics
+spec:
+  database:
+    name: main-db
+    namespace: production
+  privileges: readonly
+```
+
+### User with password rotation
+
+```yaml
+apiVersion: dbtether.io/v1alpha1
+kind: DatabaseUser
+metadata:
+  name: rotating-user
+  namespace: my-team
+spec:
+  database:
+    name: my-app-db
+  privileges: readwrite
+  password:
+    length: 32
+  rotation:
+    days: 30
+```
 
 ## kubectl Commands
 
@@ -332,167 +365,40 @@ kubectl get secret my-app-readonly-credentials -n my-team -o jsonpath='{.data.pa
 kubectl delete secret my-app-readonly-credentials -n my-team
 ```
 
-## Examples
-
-### Readonly user for analytics
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: DatabaseUser
-metadata:
-  name: analytics-reader
-  namespace: analytics
-spec:
-  databaseRef:
-    name: main-db
-    namespace: production
-  privileges: readonly
-```
-
-### Application user with write access
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: DatabaseUser
-metadata:
-  name: my-app
-  namespace: my-team
-spec:
-  databaseRef:
-    name: my-app-db
-  username: my_app_user
-  privileges: readwrite
-  password:
-    length: 32
-```
-
-### Admin for migrations
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: DatabaseUser
-metadata:
-  name: my-app-migrations
-  namespace: my-team
-spec:
-  databaseRef:
-    name: my-app-db
-  username: my_app_admin
-  privileges: admin
-```
-
-### Readonly with specific table write access
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: DatabaseUser
-metadata:
-  name: audit-writer
-  namespace: my-team
-spec:
-  databaseRef:
-    name: my-app-db
-  privileges: readonly
-  additionalGrants:
-    - tables: ["audit_log"]
-      privileges: [INSERT]
-```
-
-### User with connection limit
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: DatabaseUser
-metadata:
-  name: limited-user
-  namespace: my-team
-spec:
-  databaseRef:
-    name: my-app-db
-  privileges: readwrite
-  connectionLimit: 5
-```
-
-### User with password rotation
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: DatabaseUser
-metadata:
-  name: rotating-user
-  namespace: my-team
-spec:
-  databaseRef:
-    name: my-app-db
-  privileges: readwrite
-  password:
-    length: 32
-  rotation:
-    days: 30  # rotate every 30 days
-```
-
-### User with custom secret name and DATABASE template
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: DatabaseUser
-metadata:
-  name: api-user
-  namespace: my-team
-spec:
-  databaseRef:
-    name: my-app-db
-  privileges: readwrite
-  secret:
-    name: api-db-credentials
-    template: DATABASE
-```
-
-### User with fully custom secret keys (legacy app compatibility)
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: DatabaseUser
-metadata:
-  name: legacy-connector
-  namespace: my-team
-spec:
-  databaseRef:
-    name: my-app-db
-  privileges: readonly
-  secret:
-    template: custom
-    keys:
-      host: POSTGRES_HOST
-      port: POSTGRES_PORT
-      database: POSTGRES_DB
-      user: POSTGRES_USER
-      password: POSTGRES_PASSWORD
-```
-
 ## Troubleshooting
+
+### Phase: Failed, message: "validation error: cannot specify both 'database' and 'databases'"
+
+Use either `database` OR `databases`, not both:
+
+```yaml
+# Wrong
+spec:
+  database:
+    name: db1
+  databases:
+    - name: db2
+
+# Correct
+spec:
+  database:
+    name: db1
+```
+
+### Phase: Failed, message: "all databases must be on the same cluster"
+
+All databases in `databases` must reference the same DBCluster. Create separate DatabaseUser resources for databases on different clusters.
 
 ### Phase: Failed, message: "Database not found"
 
-Check that `databaseRef.name` matches a Database resource:
+Check that database resource exists:
 ```bash
 kubectl get database -A
 ```
-
-### Phase: Failed, message: "failed to create user"
-
-1. Check that admin credentials in DBCluster have `CREATEUSER` privilege
-2. Check operator logs for detailed error
-
-### Phase: Failed, message: "failed to apply privileges"
-
-1. Verify database exists and is Ready
-2. Check that admin user has `GRANT OPTION` on target database
 
 ### User has access to unexpected databases
 
 Check operator logs for isolation warnings:
 ```bash
-kubectl logs -n postgres-db-operator deployment/postgres-db-operator | grep "unexpected databases"
+kubectl logs -n dbtether-system deployment/dbtether-controller | grep "unexpected database"
 ```
-

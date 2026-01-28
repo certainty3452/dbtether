@@ -257,7 +257,6 @@ make test-envtest
 
 See [ROADMAP.md](ROADMAP.md) for planned features:
 
-- **User & Password Management** — customizable secrets, multi-database access
 - **Database Features** — owner, templates, schemas, deletion protection
 - **Access Control** — namespace isolation, validating webhook, IAM authentication
 - **Secret Management** — AWS Secrets Manager, Vault, ESO integration

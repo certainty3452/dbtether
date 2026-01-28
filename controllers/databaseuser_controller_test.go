@@ -1,13 +1,19 @@
 package controllers
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
+	"errors"
+
+	"github.com/certainty3452/dbtether/pkg/postgres"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 const (
@@ -301,6 +307,243 @@ func TestDatabaseUserReconciler_GetSecretKeys(t *testing.T) {
 			}
 			if gotPwd != tt.wantPwd {
 				t.Errorf("password = %v, want %v", gotPwd, tt.wantPwd)
+			}
+		})
+	}
+}
+
+func TestDatabaseUserReconciler_ShouldIncludeDatabasesList(t *testing.T) {
+	r := &DatabaseUserReconciler{}
+
+	tests := []struct {
+		name     string
+		user     *databasesv1alpha1.DatabaseUser
+		dbCount  int
+		expected bool
+	}{
+		{
+			name: "raw template with multiple databases",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{},
+			},
+			dbCount:  3,
+			expected: true,
+		},
+		{
+			name: "raw template with single database",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{},
+			},
+			dbCount:  1,
+			expected: false,
+		},
+		{
+			name: "POSTGRES template with multiple databases",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Template: "POSTGRES"},
+				},
+			},
+			dbCount:  3,
+			expected: false,
+		},
+		{
+			name: "perDatabase mode",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					SecretGeneration: "perDatabase",
+				},
+			},
+			dbCount:  3,
+			expected: false,
+		},
+		{
+			name: "explicit raw template with multiple databases",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Template: "raw"},
+				},
+			},
+			dbCount:  2,
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := r.shouldIncludeDatabasesList(tt.user, tt.dbCount)
+			if got != tt.expected {
+				t.Errorf("shouldIncludeDatabasesList() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDatabaseUserReconciler_ValidateSpec(t *testing.T) {
+	r := &DatabaseUserReconciler{}
+
+	tests := []struct {
+		name    string
+		user    *databasesv1alpha1.DatabaseUser
+		wantErr bool
+	}{
+		{
+			name: "valid single database",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{Name: "my-db"},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid multiple databases",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Databases: []databasesv1alpha1.DatabaseAccess{
+						{Name: "db1"},
+						{Name: "db2"},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "invalid - both database and databases",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{Name: "my-db"},
+					Databases: []databasesv1alpha1.DatabaseAccess{
+						{Name: "db1"},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid - neither database nor databases",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := r.validateSpec(tt.user)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateSpec() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestDatabaseUserSpec_GetDatabases(t *testing.T) {
+	tests := []struct {
+		name      string
+		spec      databasesv1alpha1.DatabaseUserSpec
+		wantCount int
+		wantFirst string
+	}{
+		{
+			name: "single database returns list of one",
+			spec: databasesv1alpha1.DatabaseUserSpec{
+				Database: &databasesv1alpha1.DatabaseAccess{Name: "my-db"},
+			},
+			wantCount: 1,
+			wantFirst: "my-db",
+		},
+		{
+			name: "multiple databases returns full list",
+			spec: databasesv1alpha1.DatabaseUserSpec{
+				Databases: []databasesv1alpha1.DatabaseAccess{
+					{Name: "db1"},
+					{Name: "db2"},
+					{Name: "db3"},
+				},
+			},
+			wantCount: 3,
+			wantFirst: "db1",
+		},
+		{
+			name:      "empty spec returns nil",
+			spec:      databasesv1alpha1.DatabaseUserSpec{},
+			wantCount: 0,
+			wantFirst: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.spec.GetDatabases()
+			if len(got) != tt.wantCount {
+				t.Errorf("GetDatabases() count = %v, want %v", len(got), tt.wantCount)
+			}
+			if tt.wantCount > 0 && got[0].Name != tt.wantFirst {
+				t.Errorf("GetDatabases()[0].Name = %v, want %v", got[0].Name, tt.wantFirst)
+			}
+		})
+	}
+}
+
+func TestDatabaseUserSpec_HasDatabases(t *testing.T) {
+	tests := []struct {
+		name string
+		spec databasesv1alpha1.DatabaseUserSpec
+		want bool
+	}{
+		{
+			name: "has single database",
+			spec: databasesv1alpha1.DatabaseUserSpec{
+				Database: &databasesv1alpha1.DatabaseAccess{Name: "my-db"},
+			},
+			want: true,
+		},
+		{
+			name: "has multiple databases",
+			spec: databasesv1alpha1.DatabaseUserSpec{
+				Databases: []databasesv1alpha1.DatabaseAccess{{Name: "db1"}},
+			},
+			want: true,
+		},
+		{
+			name: "has neither",
+			spec: databasesv1alpha1.DatabaseUserSpec{},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.spec.HasDatabases()
+			if got != tt.want {
+				t.Errorf("HasDatabases() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDatabaseUserReconciler_GetSecretNameForDatabase(t *testing.T) {
+	r := &DatabaseUserReconciler{}
+
+	tests := []struct {
+		userName string
+		dbName   string
+		want     string
+	}{
+		{"my-user", "my-db", "my-user-my-db-credentials"},
+		{"api", "orders", "api-orders-credentials"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.userName+"-"+tt.dbName, func(t *testing.T) {
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: tt.userName},
+			}
+			got := r.getSecretNameForDatabase(user, tt.dbName)
+			if got != tt.want {
+				t.Errorf("getSecretNameForDatabase() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -970,24 +1213,28 @@ func TestDatabaseUserReconciler_GetClusterFromStatus(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			user := &databasesv1alpha1.DatabaseUser{
 				Status: databasesv1alpha1.DatabaseUserStatus{
-					ClusterName:  tt.statusClusterName,
-					DatabaseName: tt.statusDBName,
+					ClusterName: tt.statusClusterName,
+					Databases: []databasesv1alpha1.DatabaseAccessStatus{
+						{DatabaseName: tt.statusDBName},
+					},
 				},
 			}
 
-			// Simulate getClusterAndDatabaseForDeletion logic (status check only)
+			// Simulate getClusterAndDatabasesForDeletion logic (status check only)
 			clusterName := ""
-			databaseName := ""
+			var databaseNames []string
 			if user.Status.ClusterName != "" {
 				clusterName = user.Status.ClusterName
-				databaseName = user.Status.DatabaseName
+				for _, db := range user.Status.Databases {
+					databaseNames = append(databaseNames, db.DatabaseName)
+				}
 			}
 
 			if clusterName != tt.expectCluster {
 				t.Errorf("clusterName = %v, want %v", clusterName, tt.expectCluster)
 			}
-			if databaseName != tt.expectDB {
-				t.Errorf("databaseName = %v, want %v", databaseName, tt.expectDB)
+			if len(databaseNames) > 0 && databaseNames[0] != tt.expectDB {
+				t.Errorf("databaseName = %v, want %v", databaseNames[0], tt.expectDB)
 			}
 		})
 	}
@@ -1077,9 +1324,11 @@ func TestDatabaseUserReconciler_StatusUpdate(t *testing.T) {
 		{
 			name: "status update fields are applied",
 			update: statusUpdate{
-				ClusterName:  testClusterRef,
-				DatabaseName: "my_database",
-				Username:     "my_user",
+				ClusterName: testClusterRef,
+				Username:    "my_user",
+				Databases: []databasesv1alpha1.DatabaseAccessStatus{
+					{DatabaseName: "my_database", Phase: "Ready"},
+				},
 			},
 			expectClear:  false,
 			expectValues: true,
@@ -1087,9 +1336,9 @@ func TestDatabaseUserReconciler_StatusUpdate(t *testing.T) {
 		{
 			name: "empty fields don't overwrite",
 			update: statusUpdate{
-				ClusterName:  "",
-				DatabaseName: "",
-				Username:     "",
+				ClusterName: "",
+				Username:    "",
+				Databases:   nil,
 			},
 			expectClear:  false,
 			expectValues: false,
@@ -1106,8 +1355,8 @@ func TestDatabaseUserReconciler_StatusUpdate(t *testing.T) {
 			if tt.update.ClusterName != "" {
 				user.Status.ClusterName = tt.update.ClusterName
 			}
-			if tt.update.DatabaseName != "" {
-				user.Status.DatabaseName = tt.update.DatabaseName
+			if len(tt.update.Databases) > 0 {
+				user.Status.Databases = tt.update.Databases
 			}
 			if tt.update.Username != "" {
 				user.Status.Username = tt.update.Username
@@ -1117,8 +1366,8 @@ func TestDatabaseUserReconciler_StatusUpdate(t *testing.T) {
 				if user.Status.ClusterName != tt.update.ClusterName {
 					t.Errorf("ClusterName = %v, want %v", user.Status.ClusterName, tt.update.ClusterName)
 				}
-				if user.Status.DatabaseName != tt.update.DatabaseName {
-					t.Errorf("DatabaseName = %v, want %v", user.Status.DatabaseName, tt.update.DatabaseName)
+				if len(user.Status.Databases) != len(tt.update.Databases) {
+					t.Errorf("Databases count = %v, want %v", len(user.Status.Databases), len(tt.update.Databases))
 				}
 				if user.Status.Username != tt.update.Username {
 					t.Errorf("Username = %v, want %v", user.Status.Username, tt.update.Username)
@@ -1145,7 +1394,6 @@ func TestDatabaseUserStatusChangeDetection(t *testing.T) {
 				Message:            "user created",
 				ObservedGeneration: 1,
 				ClusterName:        "cluster1",
-				DatabaseName:       "db1",
 				Username:           "user1",
 				SecretName:         "secret1",
 			},
@@ -1231,18 +1479,19 @@ func TestDatabaseUserStatusChangeDetection(t *testing.T) {
 			expectChanged: true,
 		},
 		{
-			name: "database name changed",
+			name: "databases added triggers change",
 			currentStatus: databasesv1alpha1.DatabaseUserStatus{
 				Phase:              "Ready",
 				Message:            "user created",
 				ObservedGeneration: 1,
-				DatabaseName:       "old-db",
 			},
 			generation: 1,
 			update: statusUpdate{
-				Phase:        "Ready",
-				Message:      "user created",
-				DatabaseName: "new-db",
+				Phase:   "Ready",
+				Message: "user created",
+				Databases: []databasesv1alpha1.DatabaseAccessStatus{
+					{DatabaseName: "new-db", Phase: "Ready"},
+				},
 			},
 			expectChanged: true,
 		},
@@ -1285,18 +1534,16 @@ func TestDatabaseUserStatusChangeDetection(t *testing.T) {
 				Message:            "user created",
 				ObservedGeneration: 1,
 				ClusterName:        "cluster1",
-				DatabaseName:       "db1",
 				Username:           "user1",
 				SecretName:         "secret1",
 			},
 			generation: 1,
 			update: statusUpdate{
-				Phase:        "Ready",
-				Message:      "user created",
-				ClusterName:  "", // empty - should not trigger change
-				DatabaseName: "", // empty - should not trigger change
-				Username:     "", // empty - should not trigger change
-				SecretName:   "", // empty - should not trigger change
+				Phase:       "Ready",
+				Message:     "user created",
+				ClusterName: "", // empty - should not trigger change
+				Username:    "", // empty - should not trigger change
+				SecretName:  "", // empty - should not trigger change
 			},
 			expectChanged: false,
 		},
@@ -1309,10 +1556,10 @@ func TestDatabaseUserStatusChangeDetection(t *testing.T) {
 				tt.currentStatus.Message != tt.update.Message ||
 				tt.currentStatus.ObservedGeneration != tt.generation ||
 				(tt.update.ClusterName != "" && tt.currentStatus.ClusterName != tt.update.ClusterName) ||
-				(tt.update.DatabaseName != "" && tt.currentStatus.DatabaseName != tt.update.DatabaseName) ||
 				(tt.update.Username != "" && tt.currentStatus.Username != tt.update.Username) ||
 				(tt.update.SecretName != "" && tt.currentStatus.SecretName != tt.update.SecretName) ||
-				tt.update.PasswordUpdated
+				tt.update.PasswordUpdated ||
+				len(tt.update.Databases) > 0
 
 			if statusChanged != tt.expectChanged {
 				t.Errorf("statusChanged = %v, want %v", statusChanged, tt.expectChanged)
@@ -1365,3 +1612,801 @@ func TestShouldDeleteOldSecret(t *testing.T) {
 		})
 	}
 }
+
+// Helper to create a fake reconciler with a fake k8s client
+func newTestReconciler(objects ...runtime.Object) *DatabaseUserReconciler {
+	scheme := runtime.NewScheme()
+	_ = databasesv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithRuntimeObjects(objects...).
+		Build()
+
+	return &DatabaseUserReconciler{
+		Client: fakeClient,
+		Scheme: scheme,
+	}
+}
+
+func TestDatabaseUserReconciler_RotatePassword(t *testing.T) {
+	ctx := context.Background()
+
+	cluster := &databasesv1alpha1.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
+		Spec: databasesv1alpha1.DBClusterSpec{
+			Endpoint: "localhost",
+			Port:     5432,
+		},
+	}
+
+	databases := []*databasesv1alpha1.Database{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "db1"},
+			Spec:       databasesv1alpha1.DatabaseSpec{DatabaseName: "testdb1"},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "db2"},
+			Spec:       databasesv1alpha1.DatabaseSpec{DatabaseName: "testdb2"},
+		},
+	}
+
+	tests := []struct {
+		name             string
+		user             *databasesv1alpha1.DatabaseUser
+		secret           *corev1.Secret
+		pgShouldFail     bool
+		wantPasswordChanged bool
+		wantErr          bool
+	}{
+		{
+			name: "successful rotation with primary mode",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-user", Namespace: "default"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Rotation: &databasesv1alpha1.RotationConfig{Days: 30},
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-user-credentials", Namespace: "default"},
+				Data:       map[string][]byte{"password": []byte("oldpassword")},
+			},
+			wantPasswordChanged: true,
+			wantErr:             false,
+		},
+		{
+			name: "rotation with custom password length",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-user", Namespace: "default"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Password: databasesv1alpha1.PasswordConfig{Length: 32},
+					Rotation: &databasesv1alpha1.RotationConfig{Days: 7},
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-user-credentials", Namespace: "default"},
+				Data:       map[string][]byte{"password": []byte("oldpassword")},
+			},
+			wantPasswordChanged: true,
+			wantErr:             false,
+		},
+		{
+			name: "postgres failure during rotation",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-user", Namespace: "default"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Rotation: &databasesv1alpha1.RotationConfig{Days: 30},
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-user-credentials", Namespace: "default"},
+				Data:       map[string][]byte{"password": []byte("oldpassword")},
+			},
+			pgShouldFail:        true,
+			wantPasswordChanged: false,
+			wantErr:             true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newTestReconciler(tt.secret)
+
+			mockPG := postgres.NewMockClient()
+			mockPG.ShouldFail = tt.pgShouldFail
+			if tt.pgShouldFail {
+				mockPG.FailError = errors.New("connection failed")
+			}
+
+			password, secretName, passwordChanged, err := r.rotatePassword(ctx, tt.user, tt.secret, cluster, databases, mockPG, "test_user")
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("rotatePassword() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			if passwordChanged != tt.wantPasswordChanged {
+				t.Errorf("rotatePassword() passwordChanged = %v, want %v", passwordChanged, tt.wantPasswordChanged)
+			}
+
+			if !tt.wantErr {
+				if password == "" {
+					t.Error("rotatePassword() password should not be empty")
+				}
+				if secretName == "" {
+					t.Error("rotatePassword() secretName should not be empty")
+				}
+			}
+		})
+	}
+}
+
+func TestDatabaseUserReconciler_AdoptSecret(t *testing.T) {
+	ctx := context.Background()
+
+	cluster := &databasesv1alpha1.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
+		Spec: databasesv1alpha1.DBClusterSpec{
+			Endpoint: "db.example.com",
+			Port:     5432,
+		},
+	}
+
+	databases := []*databasesv1alpha1.Database{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "mydb"},
+			Spec:       databasesv1alpha1.DatabaseSpec{DatabaseName: "production"},
+		},
+	}
+
+	tests := []struct {
+		name         string
+		user         *databasesv1alpha1.DatabaseUser
+		secret       *corev1.Secret
+		pgShouldFail bool
+		wantErr      bool
+	}{
+		{
+			name: "successful adopt with raw template",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-user",
+					Namespace: "default",
+					UID:       "test-uid",
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "existing-secret", Namespace: "default"},
+				Data:       map[string][]byte{"some-key": []byte("some-value")},
+			},
+			wantErr: false,
+		},
+		{
+			name: "adopt with DB template",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-user",
+					Namespace: "default",
+					UID:       "test-uid",
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Template: "DB"},
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "existing-secret", Namespace: "default"},
+				Data:       map[string][]byte{},
+			},
+			wantErr: false,
+		},
+		{
+			name: "postgres failure during adopt",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-user",
+					Namespace: "default",
+					UID:       "test-uid",
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "existing-secret", Namespace: "default"},
+				Data:       map[string][]byte{},
+			},
+			pgShouldFail: true,
+			wantErr:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newTestReconciler(tt.secret)
+
+			mockPG := postgres.NewMockClient()
+			mockPG.ShouldFail = tt.pgShouldFail
+			if tt.pgShouldFail {
+				mockPG.FailError = errors.New("connection failed")
+			}
+
+			password, secretName, passwordChanged, err := r.adoptSecret(ctx, tt.user, tt.secret, cluster, databases, mockPG, "test_user")
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("adoptSecret() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			if !tt.wantErr {
+				if password == "" {
+					t.Error("adoptSecret() password should not be empty")
+				}
+				if secretName != tt.secret.Name {
+					t.Errorf("adoptSecret() secretName = %v, want %v", secretName, tt.secret.Name)
+				}
+				if !passwordChanged {
+					t.Error("adoptSecret() should always change password")
+				}
+			}
+		})
+	}
+}
+
+func TestDatabaseUserReconciler_MergeSecret(t *testing.T) {
+	ctx := context.Background()
+
+	cluster := &databasesv1alpha1.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
+		Spec: databasesv1alpha1.DBClusterSpec{
+			Endpoint: "db.example.com",
+			Port:     5432,
+		},
+	}
+
+	databases := []*databasesv1alpha1.Database{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "db1"},
+			Spec:       databasesv1alpha1.DatabaseSpec{DatabaseName: "app_db"},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "db2"},
+			Spec:       databasesv1alpha1.DatabaseSpec{DatabaseName: "analytics_db"},
+		},
+	}
+
+	tests := []struct {
+		name              string
+		user              *databasesv1alpha1.DatabaseUser
+		secret            *corev1.Secret
+		pgShouldFail      bool
+		wantDatabasesList bool
+		wantErr           bool
+	}{
+		{
+			name: "successful merge with raw template and multiple databases",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-user",
+					Namespace: "default",
+					UID:       "test-uid",
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "shared-secret", Namespace: "default"},
+				Data: map[string][]byte{
+					"existing-key": []byte("preserve-this"),
+				},
+			},
+			wantDatabasesList: true,
+			wantErr:           false,
+		},
+		{
+			name: "merge with POSTGRES template - no databases list",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-user",
+					Namespace: "default",
+					UID:       "test-uid",
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Template: "POSTGRES"},
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "shared-secret", Namespace: "default"},
+				Data:       map[string][]byte{},
+			},
+			wantDatabasesList: false,
+			wantErr:           false,
+		},
+		{
+			name: "merge with nil secret data",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-user",
+					Namespace: "default",
+					UID:       "test-uid",
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "empty-secret", Namespace: "default"},
+				Data:       nil,
+			},
+			wantDatabasesList: true,
+			wantErr:           false,
+		},
+		{
+			name: "postgres failure during merge",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-user",
+					Namespace: "default",
+					UID:       "test-uid",
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "shared-secret", Namespace: "default"},
+				Data:       map[string][]byte{},
+			},
+			pgShouldFail: true,
+			wantErr:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newTestReconciler(tt.secret)
+
+			mockPG := postgres.NewMockClient()
+			mockPG.ShouldFail = tt.pgShouldFail
+			if tt.pgShouldFail {
+				mockPG.FailError = errors.New("connection failed")
+			}
+
+			password, secretName, passwordChanged, err := r.mergeSecret(ctx, tt.user, tt.secret, cluster, databases, mockPG, "test_user")
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("mergeSecret() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			if !tt.wantErr {
+				if password == "" {
+					t.Error("mergeSecret() password should not be empty")
+				}
+				if secretName != tt.secret.Name {
+					t.Errorf("mergeSecret() secretName = %v, want %v", secretName, tt.secret.Name)
+				}
+				if !passwordChanged {
+					t.Error("mergeSecret() should always change password")
+				}
+			}
+		})
+	}
+}
+
+func TestDatabaseUserReconciler_DeleteOldSecret(t *testing.T) {
+	ctx := context.Background()
+
+	userUID := types.UID("user-uid-123")
+
+	tests := []struct {
+		name         string
+		user         *databasesv1alpha1.DatabaseUser
+		secret       *corev1.Secret
+		secretName   string
+		shouldDelete bool
+	}{
+		{
+			name: "deletes owned secret",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-user", Namespace: "default", UID: userUID},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "old-secret",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{Kind: "DatabaseUser", Name: "test-user", UID: userUID},
+					},
+				},
+			},
+			secretName:   "old-secret",
+			shouldDelete: true,
+		},
+		{
+			name: "skips non-owned secret",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-user", Namespace: "default", UID: userUID},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "other-secret",
+					Namespace: "default",
+					OwnerReferences: []metav1.OwnerReference{
+						{Kind: "DatabaseUser", Name: "other-user", UID: "other-uid"},
+					},
+				},
+			},
+			secretName:   "other-secret",
+			shouldDelete: false,
+		},
+		{
+			name: "handles non-existent secret gracefully",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-user", Namespace: "default", UID: userUID},
+			},
+			secret:       nil,
+			secretName:   "non-existent",
+			shouldDelete: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var r *DatabaseUserReconciler
+			if tt.secret != nil {
+				r = newTestReconciler(tt.secret)
+			} else {
+				r = newTestReconciler()
+			}
+
+			// Should not panic
+			r.deleteOldSecret(ctx, "default", tt.secretName, tt.user)
+
+			if tt.shouldDelete && tt.secret != nil {
+				// Verify secret was deleted
+				var secret corev1.Secret
+				err := r.Get(ctx, types.NamespacedName{Name: tt.secretName, Namespace: "default"}, &secret)
+				if err == nil {
+					t.Error("deleteOldSecret() should have deleted the secret")
+				}
+			}
+		})
+	}
+}
+
+func TestDatabaseUserReconciler_CreateDatabaseSecret(t *testing.T) {
+	ctx := context.Background()
+
+	cluster := &databasesv1alpha1.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
+		Spec: databasesv1alpha1.DBClusterSpec{
+			Endpoint: "db.example.com",
+			Port:     5432,
+		},
+	}
+
+	database := &databasesv1alpha1.Database{
+		ObjectMeta: metav1.ObjectMeta{Name: "mydb"},
+		Spec:       databasesv1alpha1.DatabaseSpec{DatabaseName: "production_db"},
+	}
+
+	tests := []struct {
+		name       string
+		user       *databasesv1alpha1.DatabaseUser
+		secretName string
+		wantErr    bool
+	}{
+		{
+			name: "creates secret with raw template",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-user",
+					Namespace: "default",
+					UID:       "test-uid",
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{},
+			},
+			secretName: "test-user-mydb-credentials",
+			wantErr:    false,
+		},
+		{
+			name: "creates secret with DB template",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-user",
+					Namespace: "default",
+					UID:       "test-uid",
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Template: "DB"},
+				},
+			},
+			secretName: "test-user-mydb-credentials",
+			wantErr:    false,
+		},
+		{
+			name: "creates secret with custom template",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-user",
+					Namespace: "default",
+					UID:       "test-uid",
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{
+						Template: "custom",
+						Keys: &databasesv1alpha1.SecretKeys{
+							Host:     "PGHOST",
+							Port:     "PGPORT",
+							Database: "PGDATABASE",
+							User:     "PGUSER",
+							Password: "PGPASSWORD",
+						},
+					},
+				},
+			},
+			secretName: "test-user-mydb-credentials",
+			wantErr:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newTestReconciler()
+
+			err := r.createDatabaseSecret(ctx, tt.user, tt.secretName, cluster, database, "test_user", "securepassword123")
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("createDatabaseSecret() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			if !tt.wantErr {
+				// Verify secret was created
+				var secret corev1.Secret
+				err := r.Get(ctx, types.NamespacedName{Name: tt.secretName, Namespace: "default"}, &secret)
+				if err != nil {
+					t.Errorf("createDatabaseSecret() secret not found: %v", err)
+					return
+				}
+
+				// Verify secret has expected keys based on template
+				// Note: fake client doesn't convert StringData to Data, so check StringData
+				hostKey, portKey, dbKey, userKey, pwdKey := r.getSecretKeys(tt.user)
+				if secret.StringData[hostKey] != cluster.Spec.Endpoint {
+					t.Errorf("secret host = %v, want %v", secret.StringData[hostKey], cluster.Spec.Endpoint)
+				}
+				if secret.StringData[portKey] != "5432" {
+					t.Errorf("secret port = %v, want 5432", secret.StringData[portKey])
+				}
+				if secret.StringData[dbKey] != "production_db" {
+					t.Errorf("secret database = %v, want production_db", secret.StringData[dbKey])
+				}
+				if secret.StringData[userKey] != "test_user" {
+					t.Errorf("secret user = %v, want test_user", secret.StringData[userKey])
+				}
+				if secret.StringData[pwdKey] != "securepassword123" {
+					t.Errorf("secret password = %v, want securepassword123", secret.StringData[pwdKey])
+				}
+			}
+		})
+	}
+}
+
+func TestDatabaseUserReconciler_CreatePrimarySecret(t *testing.T) {
+	ctx := context.Background()
+
+	cluster := &databasesv1alpha1.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
+		Spec: databasesv1alpha1.DBClusterSpec{
+			Endpoint: "db.example.com",
+			Port:     5432,
+		},
+	}
+
+	tests := []struct {
+		name          string
+		user          *databasesv1alpha1.DatabaseUser
+		databases     []*databasesv1alpha1.Database
+		wantDatabases bool
+	}{
+		{
+			name: "single database - no databases field",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-user",
+					Namespace: "default",
+					UID:       "test-uid",
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{},
+			},
+			databases: []*databasesv1alpha1.Database{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "db1"},
+					Spec:       databasesv1alpha1.DatabaseSpec{DatabaseName: "testdb"},
+				},
+			},
+			wantDatabases: false,
+		},
+		{
+			name: "multiple databases with raw template - has databases field",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-user",
+					Namespace: "default",
+					UID:       "test-uid",
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{},
+			},
+			databases: []*databasesv1alpha1.Database{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "db1"},
+					Spec:       databasesv1alpha1.DatabaseSpec{DatabaseName: "app_db"},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "db2"},
+					Spec:       databasesv1alpha1.DatabaseSpec{DatabaseName: "analytics_db"},
+				},
+			},
+			wantDatabases: true,
+		},
+		{
+			name: "multiple databases with POSTGRES template - no databases field",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-user",
+					Namespace: "default",
+					UID:       "test-uid",
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Template: "POSTGRES"},
+				},
+			},
+			databases: []*databasesv1alpha1.Database{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "db1"},
+					Spec:       databasesv1alpha1.DatabaseSpec{DatabaseName: "app_db"},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "db2"},
+					Spec:       databasesv1alpha1.DatabaseSpec{DatabaseName: "analytics_db"},
+				},
+			},
+			wantDatabases: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newTestReconciler()
+
+			secretName := "test-user-credentials"
+			err := r.createPrimarySecret(ctx, tt.user, secretName, cluster, tt.databases, "test_user", "password123")
+			if err != nil {
+				t.Errorf("createPrimarySecret() error = %v", err)
+				return
+			}
+
+			// Verify secret was created
+			var secret corev1.Secret
+			err = r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: "default"}, &secret)
+			if err != nil {
+				t.Errorf("createPrimarySecret() secret not found: %v", err)
+				return
+			}
+
+			// Check databases field - fake client uses StringData
+			_, hasDatabases := secret.StringData["databases"]
+			if hasDatabases != tt.wantDatabases {
+				t.Errorf("secret has databases field = %v, want %v", hasDatabases, tt.wantDatabases)
+			}
+
+			if tt.wantDatabases {
+				expectedDatabases := "app_db,analytics_db"
+				if secret.StringData["databases"] != expectedDatabases {
+					t.Errorf("secret databases = %v, want %v", secret.StringData["databases"], expectedDatabases)
+				}
+			}
+
+			// Verify primary database is first one
+			hostKey, _, dbKey, _, _ := r.getSecretKeys(tt.user)
+			if secret.StringData[dbKey] != tt.databases[0].Spec.DatabaseName {
+				t.Errorf("primary database = %v, want %v", secret.StringData[dbKey], tt.databases[0].Spec.DatabaseName)
+			}
+
+			// Verify host
+			if secret.StringData[hostKey] != cluster.Spec.Endpoint {
+				t.Errorf("host = %v, want %v", secret.StringData[hostKey], cluster.Spec.Endpoint)
+			}
+		})
+	}
+}
+
+func TestDatabaseUserReconciler_UpdateSecretDatabases(t *testing.T) {
+	ctx := context.Background()
+
+	cluster := &databasesv1alpha1.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
+		Spec: databasesv1alpha1.DBClusterSpec{
+			Endpoint: "db.example.com",
+			Port:     5432,
+		},
+	}
+
+	tests := []struct {
+		name              string
+		user              *databasesv1alpha1.DatabaseUser
+		initialData       map[string][]byte
+		databases         []*databasesv1alpha1.Database
+		expectUpdate      bool
+		wantDatabasesList string
+	}{
+		{
+			name: "add databases list when adding second database",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-user", Namespace: "default"},
+				Spec:       databasesv1alpha1.DatabaseUserSpec{},
+			},
+			initialData: map[string][]byte{
+				"host":     []byte("db.example.com"),
+				"database": []byte("db1"),
+			},
+			databases: []*databasesv1alpha1.Database{
+				{ObjectMeta: metav1.ObjectMeta{Name: "db1"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "app_db"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "db2"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "cache_db"}},
+			},
+			expectUpdate:      true,
+			wantDatabasesList: "app_db,cache_db",
+		},
+		{
+			name: "remove databases list with non-raw template",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-user", Namespace: "default"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Template: "DB"},
+				},
+			},
+			initialData: map[string][]byte{
+				"DB_HOST":      []byte("db.example.com"),
+				"DB_NAME":      []byte("old_db"),
+				"databases":    []byte("old_db,other_db"),
+			},
+			databases: []*databasesv1alpha1.Database{
+				{ObjectMeta: metav1.ObjectMeta{Name: "db1"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "new_db"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "db2"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "other_db"}},
+			},
+			expectUpdate:      true,
+			wantDatabasesList: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-secret", Namespace: "default"},
+				Data:       tt.initialData,
+			}
+			r := newTestReconciler(secret)
+
+			err := r.updateSecretDatabases(ctx, tt.user, secret, cluster, tt.databases, "test_user")
+			if err != nil {
+				t.Errorf("updateSecretDatabases() error = %v", err)
+				return
+			}
+
+			// Fetch updated secret
+			var updatedSecret corev1.Secret
+			err = r.Get(ctx, types.NamespacedName{Name: "test-secret", Namespace: "default"}, &updatedSecret)
+			if err != nil {
+				t.Errorf("failed to get updated secret: %v", err)
+				return
+			}
+
+			if tt.wantDatabasesList != "" {
+				if string(updatedSecret.Data["databases"]) != tt.wantDatabasesList {
+					t.Errorf("databases = %v, want %v", string(updatedSecret.Data["databases"]), tt.wantDatabasesList)
+				}
+			} else {
+				if _, exists := updatedSecret.Data["databases"]; exists {
+					t.Errorf("databases field should not exist, but got: %v", string(updatedSecret.Data["databases"]))
+				}
+			}
+		})
+	}
+}
+

@@ -2,6 +2,15 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.5.0] - 2026-01-28
+
+### Added
+- Multi-database support for DatabaseUser
+- Per-database secret generation option
+
+### Breaking Changes
+- `spec.databaseRef` → `spec.database` or `spec.databases[]`
+
 ## [0.4.3] - 2025-01-26
 
 ### Fixed

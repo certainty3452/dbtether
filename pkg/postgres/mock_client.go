@@ -13,6 +13,7 @@ type MockClient struct {
 	dbOwners   map[string]string   // database -> "namespace/name"
 	extensions map[string][]string // database -> extensions
 	users      map[string]string   // username -> password
+	userAccess map[string]map[string]bool // username -> database -> hasAccess
 
 	Version    string
 	ShouldFail bool
@@ -25,6 +26,7 @@ func NewMockClient() *MockClient {
 		dbOwners:   make(map[string]string),
 		extensions: make(map[string][]string),
 		users:      make(map[string]string),
+		userAccess: make(map[string]map[string]bool),
 		Version:    "PostgreSQL 16.0 (mock)",
 	}
 }
@@ -229,6 +231,72 @@ func (m *MockClient) GrantDatabaseAccess(ctx context.Context, username, database
 	if m.ShouldFail {
 		return m.FailError
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.userAccess[username] == nil {
+		m.userAccess[username] = make(map[string]bool)
+	}
+	m.userAccess[username][database] = true
+	return nil
+}
+
+func (m *MockClient) RevokeDatabaseAccess(ctx context.Context, username, database string) error {
+	if m.ShouldFail {
+		return m.FailError
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.userAccess[username] != nil {
+		delete(m.userAccess[username], database)
+	}
+	return nil
+}
+
+func (m *MockClient) GetUserDatabaseAccess(ctx context.Context, username string) ([]string, error) {
+	if m.ShouldFail {
+		return nil, m.FailError
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var databases []string
+	if access := m.userAccess[username]; access != nil {
+		for db := range access {
+			databases = append(databases, db)
+		}
+	}
+	return databases, nil
+}
+
+func (m *MockClient) SyncDatabaseAccess(ctx context.Context, username string, allowedDatabases []string) error {
+	if m.ShouldFail {
+		return m.FailError
+	}
+	// Get current access
+	currentAccess, err := m.GetUserDatabaseAccess(ctx, username)
+	if err != nil {
+		return err
+	}
+
+	// Build allowed set
+	allowed := make(map[string]bool, len(allowedDatabases))
+	for _, db := range allowedDatabases {
+		allowed[db] = true
+	}
+
+	// Revoke access to databases NOT in allowed list
+	for _, db := range currentAccess {
+		if !allowed[db] {
+			_ = m.RevokeDatabaseAccess(ctx, username, db)
+		}
+	}
+
+	// Grant access to allowed databases
+	for _, db := range allowedDatabases {
+		if err := m.GrantDatabaseAccess(ctx, username, db); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 

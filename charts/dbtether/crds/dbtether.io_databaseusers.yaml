@@ -15,8 +15,11 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .status.databaseName
-      name: Database
+    - jsonPath: .status.clusterName
+      name: Cluster
+      type: string
+    - jsonPath: .status.databasesSummary
+      name: Databases
       type: string
     - jsonPath: .status.username
       name: Username
@@ -75,15 +78,50 @@ spec:
                 default: -1
                 minimum: -1
                 type: integer
-              databaseRef:
+              database:
+                description: |-
+                  Simple case: single database reference
+                  Mutually exclusive with Databases
                 properties:
                   name:
+                    description: Reference to Database resource
                     type: string
                   namespace:
+                    type: string
+                  privileges:
+                    description: Override default privileges for this database
+                    enum:
+                    - readonly
+                    - readwrite
+                    - admin
                     type: string
                 required:
                 - name
                 type: object
+              databases:
+                description: |-
+                  Multiple databases: list of database references
+                  Mutually exclusive with Database
+                items:
+                  description: DatabaseAccess defines access to a single database
+                  properties:
+                    name:
+                      description: Reference to Database resource
+                      type: string
+                    namespace:
+                      type: string
+                    privileges:
+                      description: Override default privileges for this database
+                      enum:
+                      - readonly
+                      - readwrite
+                      - admin
+                      type: string
+                  required:
+                  - name
+                  type: object
+                minItems: 1
+                type: array
               deletionPolicy:
                 default: Delete
                 enum:
@@ -99,6 +137,9 @@ spec:
                     type: integer
                 type: object
               privileges:
+                default: readonly
+                description: Default privileges for all databases (can be overridden
+                  per-database)
                 enum:
                 - readonly
                 - readwrite
@@ -149,19 +190,68 @@ spec:
                     - custom
                     type: string
                 type: object
+              secretGeneration:
+                default: primary
+                description: |-
+                  SecretGeneration controls how secrets are created for multiple databases
+                  - primary (default): single secret with first database
+                  - perDatabase: separate secret for each database (same password, different database field)
+                enum:
+                - primary
+                - perDatabase
+                type: string
               username:
                 maxLength: 63
                 pattern: ^[a-z_][a-z0-9_]*$
                 type: string
-            required:
-            - databaseRef
-            - privileges
             type: object
           status:
             properties:
               clusterName:
+                description: ClusterName is the name of the DBCluster this user belongs
+                  to
                 type: string
-              databaseName:
+              databases:
+                description: Per-database access status
+                items:
+                  description: DatabaseAccessStatus represents the status of access
+                    to a single database
+                  properties:
+                    databaseName:
+                      description: DatabaseName is the actual PostgreSQL database
+                        name
+                      type: string
+                    message:
+                      description: Message contains additional information about the
+                        status
+                      type: string
+                    name:
+                      description: Name of the Database resource
+                      type: string
+                    namespace:
+                      description: Namespace of the Database resource (empty if same
+                        as user)
+                      type: string
+                    phase:
+                      description: Phase indicates the status of access to this database
+                      enum:
+                      - Pending
+                      - Ready
+                      - Failed
+                      type: string
+                    privileges:
+                      description: Privileges granted on this database
+                      type: string
+                    secretName:
+                      description: SecretName for this database (only set when secretGeneration=perDatabase)
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              databasesSummary:
+                description: DatabasesSummary for printer column display (e.g., "db1
+                  (+2)")
                 type: string
               message:
                 type: string
@@ -182,8 +272,11 @@ spec:
                 - Failed
                 type: string
               secretName:
+                description: Primary secret name (for first database or single secret
+                  mode)
                 type: string
               username:
+                description: Username is the PostgreSQL username
                 type: string
             type: object
         type: object

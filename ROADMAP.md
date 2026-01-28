@@ -2,11 +2,6 @@
 
 This document outlines planned features and improvements for the dbtether operator.
 
-- [ ] **Multi-database access** — decouple user from single database binding:
-  - `spec.databaseRefs[]` instead of `spec.databaseRef` — grant access to multiple databases
-  - Phase 1: same-namespace only
-  - Phase 2: cross-namespace with opt-in via `dbtether.io/allow-users-from` annotation or team labels on namespaces
-
 ## Database Features
 
 - [ ] **Database owner** via `spec.owner` (reference to DatabaseUser)

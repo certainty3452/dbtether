@@ -46,6 +46,9 @@ type ClientInterface interface {
 	DropUser(ctx context.Context, username string) error
 	RevokeAllDatabaseAccess(ctx context.Context, username string) error
 	GrantDatabaseAccess(ctx context.Context, username, database string) error
+	RevokeDatabaseAccess(ctx context.Context, username, database string) error
+	GetUserDatabaseAccess(ctx context.Context, username string) ([]string, error)
+	SyncDatabaseAccess(ctx context.Context, username string, allowedDatabases []string) error
 	ApplyPrivileges(ctx context.Context, username, database, preset string, additionalGrants []TableGrant) error
 	VerifyDatabaseIsolation(ctx context.Context, username, allowedDatabase string) ([]string, error)
 	RevokePrivilegesInDatabase(ctx context.Context, username, database string) error
@@ -453,6 +456,77 @@ func (c *Client) GrantDatabaseAccess(ctx context.Context, username, database str
 	if err != nil {
 		return fmt.Errorf("failed to grant database access: %w", err)
 	}
+	return nil
+}
+
+// RevokeDatabaseAccess revokes CONNECT privilege on a single database
+func (c *Client) RevokeDatabaseAccess(ctx context.Context, username, database string) error {
+	query := fmt.Sprintf(
+		"REVOKE CONNECT ON DATABASE %s FROM %s",
+		pq.QuoteIdentifier(database),
+		pq.QuoteIdentifier(username),
+	)
+	_, err := c.pool.Exec(ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to revoke database access on %s: %w", database, err)
+	}
+	return nil
+}
+
+// GetUserDatabaseAccess returns list of databases where user has CONNECT privilege
+func (c *Client) GetUserDatabaseAccess(ctx context.Context, username string) ([]string, error) {
+	query := `
+		SELECT datname FROM pg_database 
+		WHERE datistemplate = false 
+		AND has_database_privilege($1, datname, 'CONNECT')
+	`
+	rows, err := c.pool.Query(ctx, query, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user database access: %w", err)
+	}
+	defer rows.Close()
+
+	var databases []string
+	for rows.Next() {
+		var db string
+		if err := rows.Scan(&db); err != nil {
+			return nil, err
+		}
+		databases = append(databases, db)
+	}
+	return databases, nil
+}
+
+// SyncDatabaseAccess ensures user has access ONLY to the specified databases.
+// It grants access to allowed databases and revokes access from all others.
+func (c *Client) SyncDatabaseAccess(ctx context.Context, username string, allowedDatabases []string) error {
+	// Get all databases where user currently has CONNECT
+	currentAccess, err := c.GetUserDatabaseAccess(ctx, username)
+	if err != nil {
+		return err
+	}
+
+	// Build allowed set for O(1) lookup
+	allowed := make(map[string]bool, len(allowedDatabases))
+	for _, db := range allowedDatabases {
+		allowed[db] = true
+	}
+
+	// Revoke access to databases NOT in allowed list (best-effort)
+	for _, db := range currentAccess {
+		if !allowed[db] {
+			// Best-effort: log but continue on error
+			_ = c.RevokeDatabaseAccess(ctx, username, db)
+		}
+	}
+
+	// Grant access to allowed databases
+	for _, db := range allowedDatabases {
+		if err := c.GrantDatabaseAccess(ctx, username, db); err != nil {
+			return fmt.Errorf("failed to grant access to %s: %w", db, err)
+		}
+	}
+
 	return nil
 }
 

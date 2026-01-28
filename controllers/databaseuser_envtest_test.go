@@ -80,7 +80,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "readonly",
@@ -111,7 +111,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "readwrite",
@@ -143,7 +143,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "admin",
@@ -179,7 +179,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "readonly",
@@ -223,7 +223,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: "non-existent-database",
 					},
 					Privileges: "readonly",
@@ -257,7 +257,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Username:   "custom_postgres_user",
@@ -291,7 +291,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 						Namespace: namespace,
 					},
 					Spec: databasesv1alpha1.DatabaseUserSpec{
-						DatabaseRef: databasesv1alpha1.DatabaseReference{
+						Database: &databasesv1alpha1.DatabaseAccess{
 							Name: databaseName,
 						},
 						Privileges: priv,
@@ -324,7 +324,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "readwrite",
@@ -358,7 +358,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "readonly",
@@ -397,7 +397,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges:      "readonly",
@@ -429,7 +429,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges:      "readwrite",
@@ -463,7 +463,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "readonly",
@@ -511,7 +511,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "readonly",
@@ -546,7 +546,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "readonly",
@@ -581,7 +581,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "readwrite",
@@ -616,7 +616,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "admin",
@@ -666,7 +666,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "readonly",
@@ -708,7 +708,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "readonly",
@@ -743,7 +743,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "readwrite",
@@ -778,7 +778,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
-					DatabaseRef: databasesv1alpha1.DatabaseReference{
+					Database: &databasesv1alpha1.DatabaseAccess{
 						Name: databaseName,
 					},
 					Privileges: "admin",
@@ -802,6 +802,449 @@ var _ = Describe("DatabaseUser Controller", func() {
 			Expect(createdUser.Spec.Secret).ShouldNot(BeNil())
 			Expect(createdUser.Spec.Secret.Name).Should(Equal("merged-secret"))
 			Expect(createdUser.Spec.Secret.OnConflict).Should(Equal("Merge"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+	})
+
+	Context("When creating a DatabaseUser with multiple databases", func() {
+		const (
+			database2Name = "user-test-db-2"
+			database3Name = "user-test-db-3"
+		)
+
+		BeforeEach(func() {
+			database2 := &databasesv1alpha1.Database{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      database2Name,
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseSpec{
+					ClusterRef: databasesv1alpha1.ClusterReference{
+						Name: clusterName,
+					},
+					DatabaseName: "testdb2",
+				},
+			}
+			_ = k8sClient.Create(ctx, database2)
+
+			database3 := &databasesv1alpha1.Database{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      database3Name,
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseSpec{
+					ClusterRef: databasesv1alpha1.ClusterReference{
+						Name: clusterName,
+					},
+					DatabaseName: "testdb3",
+				},
+			}
+			_ = k8sClient.Create(ctx, database3)
+		})
+
+		It("Should create a DatabaseUser with databases array", func() {
+			By("Creating a DatabaseUser with multiple databases")
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-multi-db",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Databases: []databasesv1alpha1.DatabaseAccess{
+						{Name: databaseName},
+						{Name: database2Name},
+						{Name: database3Name},
+					},
+					Privileges: "readonly",
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying the DatabaseUser was created with multiple databases")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-multi-db",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Databases).Should(HaveLen(3))
+			Expect(createdUser.Spec.GetDatabases()).Should(HaveLen(3))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should validate mutually exclusive database and databases fields", func() {
+			By("Creating a DatabaseUser with both database and databases (should fail validation)")
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-both-fields",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{
+						Name: databaseName,
+					},
+					Databases: []databasesv1alpha1.DatabaseAccess{
+						{Name: database2Name},
+					},
+					Privileges: "readonly",
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("The controller should set status to Failed due to validation error")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() string {
+				err := k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-both-fields",
+					Namespace: namespace,
+				}, createdUser)
+				if err != nil {
+					return ""
+				}
+				return createdUser.Status.Phase
+			}, timeout, interval).Should(Equal("Failed"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should accept per-database privilege overrides", func() {
+			By("Creating a DatabaseUser with different privileges per database")
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-per-db-privs",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Databases: []databasesv1alpha1.DatabaseAccess{
+						{Name: databaseName, Privileges: "readonly"},
+						{Name: database2Name, Privileges: "readwrite"},
+						{Name: database3Name, Privileges: "admin"},
+					},
+					Privileges: "readonly",
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying per-database privileges are stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-per-db-privs",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Databases[0].Privileges).Should(Equal("readonly"))
+			Expect(createdUser.Spec.Databases[1].Privileges).Should(Equal("readwrite"))
+			Expect(createdUser.Spec.Databases[2].Privileges).Should(Equal("admin"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+	})
+
+	Context("When using secretGeneration modes", func() {
+		const database2Name = "user-test-db-2-sg"
+
+		BeforeEach(func() {
+			database2 := &databasesv1alpha1.Database{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      database2Name,
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseSpec{
+					ClusterRef: databasesv1alpha1.ClusterReference{
+						Name: clusterName,
+					},
+					DatabaseName: "testdb2sg",
+				},
+			}
+			_ = k8sClient.Create(ctx, database2)
+		})
+
+		It("Should default to primary secretGeneration", func() {
+			By("Creating a DatabaseUser without specifying secretGeneration")
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-default-sg",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Databases: []databasesv1alpha1.DatabaseAccess{
+						{Name: databaseName},
+						{Name: database2Name},
+					},
+					Privileges: "readonly",
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying secretGeneration defaults to primary")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-default-sg",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			// CRD default sets it to "primary" when not specified
+			Expect(createdUser.Spec.SecretGeneration).Should(SatisfyAny(BeEmpty(), Equal("primary")))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should accept explicit primary secretGeneration", func() {
+			By("Creating a DatabaseUser with secretGeneration: primary")
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-primary-sg",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Databases: []databasesv1alpha1.DatabaseAccess{
+						{Name: databaseName},
+						{Name: database2Name},
+					},
+					Privileges:       "readonly",
+					SecretGeneration: "primary",
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying secretGeneration is primary")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-primary-sg",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.SecretGeneration).Should(Equal("primary"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should accept perDatabase secretGeneration", func() {
+			By("Creating a DatabaseUser with secretGeneration: perDatabase")
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-perdb-sg",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Databases: []databasesv1alpha1.DatabaseAccess{
+						{Name: databaseName},
+						{Name: database2Name},
+					},
+					Privileges:       "readwrite",
+					SecretGeneration: "perDatabase",
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying secretGeneration is perDatabase")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-perdb-sg",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.SecretGeneration).Should(Equal("perDatabase"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+	})
+
+	Context("When using different secret templates", func() {
+		It("Should accept DB template", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-db-template",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{
+						Name: databaseName,
+					},
+					Privileges: "readonly",
+					Secret: &databasesv1alpha1.SecretConfig{
+						Template: "DB",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying template is stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-db-template",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Secret.Template).Should(Equal("DB"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should accept DATABASE template", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-database-template",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{
+						Name: databaseName,
+					},
+					Privileges: "readonly",
+					Secret: &databasesv1alpha1.SecretConfig{
+						Template: "DATABASE",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying template is stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-database-template",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Secret.Template).Should(Equal("DATABASE"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should accept POSTGRES template", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-postgres-template",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{
+						Name: databaseName,
+					},
+					Privileges: "readonly",
+					Secret: &databasesv1alpha1.SecretConfig{
+						Template: "POSTGRES",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying template is stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-postgres-template",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Secret.Template).Should(Equal("POSTGRES"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should accept custom template with custom keys", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-custom-template",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{
+						Name: databaseName,
+					},
+					Privileges: "readonly",
+					Secret: &databasesv1alpha1.SecretConfig{
+						Template: "custom",
+						Keys: &databasesv1alpha1.SecretKeys{
+							Host:     "PGHOST",
+							Port:     "PGPORT",
+							Database: "PGDATABASE",
+							User:     "PGUSER",
+							Password: "PGPASSWORD",
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying custom template and keys are stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-custom-template",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Secret.Template).Should(Equal("custom"))
+			Expect(createdUser.Spec.Secret.Keys).ShouldNot(BeNil())
+			Expect(createdUser.Spec.Secret.Keys.Host).Should(Equal("PGHOST"))
+			Expect(createdUser.Spec.Secret.Keys.Password).Should(Equal("PGPASSWORD"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+	})
+
+	Context("When user has cross-namespace database reference", func() {
+		It("Should accept database reference with namespace", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-cross-ns",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{
+						Name:      databaseName,
+						Namespace: namespace,
+					},
+					Privileges: "readonly",
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying namespace is stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-cross-ns",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Database.Namespace).Should(Equal(namespace))
 
 			By(stepCleaningUp)
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
