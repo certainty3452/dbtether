@@ -277,6 +277,7 @@ func (r *DatabaseUserReconciler) ensureFinalizer(ctx context.Context, user *data
 	return &ctrl.Result{}, nil
 }
 
+//nolint:gocyclo,funlen // reconciler orchestration requires multiple steps
 func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
 	databases []*databasesv1alpha1.Database, cluster *databasesv1alpha1.DBCluster) (ctrl.Result, error) {
 
@@ -474,6 +475,7 @@ func (r *DatabaseUserReconciler) verifyIsolation(ctx context.Context, pgClient p
 	}
 }
 
+//nolint:gocyclo // secret management with multiple strategies requires complexity
 func (r *DatabaseUserReconciler) ensureSecrets(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
 	databases []*databasesv1alpha1.Database, cluster *databasesv1alpha1.DBCluster,
 	pgClient postgres.ClientInterface) (password, primarySecretName string, passwordChanged bool, err error) {
@@ -486,7 +488,7 @@ func (r *DatabaseUserReconciler) ensureSecrets(ctx context.Context, user *databa
 	var primarySecret corev1.Secret
 	err = r.Get(ctx, types.NamespacedName{Name: primarySecretName, Namespace: user.Namespace}, &primarySecret)
 
-	if err == nil {
+	if err == nil { //nolint:nestif // secret handling requires multiple checks
 		// Secret exists
 		if r.isSecretOwnedByUser(&primarySecret, user) {
 			if r.shouldRotatePassword(user) {
@@ -722,7 +724,7 @@ func (r *DatabaseUserReconciler) rotatePassword(ctx context.Context, user *datab
 	}
 
 	// Update secrets based on generation strategy
-	if user.Spec.SecretGeneration == "perDatabase" {
+	if user.Spec.SecretGeneration == "perDatabase" { //nolint:nestif // per-database secret updates require nested logic
 		for _, db := range databases {
 			dbSecretName := r.getSecretNameForDatabase(user, db.Name)
 			if err := r.createDatabaseSecret(ctx, user, dbSecretName, cluster, db, username, password); err != nil {

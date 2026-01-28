@@ -10,9 +10,9 @@ import (
 type MockClient struct {
 	mu         sync.RWMutex
 	databases  map[string]bool
-	dbOwners   map[string]string   // database -> "namespace/name"
-	extensions map[string][]string // database -> extensions
-	users      map[string]string   // username -> password
+	dbOwners   map[string]string          // database -> "namespace/name"
+	extensions map[string][]string        // database -> extensions
+	users      map[string]string          // username -> password
 	userAccess map[string]map[string]bool // username -> database -> hasAccess
 
 	Version    string

@@ -245,13 +245,13 @@ func TestGetCredentials_BothSourcesSpecified_UsesEnv(t *testing.T) {
 // This prevents unnecessary reconciliation loops caused by status patches
 func TestStatusChangeDetection(t *testing.T) {
 	tests := []struct {
-		name           string
-		currentStatus  databasesv1alpha1.DBClusterStatus
-		generation     int64
-		newPhase       string
-		newMessage     string
-		newVersion     string
-		expectChanged  bool
+		name          string
+		currentStatus databasesv1alpha1.DBClusterStatus
+		generation    int64
+		newPhase      string
+		newMessage    string
+		newVersion    string
+		expectChanged bool
 	}{
 		{
 			name: "no change - same phase and message",

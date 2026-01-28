@@ -2,12 +2,11 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
-	"errors"
-
 	"github.com/certainty3452/dbtether/pkg/postgres"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1653,12 +1652,12 @@ func TestDatabaseUserReconciler_RotatePassword(t *testing.T) {
 	}
 
 	tests := []struct {
-		name             string
-		user             *databasesv1alpha1.DatabaseUser
-		secret           *corev1.Secret
-		pgShouldFail     bool
+		name                string
+		user                *databasesv1alpha1.DatabaseUser
+		secret              *corev1.Secret
+		pgShouldFail        bool
 		wantPasswordChanged bool
-		wantErr          bool
+		wantErr             bool
 	}{
 		{
 			name: "successful rotation with primary mode",
@@ -2156,7 +2155,7 @@ func TestDatabaseUserReconciler_CreateDatabaseSecret(t *testing.T) {
 				return
 			}
 
-			if !tt.wantErr {
+			if !tt.wantErr { //nolint:nestif // test verification requires multiple checks
 				// Verify secret was created
 				var secret corev1.Secret
 				err := r.Get(ctx, types.NamespacedName{Name: tt.secretName, Namespace: "default"}, &secret)
@@ -2362,9 +2361,9 @@ func TestDatabaseUserReconciler_UpdateSecretDatabases(t *testing.T) {
 				},
 			},
 			initialData: map[string][]byte{
-				"DB_HOST":      []byte("db.example.com"),
-				"DB_NAME":      []byte("old_db"),
-				"databases":    []byte("old_db,other_db"),
+				"DB_HOST":   []byte("db.example.com"),
+				"DB_NAME":   []byte("old_db"),
+				"databases": []byte("old_db,other_db"),
 			},
 			databases: []*databasesv1alpha1.Database{
 				{ObjectMeta: metav1.ObjectMeta{Name: "db1"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "new_db"}},
@@ -2409,4 +2408,3 @@ func TestDatabaseUserReconciler_UpdateSecretDatabases(t *testing.T) {
 		})
 	}
 }
-

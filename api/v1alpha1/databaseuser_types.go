@@ -169,10 +169,10 @@ type DatabaseUserStatus struct {
 	DatabasesSummary string `json:"databasesSummary,omitempty"`
 
 	// Primary secret name (for first database or single secret mode)
-	SecretName        string       `json:"secretName,omitempty"`
-	PasswordUpdatedAt *metav1.Time `json:"passwordUpdatedAt,omitempty"`
-	PendingSince      *metav1.Time `json:"pendingSince,omitempty"`
-	ObservedGeneration int64       `json:"observedGeneration,omitempty"`
+	SecretName         string       `json:"secretName,omitempty"`
+	PasswordUpdatedAt  *metav1.Time `json:"passwordUpdatedAt,omitempty"`
+	PendingSince       *metav1.Time `json:"pendingSince,omitempty"`
+	ObservedGeneration int64        `json:"observedGeneration,omitempty"`
 }
 
 // DatabaseAccessStatus represents the status of access to a single database
