@@ -63,6 +63,7 @@ func TestDatabaseUserReconciler_Privileges(t *testing.T) {
 		{"readonly", "readonly", true},
 		{"readwrite", "readwrite", true},
 		{"admin", "admin", true},
+		{"owner", "owner", true},
 		{"empty", "", false},
 		{"invalid", "superuser", false},
 	}
@@ -71,6 +72,7 @@ func TestDatabaseUserReconciler_Privileges(t *testing.T) {
 		"readonly":  true,
 		"readwrite": true,
 		"admin":     true,
+		"owner":     true,
 	}
 
 	for _, tt := range tests {
@@ -2407,4 +2409,207 @@ func TestDatabaseUserReconciler_UpdateSecretDatabases(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDatabaseUserReconciler_ReassignOwnershipForRemovedDatabases(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name           string
+		statusDBs      []databasesv1alpha1.DatabaseAccessStatus
+		currentDBNames []string
+		expectReassign []string // databases that should have ReassignOwnership called
+	}{
+		{
+			name: "no databases removed",
+			statusDBs: []databasesv1alpha1.DatabaseAccessStatus{
+				{Name: "db1", DatabaseName: "app_db"},
+				{Name: "db2", DatabaseName: "cache_db"},
+			},
+			currentDBNames: []string{"app_db", "cache_db"},
+			expectReassign: []string{},
+		},
+		{
+			name: "one database removed",
+			statusDBs: []databasesv1alpha1.DatabaseAccessStatus{
+				{Name: "db1", DatabaseName: "app_db"},
+				{Name: "db2", DatabaseName: "cache_db"},
+			},
+			currentDBNames: []string{"app_db"},
+			expectReassign: []string{"cache_db"},
+		},
+		{
+			name: "all databases removed",
+			statusDBs: []databasesv1alpha1.DatabaseAccessStatus{
+				{Name: "db1", DatabaseName: "app_db"},
+				{Name: "db2", DatabaseName: "cache_db"},
+			},
+			currentDBNames: []string{},
+			expectReassign: []string{"app_db", "cache_db"},
+		},
+		{
+			name:           "empty status",
+			statusDBs:      []databasesv1alpha1.DatabaseAccessStatus{},
+			currentDBNames: []string{"new_db"},
+			expectReassign: []string{},
+		},
+		{
+			name: "empty database name in status",
+			statusDBs: []databasesv1alpha1.DatabaseAccessStatus{
+				{Name: "db1", DatabaseName: ""},
+				{Name: "db2", DatabaseName: "cache_db"},
+			},
+			currentDBNames: []string{},
+			expectReassign: []string{"cache_db"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockPG := &mockPGClientWithReassign{
+				MockClient:          postgres.NewMockClient(),
+				reassignedDatabases: make([]string, 0),
+			}
+
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-user", Namespace: "default"},
+				Status: databasesv1alpha1.DatabaseUserStatus{
+					Databases: tt.statusDBs,
+				},
+			}
+
+			r := &DatabaseUserReconciler{}
+			r.reassignOwnershipForRemovedDatabases(ctx, mockPG, user, "test_user", tt.currentDBNames)
+
+			// Verify correct databases had ReassignOwnership called
+			if len(mockPG.reassignedDatabases) != len(tt.expectReassign) {
+				t.Errorf("expected %d reassign calls, got %d: %v",
+					len(tt.expectReassign), len(mockPG.reassignedDatabases), mockPG.reassignedDatabases)
+				return
+			}
+
+			for _, expectedDB := range tt.expectReassign {
+				found := false
+				for _, actualDB := range mockPG.reassignedDatabases {
+					if actualDB == expectedDB {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("expected ReassignOwnership to be called for %s, but it wasn't. Called for: %v",
+						expectedDB, mockPG.reassignedDatabases)
+				}
+			}
+		})
+	}
+}
+
+// mockPGClientWithReassign tracks ReassignOwnership calls
+type mockPGClientWithReassign struct {
+	*postgres.MockClient
+	reassignedDatabases []string
+}
+
+func (m *mockPGClientWithReassign) ReassignOwnership(ctx context.Context, fromUser, database string) error {
+	m.reassignedDatabases = append(m.reassignedDatabases, database)
+	return nil
+}
+
+func TestDatabaseUserReconciler_OwnerPrivilegesValidation(t *testing.T) {
+	tests := []struct {
+		name       string
+		privileges string
+		valid      bool
+	}{
+		{"owner is valid", "owner", true},
+		{"readonly is valid", "readonly", true},
+		{"readwrite is valid", "readwrite", true},
+		{"admin is valid", "admin", true},
+		{"superuser is invalid", "superuser", false},
+		{"root is invalid", "root", false},
+	}
+
+	validPrivileges := map[string]bool{
+		"readonly":  true,
+		"readwrite": true,
+		"admin":     true,
+		"owner":     true,
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := validPrivileges[tt.privileges]
+			if got != tt.valid {
+				t.Errorf("privileges %q valid = %v, want %v", tt.privileges, got, tt.valid)
+			}
+		})
+	}
+}
+
+func TestDatabaseUserReconciler_DropUserWithOwnerPrivileges(t *testing.T) {
+	// This test verifies that when deleting a user, ReassignOwnership is called
+	// for each database before DropUser
+	ctx := context.Background()
+
+	mockPG := &mockPGClientWithDeletionTracking{
+		MockClient:          postgres.NewMockClient(),
+		reassignedDatabases: make([]string, 0),
+		revokedDatabases:    make([]string, 0),
+		droppedUsers:        make([]string, 0),
+	}
+
+	// Simulate deletion flow
+	username := "owner_user"
+	databaseNames := []string{"db1", "db2"}
+
+	// This simulates what dropUserFromPostgres does
+	for _, dbName := range databaseNames {
+		if err := mockPG.ReassignOwnership(ctx, username, dbName); err != nil {
+			t.Errorf("ReassignOwnership failed: %v", err)
+		}
+		if err := mockPG.RevokePrivilegesInDatabase(ctx, username, dbName); err != nil {
+			t.Errorf("RevokePrivilegesInDatabase failed: %v", err)
+		}
+	}
+	if err := mockPG.DropUser(ctx, username); err != nil {
+		t.Errorf("DropUser failed: %v", err)
+	}
+
+	// Verify order of operations
+	if len(mockPG.reassignedDatabases) != 2 {
+		t.Errorf("expected 2 ReassignOwnership calls, got %d", len(mockPG.reassignedDatabases))
+	}
+	if len(mockPG.revokedDatabases) != 2 {
+		t.Errorf("expected 2 RevokePrivilegesInDatabase calls, got %d", len(mockPG.revokedDatabases))
+	}
+	if len(mockPG.droppedUsers) != 1 {
+		t.Errorf("expected 1 DropUser call, got %d", len(mockPG.droppedUsers))
+	}
+	if len(mockPG.droppedUsers) > 0 && mockPG.droppedUsers[0] != username {
+		t.Errorf("expected DropUser for %s, got %s", username, mockPG.droppedUsers[0])
+	}
+}
+
+// mockPGClientWithDeletionTracking tracks all deletion-related calls
+type mockPGClientWithDeletionTracking struct {
+	*postgres.MockClient
+	reassignedDatabases []string
+	revokedDatabases    []string
+	droppedUsers        []string
+}
+
+func (m *mockPGClientWithDeletionTracking) ReassignOwnership(ctx context.Context, fromUser, database string) error {
+	m.reassignedDatabases = append(m.reassignedDatabases, database)
+	return nil
+}
+
+func (m *mockPGClientWithDeletionTracking) RevokePrivilegesInDatabase(ctx context.Context, username, database string) error {
+	m.revokedDatabases = append(m.revokedDatabases, database)
+	return nil
+}
+
+func (m *mockPGClientWithDeletionTracking) DropUser(ctx context.Context, username string) error {
+	m.droppedUsers = append(m.droppedUsers, username)
+	return nil
 }

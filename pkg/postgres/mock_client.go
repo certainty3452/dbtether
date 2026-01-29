@@ -321,6 +321,15 @@ func (m *MockClient) RevokePrivilegesInDatabase(ctx context.Context, username, d
 	return nil
 }
 
+func (m *MockClient) ReassignOwnership(ctx context.Context, fromUser, database string) error {
+	if m.ShouldFail {
+		return m.FailError
+	}
+	// Mock implementation: just succeed
+	// In real implementation, this transfers object ownership back to master
+	return nil
+}
+
 // Helper methods for tests
 
 func (m *MockClient) AddDatabase(name string) {

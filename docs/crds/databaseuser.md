@@ -46,7 +46,7 @@ spec:
 | `database` | object | ❌* | — | Single database reference (mutually exclusive with `databases`) |
 | `databases` | array | ❌* | — | Multiple database references (mutually exclusive with `database`) |
 | `username` | string | ❌ | metadata.name | PostgreSQL username (see below) |
-| `privileges` | enum | ❌ | `readonly` | Default privilege preset: `readonly`, `readwrite`, `admin` |
+| `privileges` | enum | ❌ | `readonly` | Default privilege preset: `readonly`, `readwrite`, `admin`, `owner` |
 | `additionalGrants` | array | ❌ | `[]` | Additional table-level grants |
 | `password.length` | int | ❌ | `16` | Password length (12-64) |
 | `rotation.days` | int | ❌ | — | Password rotation interval in days (1-365) |
@@ -107,8 +107,14 @@ Preset privilege levels applied to the `public` schema:
 | `readonly` | `SELECT` on all tables, `USAGE` on schema |
 | `readwrite` | readonly + `INSERT`, `UPDATE`, `DELETE`, sequence usage |
 | `admin` | readwrite + `CREATE` on schema, `TRUNCATE`, `REFERENCES`, `TRIGGER` |
+| `owner` | admin + ownership of all tables/sequences (enables `ALTER TABLE`, constraints, full schema control) |
 
 Can be set at spec level (default for all databases) or per-database.
+
+**Note on `owner` privilege:**
+- Transfers ownership of all existing tables and sequences to the user
+- Required for operations like `ALTER TABLE ... ADD CONSTRAINT`, schema modifications, or running `pg_restore`
+- On user deletion or when a database is removed from access list, ownership is automatically reassigned back to the master user
 
 ## secretGeneration
 

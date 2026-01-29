@@ -130,7 +130,7 @@ metadata:
   name: my-app-readonly
   namespace: default
 spec:
-  databaseRef:
+  database:
     name: my-app-db
   privileges: readonly
 ```
@@ -166,9 +166,9 @@ See full documentation in [docs/](docs/README.md):
 | [DBCluster](docs/crds/dbcluster.md) | Cluster | External PostgreSQL cluster connection |
 | [Database](docs/crds/database.md) | Namespaced | Database within a DBCluster |
 | [DatabaseUser](docs/crds/databaseuser.md) | Namespaced | PostgreSQL user with privileges |
-| BackupStorage | Cluster | S3/GCS/Azure storage configuration |
-| Backup | Namespaced | One-time database backup |
-| BackupSchedule | Namespaced | Scheduled backups with retention policy |
+| [BackupStorage](docs/crds/backupstorage.md) | Cluster | S3/GCS/Azure storage configuration |
+| [Backup](docs/crds/backup.md) | Namespaced | One-time database backup |
+| [BackupSchedule](docs/crds/backupschedule.md) | Namespaced | Scheduled backups with retention policy |
 
 ### Quick Reference
 
@@ -184,13 +184,14 @@ See full documentation in [docs/](docs/README.md):
 - `spec.deletionPolicy` - `Retain` (default) or `Delete`
 
 **DatabaseUser:**
-- `spec.databaseRef.name` - Name of Database (required)
+- `spec.database.name` - Name of Database (for single database)
+- `spec.databases[]` - List of databases (for multi-database access)
 - `spec.privileges` - `readonly`, `readwrite`, or `admin` (required)
 - `spec.username` - PostgreSQL username (defaults to metadata.name)
 - `spec.password.length` - Password length (default 16, range 12-64)
+- `spec.secretGeneration` - `primary` (default) or `perDatabase`
 - `spec.secret.name` - Custom secret name (default: `{name}-credentials`)
 - `spec.secret.template` - Key format: `raw` (default), `DB`, `DATABASE`, `POSTGRES`, `custom`
-- `spec.secret.keys` - Custom key names (when template is `custom`)
 - `spec.secret.onConflict` - If secret exists: `Fail` (default), `Adopt`, `Merge`
 
 **BackupStorage:**

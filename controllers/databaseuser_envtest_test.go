@@ -284,7 +284,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 
 	Context("When validating privileges", func() {
 		It("Should accept valid privilege presets", func() {
-			for _, priv := range []string{"readonly", "readwrite", "admin"} {
+			for _, priv := range []string{"readonly", "readwrite", "admin", "owner"} {
 				user := &databasesv1alpha1.DatabaseUser{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "user-priv-" + priv,

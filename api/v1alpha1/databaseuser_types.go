@@ -22,7 +22,7 @@ type DatabaseUserSpec struct {
 	Username string `json:"username,omitempty"`
 
 	// Default privileges for all databases (can be overridden per-database)
-	// +kubebuilder:validation:Enum=readonly;readwrite;admin
+	// +kubebuilder:validation:Enum=readonly;readwrite;admin;owner
 	// +kubebuilder:default=readonly
 	Privileges string `json:"privileges,omitempty"`
 
@@ -68,7 +68,7 @@ type DatabaseAccess struct {
 
 	// Override default privileges for this database
 	// +optional
-	// +kubebuilder:validation:Enum=readonly;readwrite;admin
+	// +kubebuilder:validation:Enum=readonly;readwrite;admin;owner
 	Privileges string `json:"privileges,omitempty"`
 }
 

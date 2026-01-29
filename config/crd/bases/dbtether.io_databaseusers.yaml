@@ -94,6 +94,7 @@ spec:
                     - readonly
                     - readwrite
                     - admin
+                    - owner
                     type: string
                 required:
                 - name
@@ -116,6 +117,7 @@ spec:
                       - readonly
                       - readwrite
                       - admin
+                      - owner
                       type: string
                   required:
                   - name
@@ -144,6 +146,7 @@ spec:
                 - readonly
                 - readwrite
                 - admin
+                - owner
                 type: string
               rotation:
                 properties:

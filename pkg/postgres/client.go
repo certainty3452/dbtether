@@ -52,6 +52,7 @@ type ClientInterface interface {
 	ApplyPrivileges(ctx context.Context, username, database, preset string, additionalGrants []TableGrant) error
 	VerifyDatabaseIsolation(ctx context.Context, username, allowedDatabase string) ([]string, error)
 	RevokePrivilegesInDatabase(ctx context.Context, username, database string) error
+	ReassignOwnership(ctx context.Context, fromUser, database string) error
 }
 
 // Ensure Client implements ClientInterface
@@ -560,6 +561,10 @@ func (c *Client) ApplyPrivileges(ctx context.Context, username, database, preset
 		if err := c.applyAdminPrivileges(ctx, conn, quotedUser); err != nil {
 			return err
 		}
+	case "owner":
+		if err := c.applyOwnerPrivileges(ctx, conn, quotedUser); err != nil {
+			return err
+		}
 	}
 
 	// Apply additional grants
@@ -617,6 +622,81 @@ func (c *Client) applyAdminPrivileges(ctx context.Context, conn *pgx.Conn, quote
 			return fmt.Errorf("failed to apply admin privileges: %w", err)
 		}
 	}
+	return nil
+}
+
+func (c *Client) applyOwnerPrivileges(ctx context.Context, conn *pgx.Conn, quotedUser string) error {
+	// First apply admin privileges (includes readwrite)
+	if err := c.applyAdminPrivileges(ctx, conn, quotedUser); err != nil {
+		return err
+	}
+
+	// Transfer ownership of all tables in public schema
+	if err := c.transferTableOwnership(ctx, conn, quotedUser); err != nil {
+		return fmt.Errorf("failed to transfer table ownership: %w", err)
+	}
+
+	// Transfer ownership of all sequences in public schema
+	if err := c.transferSequenceOwnership(ctx, conn, quotedUser); err != nil {
+		return fmt.Errorf("failed to transfer sequence ownership: %w", err)
+	}
+
+	return nil
+}
+
+// transferTableOwnership changes the owner of all tables in public schema to the specified user
+func (c *Client) transferTableOwnership(ctx context.Context, conn *pgx.Conn, quotedUser string) error {
+	rows, err := conn.Query(ctx, `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`)
+	if err != nil {
+		return fmt.Errorf("failed to list tables: %w", err)
+	}
+	defer rows.Close()
+
+	var tables []string
+	for rows.Next() {
+		var tableName string
+		if err := rows.Scan(&tableName); err != nil {
+			return err
+		}
+		tables = append(tables, tableName)
+	}
+	rows.Close()
+
+	for _, table := range tables {
+		query := fmt.Sprintf("ALTER TABLE %s OWNER TO %s", pq.QuoteIdentifier(table), quotedUser)
+		if _, err := conn.Exec(ctx, query); err != nil {
+			return fmt.Errorf("failed to transfer ownership of table %s: %w", table, err)
+		}
+	}
+
+	return nil
+}
+
+// transferSequenceOwnership changes the owner of all sequences in public schema to the specified user
+func (c *Client) transferSequenceOwnership(ctx context.Context, conn *pgx.Conn, quotedUser string) error {
+	rows, err := conn.Query(ctx, `SELECT sequencename FROM pg_sequences WHERE schemaname = 'public'`)
+	if err != nil {
+		return fmt.Errorf("failed to list sequences: %w", err)
+	}
+	defer rows.Close()
+
+	var sequences []string
+	for rows.Next() {
+		var seqName string
+		if err := rows.Scan(&seqName); err != nil {
+			return err
+		}
+		sequences = append(sequences, seqName)
+	}
+	rows.Close()
+
+	for _, seq := range sequences {
+		query := fmt.Sprintf("ALTER SEQUENCE %s OWNER TO %s", pq.QuoteIdentifier(seq), quotedUser)
+		if _, err := conn.Exec(ctx, query); err != nil {
+			return fmt.Errorf("failed to transfer ownership of sequence %s: %w", seq, err)
+		}
+	}
+
 	return nil
 }
 
@@ -683,6 +763,35 @@ func (c *Client) RevokePrivilegesInDatabase(ctx context.Context, username, datab
 	revokeConnect := fmt.Sprintf("REVOKE CONNECT ON DATABASE %s FROM %s",
 		pq.QuoteIdentifier(database), quotedUser)
 	_, _ = c.pool.Exec(ctx, revokeConnect) // best-effort: may fail if not granted
+
+	return nil
+}
+
+// ReassignOwnership transfers all objects owned by fromUser to the current connection user (master).
+// This must be called before dropping a user who has owner privileges.
+func (c *Client) ReassignOwnership(ctx context.Context, fromUser, database string) error {
+	conn, err := c.connectToDatabase(ctx, database)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close(ctx) }()
+
+	quotedFromUser := pq.QuoteIdentifier(fromUser)
+
+	// REASSIGN OWNED transfers all objects owned by fromUser to the current user (master)
+	// This is required before DROP USER if the user owns any objects
+	query := fmt.Sprintf("REASSIGN OWNED BY %s TO CURRENT_USER", quotedFromUser)
+	if _, err := conn.Exec(ctx, query); err != nil {
+		return fmt.Errorf("failed to reassign ownership from %s: %w", fromUser, err)
+	}
+
+	// DROP OWNED removes any remaining privileges (grants) that fromUser has
+	dropOwnedQuery := fmt.Sprintf("DROP OWNED BY %s", quotedFromUser)
+	if _, err := conn.Exec(ctx, dropOwnedQuery); err != nil {
+		// Best-effort: may fail if user has no remaining owned objects
+		// This is expected after REASSIGN OWNED
+		return nil
+	}
 
 	return nil
 }

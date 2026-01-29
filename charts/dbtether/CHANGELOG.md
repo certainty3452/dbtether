@@ -2,6 +2,11 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.5.1] - 2026-01-29
+
+### Added
+- `owner` privilege level for DatabaseUser
+
 ## [0.5.0] - 2026-01-28
 
 ### Added

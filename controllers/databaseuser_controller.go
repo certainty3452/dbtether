@@ -323,6 +323,10 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 		return r.setStatus(ctx, user, &baseStatus)
 	}
 
+	// Reassign ownership for databases that are being removed from user's access
+	// This prevents orphan objects when a database is removed from the spec
+	r.reassignOwnershipForRemovedDatabases(ctx, pgClient, user, username, dbNames)
+
 	// Sync database access (grant to allowed, revoke from others)
 	if err := pgClient.SyncDatabaseAccess(ctx, username, dbNames); err != nil {
 		baseStatus.Phase = "Failed"
@@ -925,8 +929,15 @@ func (r *DatabaseUserReconciler) dropUserFromPostgres(ctx context.Context, user 
 		return
 	}
 
-	// Revoke privileges from all databases
+	// Reassign ownership and revoke privileges from all databases
 	for _, dbName := range databaseNames {
+		// Reassign ownership first (required if user had "owner" privileges)
+		// This transfers all objects owned by the user back to master
+		if err := pgClient.ReassignOwnership(ctx, username, dbName); err != nil {
+			logger.Error(err, "failed to reassign ownership", "database", dbName)
+			// Continue anyway - user may not have owned any objects
+		}
+
 		if err := pgClient.RevokePrivilegesInDatabase(ctx, username, dbName); err != nil {
 			logger.Error(err, "failed to revoke privileges", "database", dbName)
 		}
@@ -995,6 +1006,37 @@ func (r *DatabaseUserReconciler) deleteOldSecret(ctx context.Context, namespace,
 		logger.Error(err, "failed to delete old secret", "secret", secretName)
 	} else {
 		logger.Info("deleted old secret after name change", "secret", secretName)
+	}
+}
+
+// reassignOwnershipForRemovedDatabases transfers ownership of objects back to master
+// for databases that were previously in the user's access list but are now removed.
+// This prevents orphan objects when a database is removed from the spec.
+func (r *DatabaseUserReconciler) reassignOwnershipForRemovedDatabases(ctx context.Context,
+	pgClient postgres.ClientInterface, user *databasesv1alpha1.DatabaseUser, username string, currentDBNames []string) {
+
+	logger := log.FromContext(ctx)
+
+	// Build set of current database names for O(1) lookup
+	currentDBSet := make(map[string]bool, len(currentDBNames))
+	for _, db := range currentDBNames {
+		currentDBSet[db] = true
+	}
+
+	// Check previous databases from status
+	for _, dbStatus := range user.Status.Databases {
+		if dbStatus.DatabaseName == "" {
+			continue
+		}
+		// If database was in status but not in current spec, reassign ownership
+		if !currentDBSet[dbStatus.DatabaseName] {
+			logger.Info("reassigning ownership for removed database", "database", dbStatus.DatabaseName, "username", username)
+			if err := pgClient.ReassignOwnership(ctx, username, dbStatus.DatabaseName); err != nil {
+				logger.Error(err, "failed to reassign ownership for removed database",
+					"database", dbStatus.DatabaseName)
+				// Continue anyway - best effort cleanup
+			}
+		}
 	}
 }
 

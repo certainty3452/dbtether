@@ -199,3 +199,113 @@ type testError struct {
 func (e *testError) Error() string {
 	return e.msg
 }
+
+func TestMockClient_ReassignOwnership(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name        string
+		shouldFail  bool
+		expectError bool
+	}{
+		{
+			name:        "successful reassign",
+			shouldFail:  false,
+			expectError: false,
+		},
+		{
+			name:        "failed reassign",
+			shouldFail:  true,
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := NewMockClient()
+			if tt.shouldFail {
+				mock.ShouldFail = true
+				mock.FailError = &testError{msg: "simulated failure"}
+			}
+
+			err := mock.ReassignOwnership(ctx, "testuser", "testdb")
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestMockClient_ApplyPrivileges_Owner(t *testing.T) {
+	ctx := context.Background()
+	mock := NewMockClient()
+
+	// Test that owner privilege is accepted
+	err := mock.ApplyPrivileges(ctx, "testuser", "testdb", "owner", nil)
+	if err != nil {
+		t.Errorf("unexpected error applying owner privileges: %v", err)
+	}
+}
+
+func TestMockClient_SyncDatabaseAccess(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name             string
+		initialAccess    map[string]bool
+		allowedDatabases []string
+		expectedAccess   map[string]bool
+	}{
+		{
+			name:             "grant access to new databases",
+			initialAccess:    map[string]bool{},
+			allowedDatabases: []string{"db1", "db2"},
+			expectedAccess:   map[string]bool{"db1": true, "db2": true},
+		},
+		{
+			name:             "revoke access from removed databases",
+			initialAccess:    map[string]bool{"db1": true, "db2": true, "db3": true},
+			allowedDatabases: []string{"db1"},
+			expectedAccess:   map[string]bool{"db1": true},
+		},
+		{
+			name:             "mixed grant and revoke",
+			initialAccess:    map[string]bool{"db1": true, "db2": true},
+			allowedDatabases: []string{"db2", "db3"},
+			expectedAccess:   map[string]bool{"db2": true, "db3": true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := NewMockClient()
+			mock.userAccess["testuser"] = tt.initialAccess
+
+			err := mock.SyncDatabaseAccess(ctx, "testuser", tt.allowedDatabases)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+
+			// Check final access state
+			for db, expected := range tt.expectedAccess {
+				if mock.userAccess["testuser"][db] != expected {
+					t.Errorf("database %s: expected access=%v, got %v", db, expected, mock.userAccess["testuser"][db])
+				}
+			}
+
+			// Check that removed databases are not accessible
+			for db := range tt.initialAccess {
+				if !tt.expectedAccess[db] && mock.userAccess["testuser"][db] {
+					t.Errorf("database %s should have been revoked but still has access", db)
+				}
+			}
+		})
+	}
+}

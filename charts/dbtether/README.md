@@ -69,14 +69,14 @@ metadata:
   name: myapp-user
   namespace: default
 spec:
-  clusterRef:
-    name: my-aurora
-  databaseRef:
+  database:
     name: myapp-db
   username: myapp
-  passwordRotation:
-    enabled: true
-    interval: 720h  # 30 days
+  privileges: readwrite
+  password:
+    rotation:
+      enabled: true
+      interval: 720h  # 30 days
 ```
 
 ### 4. Setup Backups
@@ -136,7 +136,7 @@ spec:
 |-----------|-------------|---------|
 | `replicaCount` | Number of operator replicas | `1` |
 | `image.repository` | Operator image | `ghcr.io/certainty3452/dbtether` |
-| `image.tag` | Image tag | `0.3.1` |
+| `image.tag` | Image tag | `0.5.1` |
 | `resources.requests.cpu` | CPU request | `100m` |
 | `resources.requests.memory` | Memory request | `128Mi` |
 | `resources.limits.cpu` | CPU limit | `500m` |
