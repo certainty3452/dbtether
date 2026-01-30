@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dbtether.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dbtether.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    # Backup job configuration
+    backup:
+      maxConcurrentPerCluster: {{ .Values.backup.maxConcurrentPerCluster | default 3 }}
+      {{- if .Values.backup.podAnnotations }}
+      podAnnotations:
+        {{- toYaml .Values.backup.podAnnotations | nindent 8 }}
+      {{- end }}
+      {{- if .Values.backup.podLabels }}
+      podLabels:
+        {{- toYaml .Values.backup.podLabels | nindent 8 }}
+      {{- end }}
+      {{- if .Values.backup.jobLabels }}
+      jobLabels:
+        {{- toYaml .Values.backup.jobLabels | nindent 8 }}
+      {{- end }}

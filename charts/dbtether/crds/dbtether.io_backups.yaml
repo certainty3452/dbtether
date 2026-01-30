@@ -71,6 +71,34 @@ spec:
                   Filename template for the backup file
                   Available: .DatabaseName, .Timestamp, .Random (6 chars lowercase alphanumeric)
                 type: string
+              jobConfig:
+                description: Job configuration for backup execution
+                properties:
+                  activeDeadlineSeconds:
+                    description: |-
+                      ActiveDeadlineSeconds specifies the duration in seconds relative to the startTime
+                      that the backup job may be active before the system tries to terminate it.
+                      This is a hard timeout for the entire backup operation.
+                    format: int64
+                    minimum: 60
+                    type: integer
+                  backoffLimit:
+                    default: 3
+                    description: |-
+                      BackoffLimit specifies the number of retries before marking this backup failed.
+                      Defaults to 3.
+                    format: int32
+                    maximum: 10
+                    minimum: 0
+                    type: integer
+                  ttlSecondsAfterFailed:
+                    description: |-
+                      TTLSecondsAfterFailed specifies the TTL for the Job after it fails.
+                      This allows keeping failed jobs longer for debugging.
+                      Defaults to the same value as TTLAfterCompletion (or 1 hour if not set).
+                    format: int32
+                    type: integer
+                type: object
               storageRef:
                 description: Reference to the BackupStorage to use
                 properties:
@@ -95,8 +123,25 @@ spec:
               duration:
                 description: Duration of the backup operation
                 type: string
+              failedAttempts:
+                description: FailedAttempts is the number of failed pod attempts before
+                  the job failed
+                format: int32
+                type: integer
+              failureMessage:
+                description: FailureMessage provides human-readable details about
+                  the failure
+                type: string
+              failureReason:
+                description: FailureReason provides a machine-readable failure reason
+                  (e.g., BackoffLimitExceeded, DeadlineExceeded)
+                type: string
               jobName:
                 description: Name of the Job created for this backup
+                type: string
+              lastPodName:
+                description: LastPodName is the name of the last pod that ran for
+                  this backup (useful for log retrieval)
                 type: string
               message:
                 type: string

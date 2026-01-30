@@ -71,4 +71,26 @@ spec:
   schedule: "0 3 * * 0"  # Every Sunday at 3:00 AM
   retention:
     keepLast: 4  # Keep last 4 weekly backups
+---
+# Example: BackupSchedule with custom job configuration
+# Useful for large databases that need longer timeouts
+apiVersion: dbtether.io/v1alpha1
+kind: BackupSchedule
+metadata:
+  name: large-db-nightly
+  namespace: data-team
+spec:
+  databaseRef:
+    name: large-analytics-db
+  storageRef:
+    name: company-s3
+  schedule: "0 1 * * *"  # Daily at 1:00 AM
+  retention:
+    keepLast: 7
+    keepDaily: 14
+  # Job configuration inherited by all created Backups
+  jobConfig:
+    backoffLimit: 5              # Retry up to 5 times on failure
+    activeDeadlineSeconds: 14400 # 4 hour timeout
+    ttlSecondsAfterFailed: 86400 # Keep failed Jobs for 24h
 

@@ -33,6 +33,27 @@ spec:
 | `storageRef.name` | string | ✅ | — | Name of the BackupStorage resource |
 | `filenameTemplate` | string | ❌ | `{{ .Timestamp }}.sql.gz` | Backup filename template |
 | `ttlAfterCompletion` | duration | ❌ | — | Auto-delete Backup CRD after completion |
+| `jobConfig` | object | ❌ | — | Kubernetes Job configuration |
+
+### jobConfig
+
+Configure Kubernetes Job parameters for backup execution.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `backoffLimit` | int | `3` | Number of retries before marking backup failed (0-10) |
+| `activeDeadlineSeconds` | int | — | Hard timeout for the entire backup (seconds, min 60) |
+| `ttlSecondsAfterFailed` | int | — | Keep failed Job for debugging (seconds) |
+
+**Example:**
+
+```yaml
+spec:
+  jobConfig:
+    backoffLimit: 5              # Retry up to 5 times
+    activeDeadlineSeconds: 7200  # 2 hour timeout
+    ttlSecondsAfterFailed: 86400 # Keep failed Job 24h for debugging
+```
 
 ## filenameTemplate
 
@@ -95,6 +116,10 @@ When set, the Backup CRD will be automatically deleted after the specified durat
 | `startedAt` | time | When backup started |
 | `completedAt` | time | When backup completed |
 | `observedGeneration` | int64 | Which spec version has been processed |
+| `failureReason` | string | Machine-readable failure reason (e.g., `BackoffLimitExceeded`) |
+| `failureMessage` | string | Detailed failure message |
+| `failedAttempts` | int | Number of failed Job attempts |
+| `lastPodName` | string | Name of the last Pod (for log retrieval) |
 
 ### Status Phases
 
@@ -214,6 +239,25 @@ spec:
     name: central-backups
 ```
 
+### Large Database with Custom Timeouts
+
+```yaml
+apiVersion: dbtether.io/v1alpha1
+kind: Backup
+metadata:
+  name: large-db-backup
+  namespace: data-team
+spec:
+  databaseRef:
+    name: large-analytics-db
+  storageRef:
+    name: company-s3
+  jobConfig:
+    backoffLimit: 5              # Retry up to 5 times on failure
+    activeDeadlineSeconds: 7200  # 2 hour timeout
+    ttlSecondsAfterFailed: 86400 # Keep failed Job 24h for debugging
+```
+
 ## Backup File Details
 
 ### Format
@@ -290,5 +334,26 @@ JOB=$(kubectl get bkp my-backup -n my-team -o jsonpath='{.status.jobName}')
 
 # Get logs
 kubectl logs -n dbtether job/$JOB
+
+# Or use lastPodName from status
+POD=$(kubectl get bkp my-backup -n my-team -o jsonpath='{.status.lastPodName}')
+kubectl logs -n dbtether $POD
 ```
+
+### Viewing Kubernetes Events
+
+The operator emits events for backup lifecycle:
+
+```bash
+# Events for a specific backup
+kubectl get events -n my-team --field-selector involvedObject.name=my-backup
+
+# Events: BackupStarted, BackupCompleted, BackupFailed
+```
+
+| Event | Reason | Description |
+|-------|--------|-------------|
+| Normal | `BackupStarted` | Backup job created |
+| Normal | `BackupCompleted` | Backup finished successfully |
+| Warning | `BackupFailed` | Backup failed (includes reason and message) |
 

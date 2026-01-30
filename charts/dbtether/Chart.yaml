@@ -2,8 +2,8 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.5.1
-appVersion: "0.5.1"
+version: 0.5.2
+appVersion: "0.5.2"
 home: https://github.com/certainty3452/dbtether
 # icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
@@ -69,6 +69,12 @@ annotations:
     - name: Source
       url: https://github.com/certainty3452/dbtether
   artifacthub.io/changes: |
+    - kind: fixed
+      description: "Backup stuck in Running phase when Job fails"
     - kind: added
-      description: "'owner' privilege level for DatabaseUser"
+      description: "Configurable pod annotations/labels for backup jobs"
+    - kind: added
+      description: "Configurable job parameters via jobConfig (backoffLimit, activeDeadlineSeconds)"
+    - kind: added
+      description: "Kubernetes Events for backup lifecycle"
 

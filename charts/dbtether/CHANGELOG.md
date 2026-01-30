@@ -2,6 +2,17 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.5.2] - 2026-01-30
+
+### Fixed
+- Backup stuck in Running phase when underlying Job fails
+
+### Added
+- Configurable pod annotations/labels for backup jobs via Helm values (`backup.podAnnotations`, `backup.podLabels`, `backup.jobLabels`)
+- Kubernetes Events for backup lifecycle (`BackupStarted`, `BackupCompleted`, `BackupFailed`)
+- Configurable job parameters via `jobConfig` in Backup and BackupSchedule CRDs (`backoffLimit`, `activeDeadlineSeconds`, `ttlSecondsAfterFailed`)
+- Detailed failure reporting in Backup status (`failureReason`, `failureMessage`, `failedAttempts`)
+
 ## [0.5.1] - 2026-01-29
 
 ### Added

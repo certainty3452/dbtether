@@ -50,6 +50,10 @@ type BackupScheduleSpec struct {
 	// Suspend stops scheduling new backups (does not affect running backups)
 	// +optional
 	Suspend bool `json:"suspend,omitempty"`
+
+	// Job configuration inherited by all Backups created by this schedule
+	// +optional
+	JobConfig *BackupJobConfig `json:"jobConfig,omitempty"`
 }
 
 type BackupScheduleStatus struct {

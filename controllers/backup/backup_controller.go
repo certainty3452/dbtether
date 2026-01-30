@@ -17,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -44,10 +45,31 @@ const (
 type BackupReconciler struct {
 	client.Client
 	Scheme               *runtime.Scheme
+	Recorder             record.EventRecorder
 	Image                string
 	Namespace            string
 	MaxConcurrentBackups int // limit per DBCluster, default 3
+
+	// PodAnnotations are applied to all backup pods.
+	// Set via Helm values (backup.podAnnotations) for Karpenter/autoscaler protection.
+	PodAnnotations map[string]string
+
+	// PodLabels are applied to all backup pods (in addition to required labels).
+	// Set via Helm values (backup.podLabels).
+	PodLabels map[string]string
+
+	// JobLabels are applied to all backup Job objects (in addition to required labels).
+	// Set via Helm values (backup.jobLabels).
+	JobLabels map[string]string
 }
+
+// Event reason constants for backup operations
+const (
+	EventReasonBackupStarted   = "BackupStarted"
+	EventReasonBackupCompleted = "BackupCompleted"
+	EventReasonBackupFailed    = "BackupFailed"
+	EventReasonBackupThrottled = "BackupThrottled"
+)
 
 func (r *BackupReconciler) maxConcurrent() int {
 	if r.MaxConcurrentBackups <= 0 {
@@ -157,6 +179,14 @@ func (r *BackupReconciler) createBackupJobIfAllowed(ctx context.Context, backup 
 	}
 
 	logger.Info("backup job created", "job", job.Name, "runId", runID)
+
+	// Emit start event
+	if r.Recorder != nil {
+		eventMessage := fmt.Sprintf("Started backup job %s for database %s",
+			job.Name, backup.Spec.DatabaseRef.Name)
+		r.Recorder.Event(backup, corev1.EventTypeNormal, EventReasonBackupStarted, eventMessage)
+	}
+
 	return r.updateStatusWithJobAndRunID(ctx, backup, "Running", "backup job started", specHash, job.Name, runID)
 }
 
@@ -345,6 +375,7 @@ func (r *BackupReconciler) getResources(ctx context.Context, backup *databasesv1
 	return &db, &cluster, &storage, nil
 }
 
+//nolint:funlen // Job creation requires many fields - splitting would reduce readability
 func (r *BackupReconciler) createBackupJob(ctx context.Context, backup *databasesv1alpha1.Backup,
 	db *databasesv1alpha1.Database, cluster *databasesv1alpha1.DBCluster, storage *databasesv1alpha1.BackupStorage, runID string) (*batchv1.Job, error) {
 
@@ -376,7 +407,11 @@ func (r *BackupReconciler) createBackupJob(ctx context.Context, backup *database
 	// Add storage configuration
 	env = append(env, r.getStorageEnv(storage)...)
 
+	// Configure backoff limit (default: 3)
 	backoffLimit := int32(3)
+	if backup.Spec.JobConfig != nil && backup.Spec.JobConfig.BackoffLimit != nil {
+		backoffLimit = *backup.Spec.JobConfig.BackoffLimit
+	}
 
 	// Use TTL from spec, or default to 1 hour
 	var ttlSeconds int32 = 3600
@@ -384,23 +419,60 @@ func (r *BackupReconciler) createBackupJob(ctx context.Context, backup *database
 		ttlSeconds = int32(backup.Spec.TTLAfterCompletion.Seconds())
 	}
 
+	// Configure active deadline (optional hard timeout)
+	var activeDeadlineSeconds *int64
+	if backup.Spec.JobConfig != nil && backup.Spec.JobConfig.ActiveDeadlineSeconds != nil {
+		activeDeadlineSeconds = backup.Spec.JobConfig.ActiveDeadlineSeconds
+	}
+
+	// Required labels - needed for controller operation (job lookup, concurrency limits)
+	requiredLabels := map[string]string{
+		LabelBackupName:      backup.Name,
+		LabelBackupNamespace: backup.Namespace,
+		LabelCluster:         cluster.Name,
+	}
+
+	// Build job labels: required + Helm values (backup.jobLabels)
+	jobLabels := make(map[string]string)
+	for k, v := range requiredLabels {
+		jobLabels[k] = v
+	}
+	for k, v := range r.JobLabels {
+		jobLabels[k] = v
+	}
+
+	// Build pod labels: required + Helm values (backup.podLabels)
+	podLabels := make(map[string]string)
+	for k, v := range requiredLabels {
+		podLabels[k] = v
+	}
+	for k, v := range r.PodLabels {
+		podLabels[k] = v
+	}
+
+	// Pod annotations from Helm values (backup.podAnnotations)
+	podAnnotations := make(map[string]string)
+	for k, v := range r.PodAnnotations {
+		podAnnotations[k] = v
+	}
+
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName,
 			Namespace: r.Namespace,
-			Labels: map[string]string{
-				LabelBackupName:        backup.Name,
-				LabelBackupNamespace:   backup.Namespace,
-				"dbtether.io/database": backup.Spec.DatabaseRef.Name,
-				LabelCluster:           cluster.Name,
-			},
+			Labels:    jobLabels,
 			// No OwnerReference - cross-namespace not allowed
 			// Cleanup via finalizer on Backup + TTL as fallback
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            &backoffLimit,
 			TTLSecondsAfterFinished: &ttlSeconds,
+			ActiveDeadlineSeconds:   activeDeadlineSeconds,
 			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      podLabels,
+					Annotations: podAnnotations,
+				},
 				Spec: corev1.PodSpec{
 					RestartPolicy:      corev1.RestartPolicyOnFailure,
 					ServiceAccountName: "dbtether", // Uses operator's SA for IRSA
@@ -558,12 +630,141 @@ func (r *BackupReconciler) evaluateJobStatus(ctx context.Context, backup *databa
 		return r.updateStatusCompleted(ctx, backup, job, specHash)
 	}
 
-	if job.Status.Failed > 0 && job.Spec.BackoffLimit != nil && job.Status.Failed >= *job.Spec.BackoffLimit {
-		return r.updateStatus(ctx, backup, "Failed", "backup job failed", specHash)
+	// Check Job Conditions for definitive failure status
+	// This is the correct way to detect job failure - Kubernetes sets this condition
+	// when backoff limit is exceeded, deadline is exceeded, or pod failure policy triggers
+	if _, failed := r.isJobFailed(job); failed {
+		failureInfo := r.getJobFailureInfo(job)
+		return r.updateStatusFailedWithInfo(ctx, backup, job, specHash, failureInfo)
 	}
 
 	// Still running
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// JobFailureInfo contains structured information about a job failure
+type JobFailureInfo struct {
+	Reason         string // Machine-readable reason (e.g., BackoffLimitExceeded)
+	Message        string // Human-readable message
+	FailedAttempts int32  // Number of failed pod attempts
+}
+
+// isJobFailed checks if a Job has definitively failed by examining its conditions.
+// Returns structured failure info and whether the job has failed.
+func (r *BackupReconciler) isJobFailed(job *batchv1.Job) (string, bool) {
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
+			reason := "backup job failed"
+			if c.Reason != "" {
+				reason = fmt.Sprintf("backup job failed: %s", c.Reason)
+			}
+			if c.Message != "" {
+				reason = fmt.Sprintf("%s - %s", reason, c.Message)
+			}
+			return reason, true
+		}
+	}
+	return "", false
+}
+
+// getJobFailureInfo extracts detailed failure information from a failed job
+func (r *BackupReconciler) getJobFailureInfo(job *batchv1.Job) *JobFailureInfo {
+	info := &JobFailureInfo{
+		FailedAttempts: job.Status.Failed,
+	}
+
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
+			info.Reason = c.Reason
+			info.Message = c.Message
+			break
+		}
+	}
+
+	if info.Reason == "" {
+		info.Reason = "Unknown"
+	}
+	if info.Message == "" {
+		info.Message = "backup job failed without detailed message"
+	}
+
+	return info
+}
+
+// updateStatusFailedWithInfo updates the Backup status to Failed with structured failure info
+// and emits a Kubernetes Event for visibility.
+func (r *BackupReconciler) updateStatusFailedWithInfo(ctx context.Context, backup *databasesv1alpha1.Backup,
+	job *batchv1.Job, specHash string, failureInfo *JobFailureInfo) (ctrl.Result, error) {
+
+	logger := log.FromContext(ctx)
+
+	patch := client.MergeFrom(backup.DeepCopy())
+
+	// Core status fields
+	backup.Status.Phase = "Failed"
+	backup.Status.Message = fmt.Sprintf("backup job failed: %s", failureInfo.Reason)
+	backup.Status.SpecHash = specHash
+	backup.Status.ObservedGeneration = backup.Generation
+
+	// Detailed failure info
+	backup.Status.FailureReason = failureInfo.Reason
+	backup.Status.FailureMessage = failureInfo.Message
+	backup.Status.FailedAttempts = failureInfo.FailedAttempts
+
+	// Try to get the last pod name for log retrieval hints
+	if job != nil {
+		backup.Status.LastPodName = r.getLastPodName(ctx, job)
+	}
+
+	now := metav1.Now()
+	backup.Status.CompletedAt = &now
+
+	if err := r.Status().Patch(ctx, backup, patch); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Emit Kubernetes Event for visibility in kubectl describe and monitoring
+	if r.Recorder != nil {
+		eventMessage := fmt.Sprintf("Backup failed after %d attempt(s): %s - %s",
+			failureInfo.FailedAttempts, failureInfo.Reason, failureInfo.Message)
+		r.Recorder.Event(backup, corev1.EventTypeWarning, EventReasonBackupFailed, eventMessage)
+	}
+
+	logger.Info("backup failed",
+		"reason", failureInfo.Reason,
+		"message", failureInfo.Message,
+		"failedAttempts", failureInfo.FailedAttempts,
+		"lastPodName", backup.Status.LastPodName)
+
+	return ctrl.Result{}, nil
+}
+
+// getLastPodName tries to find the name of the last pod that ran for this job
+func (r *BackupReconciler) getLastPodName(ctx context.Context, job *batchv1.Job) string {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(job.Namespace), client.MatchingLabels{
+		"job-name": job.Name,
+	}); err != nil {
+		return ""
+	}
+
+	if len(pods.Items) == 0 {
+		return ""
+	}
+
+	// Return the most recently created pod
+	var lastPod *corev1.Pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if lastPod == nil || pod.CreationTimestamp.After(lastPod.CreationTimestamp.Time) {
+			lastPod = pod
+		}
+	}
+
+	if lastPod != nil {
+		return lastPod.Name
+	}
+	return ""
 }
 
 func (r *BackupReconciler) updateStatus(ctx context.Context, backup *databasesv1alpha1.Backup,
@@ -616,6 +817,8 @@ func (r *BackupReconciler) updateStatusWithJobAndRunID(ctx context.Context, back
 func (r *BackupReconciler) updateStatusCompleted(ctx context.Context, backup *databasesv1alpha1.Backup,
 	job *batchv1.Job, specHash string) (ctrl.Result, error) {
 
+	logger := log.FromContext(ctx)
+
 	patch := client.MergeFrom(backup.DeepCopy())
 
 	// Core status fields
@@ -643,6 +846,18 @@ func (r *BackupReconciler) updateStatusCompleted(ctx context.Context, backup *da
 	if err := r.Status().Patch(ctx, backup, patch); err != nil {
 		return ctrl.Result{}, err
 	}
+
+	// Emit success event
+	if r.Recorder != nil {
+		eventMessage := fmt.Sprintf("Backup completed successfully: %s (%s)",
+			backup.Status.Path, backup.Status.Size)
+		r.Recorder.Event(backup, corev1.EventTypeNormal, EventReasonBackupCompleted, eventMessage)
+	}
+
+	logger.Info("backup completed",
+		"path", backup.Status.Path,
+		"size", backup.Status.Size,
+		"duration", backup.Status.Duration)
 
 	return ctrl.Result{}, nil
 }

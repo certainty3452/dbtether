@@ -8,7 +8,7 @@ image:
   repository: ghcr.io/certainty3452/dbtether
   pullPolicy: IfNotPresent
   # Automatically updated by release pipeline from git tag
-  tag: "0.5.1"
+  tag: "0.5.2"
 
 imagePullSecrets: []
 nameOverride: ""
@@ -19,7 +19,13 @@ serviceAccount:
   annotations: {}
   name: ""
 
+# Additional annotations for the operator pod
 podAnnotations: {}
+
+# Additional labels for the operator pod (in addition to standard app.kubernetes.io/* labels)
+podLabels: {}
+# Example:
+#   custom-label: my-value
 
 podSecurityContext:
   runAsNonRoot: true
@@ -101,6 +107,28 @@ logging:
 backup:
   # Maximum concurrent backup jobs per DBCluster (prevents connection pool exhaustion)
   maxConcurrentPerCluster: 3
+
+  # Annotations for backup job pods
+  # Use this to protect backup pods from autoscaler disruption (Karpenter, cluster-autoscaler)
+  # Similar to Dagster's runK8sConfig.podTemplateSpecMetadata.annotations
+  # or Airbyte's global.jobs.kube.annotations
+  podAnnotations: {}
+  # Example:
+  #   karpenter.sh/do-not-disrupt: "true"
+  #   cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+
+  # Labels for backup job pods (in addition to required dbtether.io/* labels)
+  # Use for log filtering in Grafana/Loki, monitoring, etc.
+  podLabels: {}
+  # Example:
+  #   app.kubernetes.io/name: dbtether-backup
+  #   app.kubernetes.io/component: backup-job
+
+  # Labels for backup Job objects (in addition to required dbtether.io/* labels)
+  jobLabels: {}
+  # Example:
+  #   app.kubernetes.io/name: dbtether-backup
+  #   app.kubernetes.io/managed-by: dbtether
 
 # Extra environment variables for the operator pod
 # Use this for credentialsFromEnv in DBCluster resources

@@ -22,6 +22,34 @@ type BackupSpec struct {
 	// Auto-delete after completion. Use with caution in GitOps environments!
 	// +optional
 	TTLAfterCompletion *metav1.Duration `json:"ttlAfterCompletion,omitempty"`
+
+	// Job configuration for backup execution
+	// +optional
+	JobConfig *BackupJobConfig `json:"jobConfig,omitempty"`
+}
+
+// BackupJobConfig configures the Kubernetes Job that performs the backup
+type BackupJobConfig struct {
+	// BackoffLimit specifies the number of retries before marking this backup failed.
+	// Defaults to 3.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=10
+	// +kubebuilder:default=3
+	// +optional
+	BackoffLimit *int32 `json:"backoffLimit,omitempty"`
+
+	// ActiveDeadlineSeconds specifies the duration in seconds relative to the startTime
+	// that the backup job may be active before the system tries to terminate it.
+	// This is a hard timeout for the entire backup operation.
+	// +kubebuilder:validation:Minimum=60
+	// +optional
+	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`
+
+	// TTLSecondsAfterFailed specifies the TTL for the Job after it fails.
+	// This allows keeping failed jobs longer for debugging.
+	// Defaults to the same value as TTLAfterCompletion (or 1 hour if not set).
+	// +optional
+	TTLSecondsAfterFailed *int32 `json:"ttlSecondsAfterFailed,omitempty"`
 }
 
 // StorageReference references a BackupStorage resource
@@ -58,6 +86,22 @@ type BackupStatus struct {
 	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
 
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// FailureReason provides a machine-readable failure reason (e.g., BackoffLimitExceeded, DeadlineExceeded)
+	// +optional
+	FailureReason string `json:"failureReason,omitempty"`
+
+	// FailureMessage provides human-readable details about the failure
+	// +optional
+	FailureMessage string `json:"failureMessage,omitempty"`
+
+	// FailedAttempts is the number of failed pod attempts before the job failed
+	// +optional
+	FailedAttempts int32 `json:"failedAttempts,omitempty"`
+
+	// LastPodName is the name of the last pod that ran for this backup (useful for log retrieval)
+	// +optional
+	LastPodName string `json:"lastPodName,omitempty"`
 }
 
 // +kubebuilder:object:root=true

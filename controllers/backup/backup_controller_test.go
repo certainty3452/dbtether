@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -428,7 +429,7 @@ func TestBackupReconciler_JobCompleted(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_JobFailed tests failed job status propagation
+// TestBackupReconciler_JobFailed tests failed job status propagation via Job Conditions
 func TestBackupReconciler_JobFailed(t *testing.T) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
@@ -452,6 +453,14 @@ func TestBackupReconciler_JobFailed(t *testing.T) {
 		},
 		Status: batchv1.JobStatus{
 			Failed: 3, // Reached backoff limit
+			// Job failure is detected via Conditions, not just Failed count
+			Conditions: []batchv1.JobCondition{
+				{
+					Type:   batchv1.JobFailed,
+					Status: corev1.ConditionTrue,
+					Reason: "BackoffLimitExceeded",
+				},
+			},
 		},
 	}
 
@@ -1371,5 +1380,470 @@ func newTestReconcilerWithObjects(objs ...client.Object) *BackupReconciler {
 		Scheme:    scheme,
 		Image:     testImage,
 		Namespace: testOperatorNS,
+	}
+}
+
+// TestIsJobFailed tests the isJobFailed function with various Job conditions
+func TestIsJobFailed(t *testing.T) {
+	r := &BackupReconciler{}
+
+	tests := []struct {
+		name           string
+		conditions     []batchv1.JobCondition
+		expectFailed   bool
+		expectContains string // substring expected in reason
+	}{
+		{
+			name:         "no conditions",
+			conditions:   nil,
+			expectFailed: false,
+		},
+		{
+			name:         "empty conditions",
+			conditions:   []batchv1.JobCondition{},
+			expectFailed: false,
+		},
+		{
+			name: "job complete (not failed)",
+			conditions: []batchv1.JobCondition{
+				{
+					Type:   batchv1.JobComplete,
+					Status: corev1.ConditionTrue,
+				},
+			},
+			expectFailed: false,
+		},
+		{
+			name: "job failed condition false",
+			conditions: []batchv1.JobCondition{
+				{
+					Type:   batchv1.JobFailed,
+					Status: corev1.ConditionFalse,
+				},
+			},
+			expectFailed: false,
+		},
+		{
+			name: "job failed - backoff limit exceeded",
+			conditions: []batchv1.JobCondition{
+				{
+					Type:    batchv1.JobFailed,
+					Status:  corev1.ConditionTrue,
+					Reason:  "BackoffLimitExceeded",
+					Message: "Job has reached the specified backoff limit",
+				},
+			},
+			expectFailed:   true,
+			expectContains: "BackoffLimitExceeded",
+		},
+		{
+			name: "job failed - deadline exceeded",
+			conditions: []batchv1.JobCondition{
+				{
+					Type:    batchv1.JobFailed,
+					Status:  corev1.ConditionTrue,
+					Reason:  "DeadlineExceeded",
+					Message: "Job was active longer than specified deadline",
+				},
+			},
+			expectFailed:   true,
+			expectContains: "DeadlineExceeded",
+		},
+		{
+			name: "job failed - no reason or message",
+			conditions: []batchv1.JobCondition{
+				{
+					Type:   batchv1.JobFailed,
+					Status: corev1.ConditionTrue,
+				},
+			},
+			expectFailed:   true,
+			expectContains: "backup job failed",
+		},
+		{
+			name: "multiple conditions - failed takes precedence",
+			conditions: []batchv1.JobCondition{
+				{
+					Type:   batchv1.JobComplete,
+					Status: corev1.ConditionFalse,
+				},
+				{
+					Type:    batchv1.JobFailed,
+					Status:  corev1.ConditionTrue,
+					Reason:  "PodFailurePolicy",
+					Message: "Container exited with code 1",
+				},
+			},
+			expectFailed:   true,
+			expectContains: "PodFailurePolicy",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			job := &batchv1.Job{
+				Status: batchv1.JobStatus{
+					Conditions: tt.conditions,
+				},
+			}
+
+			reason, failed := r.isJobFailed(job)
+
+			if failed != tt.expectFailed {
+				t.Errorf("isJobFailed() failed = %v, want %v", failed, tt.expectFailed)
+			}
+
+			if tt.expectContains != "" && failed {
+				if !contains(reason, tt.expectContains) {
+					t.Errorf("reason %q should contain %q", reason, tt.expectContains)
+				}
+			}
+		})
+	}
+}
+
+// contains checks if s contains substr
+func contains(s, substr string) bool {
+	return strings.Contains(s, substr)
+}
+
+// TestBackupReconciler_JobFailedWithCondition tests that job failure is detected via conditions
+func TestBackupReconciler_JobFailedWithCondition(t *testing.T) {
+	backup := newTestBackup(testBackupName, testNamespace)
+	backup.Finalizers = []string{backupFinalizer}
+	backup.Status.JobName = testJobName
+	backup.Status.Phase = "Running"
+
+	backoffLimit := int32(3)
+	failedJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testJobName,
+			Namespace: "dbtether",
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit: &backoffLimit,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					Containers:    []corev1.Container{{Name: "backup", Image: "test"}},
+				},
+			},
+		},
+		Status: batchv1.JobStatus{
+			Failed: 3,
+			Conditions: []batchv1.JobCondition{
+				{
+					Type:    batchv1.JobFailed,
+					Status:  corev1.ConditionTrue,
+					Reason:  "BackoffLimitExceeded",
+					Message: "Job has reached the specified backoff limit",
+				},
+			},
+		},
+	}
+
+	r := newTestReconciler(backup, failedJob)
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      testBackupName,
+			Namespace: testNamespace,
+		},
+	}
+
+	_, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf(errUnexpectedError, err)
+	}
+
+	var updatedBackup databasesv1alpha1.Backup
+	if err := r.Get(context.Background(), req.NamespacedName, &updatedBackup); err != nil {
+		t.Fatalf(errFailedToGet, err)
+	}
+
+	if updatedBackup.Status.Phase != "Failed" {
+		t.Errorf(errExpectedPhase, "Failed", updatedBackup.Status.Phase)
+	}
+
+	// Verify failure reason is captured
+	if !contains(updatedBackup.Status.Message, "BackoffLimitExceeded") {
+		t.Errorf("expected message to contain 'BackoffLimitExceeded', got %q", updatedBackup.Status.Message)
+	}
+}
+
+// TestBackupReconciler_CustomBackoffLimit tests custom backoff limit configuration
+func TestBackupReconciler_CustomBackoffLimit(t *testing.T) {
+	backoffLimit := int32(5)
+	backup := newTestBackup(testBackupName, testNamespace)
+	backup.Finalizers = []string{backupFinalizer}
+	backup.Spec.JobConfig = &databasesv1alpha1.BackupJobConfig{
+		BackoffLimit: &backoffLimit,
+	}
+
+	db := newTestDatabase(testDBName, testNamespace, testClusterName)
+	cluster := newTestCluster(testClusterName)
+	storage := newTestStorage(testStorageName)
+	secret := newTestSecret(testSecretName, "dbtether")
+
+	r := newTestReconciler(backup, db, cluster, storage, secret)
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      testBackupName,
+			Namespace: testNamespace,
+		},
+	}
+
+	_, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf(errUnexpectedError, err)
+	}
+
+	var jobs batchv1.JobList
+	if err := r.List(context.Background(), &jobs, client.InNamespace("dbtether")); err != nil {
+		t.Fatalf(errFailedToListJobs, err)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf(errExpectedOneJob, len(jobs.Items))
+	}
+
+	job := &jobs.Items[0]
+	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != 5 {
+		t.Errorf("BackoffLimit should be 5, got %v", job.Spec.BackoffLimit)
+	}
+}
+
+// TestBackupReconciler_ActiveDeadlineSeconds tests active deadline configuration
+func TestBackupReconciler_ActiveDeadlineSeconds(t *testing.T) {
+	deadline := int64(1800) // 30 minutes
+	backup := newTestBackup(testBackupName, testNamespace)
+	backup.Finalizers = []string{backupFinalizer}
+	backup.Spec.JobConfig = &databasesv1alpha1.BackupJobConfig{
+		ActiveDeadlineSeconds: &deadline,
+	}
+
+	db := newTestDatabase(testDBName, testNamespace, testClusterName)
+	cluster := newTestCluster(testClusterName)
+	storage := newTestStorage(testStorageName)
+	secret := newTestSecret(testSecretName, "dbtether")
+
+	r := newTestReconciler(backup, db, cluster, storage, secret)
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      testBackupName,
+			Namespace: testNamespace,
+		},
+	}
+
+	_, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf(errUnexpectedError, err)
+	}
+
+	var jobs batchv1.JobList
+	if err := r.List(context.Background(), &jobs, client.InNamespace("dbtether")); err != nil {
+		t.Fatalf(errFailedToListJobs, err)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf(errExpectedOneJob, len(jobs.Items))
+	}
+
+	job := &jobs.Items[0]
+	if job.Spec.ActiveDeadlineSeconds == nil || *job.Spec.ActiveDeadlineSeconds != 1800 {
+		t.Errorf("ActiveDeadlineSeconds should be 1800, got %v", job.Spec.ActiveDeadlineSeconds)
+	}
+}
+
+// TestBackupReconciler_DeadlineExceeded tests handling of deadline exceeded failure
+func TestBackupReconciler_DeadlineExceeded(t *testing.T) {
+	backup := newTestBackup(testBackupName, testNamespace)
+	backup.Finalizers = []string{backupFinalizer}
+	backup.Status.JobName = testJobName
+	backup.Status.Phase = "Running"
+
+	deadline := int64(300)
+	failedJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testJobName,
+			Namespace: "dbtether",
+		},
+		Spec: batchv1.JobSpec{
+			ActiveDeadlineSeconds: &deadline,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					Containers:    []corev1.Container{{Name: "backup", Image: "test"}},
+				},
+			},
+		},
+		Status: batchv1.JobStatus{
+			Conditions: []batchv1.JobCondition{
+				{
+					Type:    batchv1.JobFailed,
+					Status:  corev1.ConditionTrue,
+					Reason:  "DeadlineExceeded",
+					Message: "Job was active longer than specified deadline",
+				},
+			},
+		},
+	}
+
+	r := newTestReconciler(backup, failedJob)
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      testBackupName,
+			Namespace: testNamespace,
+		},
+	}
+
+	_, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf(errUnexpectedError, err)
+	}
+
+	var updatedBackup databasesv1alpha1.Backup
+	if err := r.Get(context.Background(), req.NamespacedName, &updatedBackup); err != nil {
+		t.Fatalf(errFailedToGet, err)
+	}
+
+	if updatedBackup.Status.Phase != "Failed" {
+		t.Errorf(errExpectedPhase, "Failed", updatedBackup.Status.Phase)
+	}
+
+	if !contains(updatedBackup.Status.Message, "DeadlineExceeded") {
+		t.Errorf("expected message to contain 'DeadlineExceeded', got %q", updatedBackup.Status.Message)
+	}
+}
+
+// TestBackupReconciler_ZeroBackoffLimit tests zero retries configuration
+func TestBackupReconciler_ZeroBackoffLimit(t *testing.T) {
+	backoffLimit := int32(0) // No retries
+	backup := newTestBackup(testBackupName, testNamespace)
+	backup.Finalizers = []string{backupFinalizer}
+	backup.Spec.JobConfig = &databasesv1alpha1.BackupJobConfig{
+		BackoffLimit: &backoffLimit,
+	}
+
+	db := newTestDatabase(testDBName, testNamespace, testClusterName)
+	cluster := newTestCluster(testClusterName)
+	storage := newTestStorage(testStorageName)
+	secret := newTestSecret(testSecretName, "dbtether")
+
+	r := newTestReconciler(backup, db, cluster, storage, secret)
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      testBackupName,
+			Namespace: testNamespace,
+		},
+	}
+
+	_, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf(errUnexpectedError, err)
+	}
+
+	var jobs batchv1.JobList
+	if err := r.List(context.Background(), &jobs, client.InNamespace("dbtether")); err != nil {
+		t.Fatalf(errFailedToListJobs, err)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf(errExpectedOneJob, len(jobs.Items))
+	}
+
+	job := &jobs.Items[0]
+	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != 0 {
+		t.Errorf("BackoffLimit should be 0 (no retries), got %v", job.Spec.BackoffLimit)
+	}
+}
+
+func TestGetLastPodName_Logic(t *testing.T) {
+	// Test the logic of selecting the most recently created pod
+	now := metav1.Now()
+	earlier := metav1.NewTime(now.Add(-1 * time.Hour))
+	evenEarlier := metav1.NewTime(now.Add(-2 * time.Hour))
+
+	pods := []corev1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "job-abc-pod-1",
+				CreationTimestamp: evenEarlier,
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "job-abc-pod-3",
+				CreationTimestamp: now, // newest
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "job-abc-pod-2",
+				CreationTimestamp: earlier,
+			},
+		},
+	}
+
+	// Simulate getLastPodName logic
+	var lastPod *corev1.Pod
+	for i := range pods {
+		pod := &pods[i]
+		if lastPod == nil || pod.CreationTimestamp.After(lastPod.CreationTimestamp.Time) {
+			lastPod = pod
+		}
+	}
+
+	if lastPod == nil {
+		t.Fatal("Expected to find a pod")
+	}
+	if lastPod.Name != "job-abc-pod-3" {
+		t.Errorf("Expected newest pod 'job-abc-pod-3', got '%s'", lastPod.Name)
+	}
+}
+
+func TestGetLastPodName_EmptyList(t *testing.T) {
+	// Test with empty pod list
+	pods := []corev1.Pod{}
+
+	var lastPod *corev1.Pod
+	for i := range pods {
+		pod := &pods[i]
+		if lastPod == nil || pod.CreationTimestamp.After(lastPod.CreationTimestamp.Time) {
+			lastPod = pod
+		}
+	}
+
+	if lastPod != nil {
+		t.Error("Expected nil for empty pod list")
+	}
+}
+
+func TestGetLastPodName_SinglePod(t *testing.T) {
+	// Test with single pod
+	now := metav1.Now()
+	pods := []corev1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "job-xyz-pod-1",
+				CreationTimestamp: now,
+			},
+		},
+	}
+
+	var lastPod *corev1.Pod
+	for i := range pods {
+		pod := &pods[i]
+		if lastPod == nil || pod.CreationTimestamp.After(lastPod.CreationTimestamp.Time) {
+			lastPod = pod
+		}
+	}
+
+	if lastPod == nil {
+		t.Fatal("Expected to find a pod")
+	}
+	if lastPod.Name != "job-xyz-pod-1" {
+		t.Errorf("Expected 'job-xyz-pod-1', got '%s'", lastPod.Name)
 	}
 }

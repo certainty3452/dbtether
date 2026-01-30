@@ -204,6 +204,11 @@ func (r *BackupScheduleReconciler) createBackup(ctx context.Context, schedule *d
 		backup.Spec.FilenameTemplate = schedule.Spec.FilenameTemplate
 	}
 
+	// Inherit job config if specified
+	if schedule.Spec.JobConfig != nil {
+		backup.Spec.JobConfig = schedule.Spec.JobConfig
+	}
+
 	// Set owner reference for garbage collection
 	if err := controllerutil.SetControllerReference(schedule, backup, r.Scheme); err != nil {
 		return nil, fmt.Errorf("failed to set owner reference: %w", err)

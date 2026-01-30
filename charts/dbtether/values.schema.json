@@ -90,7 +90,15 @@
     },
     "podAnnotations": {
       "type": "object",
-      "description": "Annotations to add to the operator pod",
+      "description": "Additional annotations for the operator pod",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {}
+    },
+    "podLabels": {
+      "type": "object",
+      "description": "Additional labels for the operator pod (in addition to standard app.kubernetes.io/* labels)",
       "additionalProperties": {
         "type": "string"
       },
@@ -486,6 +494,30 @@
           "description": "Maximum concurrent backup jobs per DBCluster (prevents connection pool exhaustion)",
           "default": 3,
           "minimum": 1
+        },
+        "podAnnotations": {
+          "type": "object",
+          "description": "Annotations for backup job pods. Use for Karpenter/autoscaler protection (e.g., karpenter.sh/do-not-disrupt). Similar to Dagster's runK8sConfig.podTemplateSpecMetadata.annotations.",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "podLabels": {
+          "type": "object",
+          "description": "Labels for backup job pods (in addition to required dbtether.io/* labels). Use for log filtering in Grafana/Loki.",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "jobLabels": {
+          "type": "object",
+          "description": "Labels for backup Job objects (in addition to required dbtether.io/* labels).",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
         }
       },
       "additionalProperties": false

@@ -38,6 +38,27 @@ spec:
 | `filenameTemplate` | string | ❌ | `{{ .Timestamp }}.sql.gz` | Backup filename template |
 | `retention` | object | ❌ | — | Retention policy for cleanup |
 | `suspend` | bool | ❌ | `false` | Pause scheduling |
+| `jobConfig` | object | ❌ | — | Job configuration inherited by all Backups |
+
+### jobConfig
+
+Configure Kubernetes Job parameters inherited by all scheduled Backups. See [Backup jobConfig](backup.md#jobconfig) for details.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `backoffLimit` | int | `3` | Number of retries before marking backup failed (0-10) |
+| `activeDeadlineSeconds` | int | — | Hard timeout for the entire backup (seconds, min 60) |
+| `ttlSecondsAfterFailed` | int | — | Keep failed Job for debugging (seconds) |
+
+**Example:**
+
+```yaml
+spec:
+  schedule: "0 2 * * *"
+  jobConfig:
+    backoffLimit: 5              # All scheduled backups get 5 retries
+    activeDeadlineSeconds: 14400 # 4 hour timeout for large DBs
+```
 
 ## schedule (Cron Format)
 
@@ -237,6 +258,28 @@ spec:
   schedule: "0 3 * * 0"  # Sunday 3 AM
   retention:
     keepLast: 8  # 2 months of weekly backups
+```
+
+### Large Database: Custom Timeouts
+
+```yaml
+apiVersion: dbtether.io/v1alpha1
+kind: BackupSchedule
+metadata:
+  name: large-db-nightly
+  namespace: data-team
+spec:
+  databaseRef:
+    name: large-analytics-db
+  storageRef:
+    name: company-s3
+  schedule: "0 1 * * *"  # 1 AM daily
+  retention:
+    keepLast: 7
+  jobConfig:
+    backoffLimit: 5              # More retries for large DBs
+    activeDeadlineSeconds: 14400 # 4 hour timeout
+    ttlSecondsAfterFailed: 86400 # Keep failed Jobs for debugging
 ```
 
 ## Troubleshooting

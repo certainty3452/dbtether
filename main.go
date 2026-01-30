@@ -24,6 +24,7 @@ import (
 	"github.com/certainty3452/dbtether/controllers"
 	"github.com/certainty3452/dbtether/controllers/backup"
 	backuppkg "github.com/certainty3452/dbtether/pkg/backup"
+	"github.com/certainty3452/dbtether/pkg/config"
 	"github.com/certainty3452/dbtether/pkg/postgres"
 	"github.com/certainty3452/dbtether/pkg/storage"
 )
@@ -141,14 +142,24 @@ func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string) {
 	if operatorImage == "" {
 		operatorImage = "certainty3452/dbtether:latest"
 	}
-	maxConcurrentBackups := getEnvInt("BACKUP_MAX_CONCURRENT_PER_CLUSTER", 3)
+
+	// Load configuration from YAML file (mounted from ConfigMap at /etc/dbtether/config.yaml)
+	cfg := config.LoadOrDefault(config.DefaultConfigPath)
+	setupLog.Info("loaded configuration",
+		"maxConcurrentPerCluster", cfg.Backup.MaxConcurrentPerCluster,
+		"podAnnotations", cfg.Backup.PodAnnotations,
+	)
 
 	if err := (&backup.BackupReconciler{
 		Client:               mgr.GetClient(),
 		Scheme:               mgr.GetScheme(),
+		Recorder:             mgr.GetEventRecorderFor("backup-controller"),
 		Image:                operatorImage,
 		Namespace:            operatorNamespace,
-		MaxConcurrentBackups: maxConcurrentBackups,
+		MaxConcurrentBackups: cfg.Backup.MaxConcurrentPerCluster,
+		PodAnnotations:       cfg.Backup.PodAnnotations,
+		PodLabels:            cfg.Backup.PodLabels,
+		JobLabels:            cfg.Backup.JobLabels,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, errUnableToCreateController, "controller", "Backup")
 		os.Exit(1)
@@ -358,12 +369,12 @@ func updateJobAnnotations(ctx context.Context, result *backuppkg.BackupResult) e
 		return fmt.Errorf("JOB_NAME or JOB_NAMESPACE not set")
 	}
 
-	config, err := ctrl.GetConfig()
+	restConfig, err := ctrl.GetConfig()
 	if err != nil {
 		return fmt.Errorf("failed to get kubernetes config: %w", err)
 	}
 
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create kubernetes client: %w", err)
 	}

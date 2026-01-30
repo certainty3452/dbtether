@@ -75,6 +75,35 @@ spec:
                   Filename template for backup files (inherited by created Backups)
                   Available: .DatabaseName, .Timestamp, .RunID
                 type: string
+              jobConfig:
+                description: Job configuration inherited by all Backups created by
+                  this schedule
+                properties:
+                  activeDeadlineSeconds:
+                    description: |-
+                      ActiveDeadlineSeconds specifies the duration in seconds relative to the startTime
+                      that the backup job may be active before the system tries to terminate it.
+                      This is a hard timeout for the entire backup operation.
+                    format: int64
+                    minimum: 60
+                    type: integer
+                  backoffLimit:
+                    default: 3
+                    description: |-
+                      BackoffLimit specifies the number of retries before marking this backup failed.
+                      Defaults to 3.
+                    format: int32
+                    maximum: 10
+                    minimum: 0
+                    type: integer
+                  ttlSecondsAfterFailed:
+                    description: |-
+                      TTLSecondsAfterFailed specifies the TTL for the Job after it fails.
+                      This allows keeping failed jobs longer for debugging.
+                      Defaults to the same value as TTLAfterCompletion (or 1 hour if not set).
+                    format: int32
+                    type: integer
+                type: object
               retention:
                 description: Retention policy for automatic cleanup of old backups
                 properties:

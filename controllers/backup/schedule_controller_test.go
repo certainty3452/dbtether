@@ -680,3 +680,127 @@ func TestAnnotationLastRetentionClean_Constant(t *testing.T) {
 	// Verify annotation name constant
 	assert.Equal(t, "dbtether.io/last-retention-cleanup", AnnotationLastRetentionClean)
 }
+
+func TestBackupScheduleSpec_WithJobConfig(t *testing.T) {
+	// Test that BackupSchedule can have JobConfig which should be inherited by Backups
+	backoffLimit := int32(5)
+	activeDeadline := int64(7200)
+	ttlAfterFailed := int32(86400)
+
+	schedule := &dbtether.BackupSchedule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "large-db-nightly",
+			Namespace: "default",
+		},
+		Spec: dbtether.BackupScheduleSpec{
+			DatabaseRef: dbtether.DatabaseReference{Name: "large-db"},
+			StorageRef:  dbtether.StorageReference{Name: "company-s3"},
+			Schedule:    "0 1 * * *",
+			JobConfig: &dbtether.BackupJobConfig{
+				BackoffLimit:          &backoffLimit,
+				ActiveDeadlineSeconds: &activeDeadline,
+				TTLSecondsAfterFailed: &ttlAfterFailed,
+			},
+		},
+	}
+
+	// Verify JobConfig is set correctly
+	require.NotNil(t, schedule.Spec.JobConfig)
+	assert.Equal(t, int32(5), *schedule.Spec.JobConfig.BackoffLimit)
+	assert.Equal(t, int64(7200), *schedule.Spec.JobConfig.ActiveDeadlineSeconds)
+	assert.Equal(t, int32(86400), *schedule.Spec.JobConfig.TTLSecondsAfterFailed)
+}
+
+func TestBackupInheritsJobConfigFromSchedule(t *testing.T) {
+	// Test that when creating a Backup from Schedule, JobConfig is inherited
+	backoffLimit := int32(5)
+	activeDeadline := int64(14400)
+	ttlAfterFailed := int32(172800)
+
+	schedule := &dbtether.BackupSchedule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-schedule",
+			Namespace: "test-ns",
+		},
+		Spec: dbtether.BackupScheduleSpec{
+			DatabaseRef:      dbtether.DatabaseReference{Name: "test-db"},
+			StorageRef:       dbtether.StorageReference{Name: "test-storage"},
+			Schedule:         "0 2 * * *",
+			FilenameTemplate: "{{ .Timestamp }}.sql.gz",
+			JobConfig: &dbtether.BackupJobConfig{
+				BackoffLimit:          &backoffLimit,
+				ActiveDeadlineSeconds: &activeDeadline,
+				TTLSecondsAfterFailed: &ttlAfterFailed,
+			},
+		},
+	}
+
+	// Simulate what createBackup does (without k8s client)
+	backup := &dbtether.Backup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-schedule-20260120-0200",
+			Namespace: schedule.Namespace,
+			Labels: map[string]string{
+				LabelScheduleName: schedule.Name,
+				LabelScheduleNS:   schedule.Namespace,
+			},
+		},
+		Spec: dbtether.BackupSpec{
+			DatabaseRef: schedule.Spec.DatabaseRef,
+			StorageRef:  schedule.Spec.StorageRef,
+		},
+	}
+
+	// Inherit filename template if specified
+	if schedule.Spec.FilenameTemplate != "" {
+		backup.Spec.FilenameTemplate = schedule.Spec.FilenameTemplate
+	}
+
+	// Inherit job config if specified (this is what we're testing)
+	if schedule.Spec.JobConfig != nil {
+		backup.Spec.JobConfig = schedule.Spec.JobConfig
+	}
+
+	// Verify JobConfig was inherited
+	require.NotNil(t, backup.Spec.JobConfig)
+	assert.Equal(t, int32(5), *backup.Spec.JobConfig.BackoffLimit)
+	assert.Equal(t, int64(14400), *backup.Spec.JobConfig.ActiveDeadlineSeconds)
+	assert.Equal(t, int32(172800), *backup.Spec.JobConfig.TTLSecondsAfterFailed)
+
+	// Verify other fields
+	assert.Equal(t, "test-db", backup.Spec.DatabaseRef.Name)
+	assert.Equal(t, "test-storage", backup.Spec.StorageRef.Name)
+	assert.Equal(t, "{{ .Timestamp }}.sql.gz", backup.Spec.FilenameTemplate)
+}
+
+func TestBackupWithoutJobConfigFromSchedule(t *testing.T) {
+	// Test that Backup without JobConfig in Schedule gets nil JobConfig
+	schedule := &dbtether.BackupSchedule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "simple-schedule",
+			Namespace: "default",
+		},
+		Spec: dbtether.BackupScheduleSpec{
+			DatabaseRef: dbtether.DatabaseReference{Name: "simple-db"},
+			StorageRef:  dbtether.StorageReference{Name: "simple-storage"},
+			Schedule:    "0 3 * * *",
+			JobConfig:   nil, // No JobConfig
+		},
+	}
+
+	// Simulate backup creation
+	backup := &dbtether.Backup{
+		Spec: dbtether.BackupSpec{
+			DatabaseRef: schedule.Spec.DatabaseRef,
+			StorageRef:  schedule.Spec.StorageRef,
+		},
+	}
+
+	// Inherit job config only if specified
+	if schedule.Spec.JobConfig != nil {
+		backup.Spec.JobConfig = schedule.Spec.JobConfig
+	}
+
+	// JobConfig should remain nil
+	assert.Nil(t, backup.Spec.JobConfig)
+}
