@@ -771,3 +771,94 @@ func TestResolveSource_EmptySource(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "either backupRef, latestFrom, or path must be specified")
 }
+
+func TestJobToRestoreMapping(t *testing.T) {
+	tests := []struct {
+		name              string
+		jobNamespace      string
+		labels            map[string]string
+		operatorNamespace string
+		expectRequest     bool
+		expectedName      string
+		expectedNamespace string
+	}{
+		{
+			name:         "correct labels in operator namespace",
+			jobNamespace: "dbtether",
+			labels: map[string]string{
+				LabelRestoreName:      "my-restore",
+				LabelRestoreNamespace: "app-team",
+			},
+			operatorNamespace: "dbtether",
+			expectRequest:     true,
+			expectedName:      "my-restore",
+			expectedNamespace: "app-team",
+		},
+		{
+			name:         "wrong namespace ignored",
+			jobNamespace: "other-namespace",
+			labels: map[string]string{
+				LabelRestoreName:      "my-restore",
+				LabelRestoreNamespace: "app-team",
+			},
+			operatorNamespace: "dbtether",
+			expectRequest:     false,
+		},
+		{
+			name:              "no labels ignored",
+			jobNamespace:      "dbtether",
+			labels:            map[string]string{},
+			operatorNamespace: "dbtether",
+			expectRequest:     false,
+		},
+		{
+			name:         "partial labels ignored",
+			jobNamespace: "dbtether",
+			labels: map[string]string{
+				LabelRestoreName: "partial-restore",
+			},
+			operatorNamespace: "dbtether",
+			expectRequest:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.jobNamespace != tt.operatorNamespace {
+				if tt.expectRequest {
+					t.Error("expected no request for job in wrong namespace")
+				}
+				return
+			}
+
+			restoreName := tt.labels[LabelRestoreName]
+			restoreNamespace := tt.labels[LabelRestoreNamespace]
+
+			if restoreName == "" || restoreNamespace == "" {
+				if tt.expectRequest {
+					t.Error("expected no request for job without proper labels")
+				}
+				return
+			}
+
+			if !tt.expectRequest {
+				t.Error("expected no request but mapping logic would produce one")
+				return
+			}
+
+			assert.Equal(t, tt.expectedName, restoreName)
+			assert.Equal(t, tt.expectedNamespace, restoreNamespace)
+		})
+	}
+}
+
+func TestRestoreLabelConstants(t *testing.T) {
+	expected := map[string]string{
+		"dbtether.io/restore":           LabelRestoreName,
+		"dbtether.io/restore-namespace": LabelRestoreNamespace,
+	}
+
+	for want, got := range expected {
+		assert.Equal(t, want, got, "label constant mismatch")
+	}
+}

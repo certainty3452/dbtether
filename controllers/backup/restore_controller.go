@@ -18,6 +18,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
@@ -574,6 +575,29 @@ func (r *RestoreReconciler) computeSpecHash(restore *databasesv1alpha1.Restore) 
 func (r *RestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&databasesv1alpha1.Restore{}).
-		Owns(&batchv1.Job{}).
+		// Jobs don't have OwnerReference (cross-namespace), so we watch by labels
+		Watches(&batchv1.Job{}, r.jobEventHandler()).
 		Complete(r)
+}
+
+func (r *RestoreReconciler) jobEventHandler() handler.EventHandler {
+	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []ctrl.Request {
+		job, ok := obj.(*batchv1.Job)
+		if !ok || job.Namespace != r.Namespace {
+			return nil
+		}
+
+		restoreName := job.Labels[LabelRestoreName]
+		restoreNamespace := job.Labels[LabelRestoreNamespace]
+		if restoreName == "" || restoreNamespace == "" {
+			return nil
+		}
+
+		return []ctrl.Request{{
+			NamespacedName: types.NamespacedName{
+				Name:      restoreName,
+				Namespace: restoreNamespace,
+			},
+		}}
+	})
 }

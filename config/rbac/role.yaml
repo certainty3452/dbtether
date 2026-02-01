@@ -71,3 +71,12 @@ rules:
   - get
   - patch
   - update
+# Pod permissions (for backup job status tracking and failure diagnostics)
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch

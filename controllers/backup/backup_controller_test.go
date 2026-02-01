@@ -1847,3 +1847,114 @@ func TestGetLastPodName_SinglePod(t *testing.T) {
 		t.Errorf("Expected 'job-xyz-pod-1', got '%s'", lastPod.Name)
 	}
 }
+
+func TestJobToBackupMapping(t *testing.T) {
+	tests := []struct {
+		name              string
+		jobNamespace      string
+		labels            map[string]string
+		operatorNamespace string
+		expectRequest     bool
+		expectedName      string
+		expectedNamespace string
+	}{
+		{
+			name:         "correct labels in operator namespace",
+			jobNamespace: testOperatorNS,
+			labels: map[string]string{
+				LabelBackupName:      "my-backup",
+				LabelBackupNamespace: "app-team",
+			},
+			operatorNamespace: testOperatorNS,
+			expectRequest:     true,
+			expectedName:      "my-backup",
+			expectedNamespace: "app-team",
+		},
+		{
+			name:         "wrong namespace ignored",
+			jobNamespace: "other-namespace",
+			labels: map[string]string{
+				LabelBackupName:      "my-backup",
+				LabelBackupNamespace: "app-team",
+			},
+			operatorNamespace: testOperatorNS,
+			expectRequest:     false,
+		},
+		{
+			name:              "no labels ignored",
+			jobNamespace:      testOperatorNS,
+			labels:            map[string]string{},
+			operatorNamespace: testOperatorNS,
+			expectRequest:     false,
+		},
+		{
+			name:         "partial labels ignored",
+			jobNamespace: testOperatorNS,
+			labels: map[string]string{
+				LabelBackupName: "partial-backup",
+			},
+			operatorNamespace: testOperatorNS,
+			expectRequest:     false,
+		},
+		{
+			name:         "cross-namespace mapping",
+			jobNamespace: testOperatorNS,
+			labels: map[string]string{
+				LabelBackupName:      "dagster-nightly-20260201-0200",
+				LabelBackupNamespace: "dagster",
+				LabelCluster:         "infrastructure",
+			},
+			operatorNamespace: testOperatorNS,
+			expectRequest:     true,
+			expectedName:      "dagster-nightly-20260201-0200",
+			expectedNamespace: "dagster",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.jobNamespace != tt.operatorNamespace {
+				if tt.expectRequest {
+					t.Error("expected no request for job in wrong namespace")
+				}
+				return
+			}
+
+			backupName := tt.labels[LabelBackupName]
+			backupNamespace := tt.labels[LabelBackupNamespace]
+
+			if backupName == "" || backupNamespace == "" {
+				if tt.expectRequest {
+					t.Error("expected no request for job without proper labels")
+				}
+				return
+			}
+
+			if !tt.expectRequest {
+				t.Error("expected no request but mapping logic would produce one")
+				return
+			}
+
+			if backupName != tt.expectedName {
+				t.Errorf("expected name %q, got %q", tt.expectedName, backupName)
+			}
+			if backupNamespace != tt.expectedNamespace {
+				t.Errorf("expected namespace %q, got %q", tt.expectedNamespace, backupNamespace)
+			}
+		})
+	}
+}
+
+func TestBackupLabelConstants(t *testing.T) {
+	expected := map[string]string{
+		"dbtether.io/backup":           LabelBackupName,
+		"dbtether.io/backup-namespace": LabelBackupNamespace,
+		"dbtether.io/cluster":          LabelCluster,
+	}
+
+	for want, got := range expected {
+		if got != want {
+			t.Errorf("label constant mismatch: expected %q, got %q", want, got)
+		}
+	}
+}

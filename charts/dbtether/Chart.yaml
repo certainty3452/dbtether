@@ -2,8 +2,8 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.5.2
-appVersion: "0.5.2"
+version: 0.5.3
+appVersion: "0.5.3"
 home: https://github.com/certainty3452/dbtether
 # icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
@@ -68,13 +68,97 @@ annotations:
       url: https://github.com/certainty3452/dbtether#readme
     - name: Source
       url: https://github.com/certainty3452/dbtether
+  artifacthub.io/crdsExamples: |
+    - apiVersion: dbtether.io/v1alpha1
+      kind: DBCluster
+      metadata:
+        name: microservices
+      spec:
+        endpoint: microservices-prod.cluster-xxxxxxxxxxxx.eu-central-1.rds.amazonaws.com
+        port: 5432
+        credentialsSecretRef:
+          name: microservices-credentials
+          namespace: dbtether
+    - apiVersion: dbtether.io/v1alpha1
+      kind: Database
+      metadata:
+        name: orders-db
+        namespace: team-alpha
+      spec:
+        clusterRef:
+          name: microservices
+        extensions:
+          - uuid-ossp
+          - pg_trgm
+        deletionPolicy: Delete
+    - apiVersion: dbtether.io/v1alpha1
+      kind: DatabaseUser
+      metadata:
+        name: orders-api
+        namespace: team-alpha
+      spec:
+        database:
+          name: orders-db
+        privileges: readwrite
+        password:
+          length: 32
+        rotation:
+          days: 30
+        secret:
+          template: POSTGRES
+    - apiVersion: dbtether.io/v1alpha1
+      kind: BackupStorage
+      metadata:
+        name: company-s3
+      spec:
+        s3:
+          bucket: my-company-backups
+          region: eu-central-1
+        pathTemplate: "{{ .ClusterName }}/{{ .Year }}/{{ .Month }}"
+    - apiVersion: dbtether.io/v1alpha1
+      kind: Backup
+      metadata:
+        name: orders-backup-20260119
+        namespace: team-alpha
+      spec:
+        databaseRef:
+          name: orders-db
+        storageRef:
+          name: company-s3
+        ttlAfterCompletion: 1h
+    - apiVersion: dbtether.io/v1alpha1
+      kind: BackupSchedule
+      metadata:
+        name: orders-nightly
+        namespace: orders-team
+      spec:
+        databaseRef:
+          name: orders-db
+        storageRef:
+          name: company-s3
+        schedule: "0 2 * * *"
+        retention:
+          keepLast: 7
+          keepDaily: 30
+          keepWeekly: 12
+          keepMonthly: 12
+    - apiVersion: dbtether.io/v1alpha1
+      kind: Restore
+      metadata:
+        name: restore-orders-latest
+        namespace: default
+      spec:
+        source:
+          latestFrom:
+            databaseRef:
+              name: orders-db
+        target:
+          databaseRef:
+            name: orders-db-restored
+        onConflict: drop
   artifacthub.io/changes: |
     - kind: fixed
-      description: "Backup stuck in Running phase when Job fails"
-    - kind: added
-      description: "Configurable pod annotations/labels for backup jobs"
-    - kind: added
-      description: "Configurable job parameters via jobConfig (backoffLimit, activeDeadlineSeconds)"
-    - kind: added
-      description: "Kubernetes Events for backup lifecycle"
+      description: "Critical: Backup/Restore controllers now properly watch Jobs via labels instead of broken OwnerReference"
+    - kind: fixed
+      description: "Added Pod permissions to ClusterRole for backup job status tracking"
 

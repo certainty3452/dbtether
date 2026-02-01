@@ -2,6 +2,12 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.5.3] - 2026-02-02
+
+### Fixed
+- Backup/Restore stuck in Running when Job completes
+- Added Pod read permissions to ClusterRole
+
 ## [0.5.2] - 2026-01-30
 
 ### Fixed
