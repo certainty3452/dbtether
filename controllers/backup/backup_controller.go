@@ -62,6 +62,10 @@ type BackupReconciler struct {
 	// JobLabels are applied to all backup Job objects (in addition to required labels).
 	// Set via Helm values (backup.jobLabels).
 	JobLabels map[string]string
+
+	// PodResources defines resource limits/requests for backup pods.
+	// Set via Helm values (backup.resources).
+	PodResources corev1.ResourceRequirements
 }
 
 // Event reason constants for backup operations
@@ -479,10 +483,11 @@ func (r *BackupReconciler) createBackupJob(ctx context.Context, backup *database
 					ServiceAccountName: "dbtether", // Uses operator's SA for IRSA
 					Containers: []corev1.Container{
 						{
-							Name:  "backup",
-							Image: r.Image,
-							Args:  []string{"--mode=job"},
-							Env:   env,
+							Name:      "backup",
+							Image:     r.Image,
+							Args:      []string{"--mode=job"},
+							Env:       env,
+							Resources: r.PodResources,
 						},
 					},
 				},
@@ -627,19 +632,25 @@ func (r *BackupReconciler) evaluateJobStatus(ctx context.Context, backup *databa
 	job *batchv1.Job, specHash string) (ctrl.Result, error) {
 
 	if job.Status.Succeeded > 0 {
-		// Read backup results from job annotations and update status with them
 		return r.updateStatusCompleted(ctx, backup, job, specHash)
 	}
 
-	// Check Job Conditions for definitive failure status
-	// This is the correct way to detect job failure - Kubernetes sets this condition
-	// when backoff limit is exceeded, deadline is exceeded, or pod failure policy triggers
 	if _, failed := r.isJobFailed(job); failed {
 		failureInfo := r.getJobFailureInfo(job)
 		return r.updateStatusFailedWithInfo(ctx, backup, job, specHash, failureInfo)
 	}
 
-	// Still running
+	// Still running - track pod name while pod exists
+	if backup.Status.LastPodName == "" {
+		if podName := r.getLastPodName(ctx, job); podName != "" {
+			patch := client.MergeFrom(backup.DeepCopy())
+			backup.Status.LastPodName = podName
+			if err := r.Status().Patch(ctx, backup, patch); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 

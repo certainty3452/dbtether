@@ -6,6 +6,8 @@ import (
 	"os"
 
 	"gopkg.in/yaml.v3"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // DefaultConfigPath is the path where the ConfigMap is mounted in the operator pod.
@@ -30,6 +32,40 @@ type BackupConfig struct {
 
 	// JobLabels are added to backup Job objects (in addition to required labels)
 	JobLabels map[string]string `yaml:"jobLabels"`
+
+	// Resources for backup job pods
+	Resources ResourcesConfig `yaml:"resources"`
+}
+
+// ResourcesConfig defines resource limits/requests for pods.
+type ResourcesConfig struct {
+	Limits   map[string]string `yaml:"limits"`
+	Requests map[string]string `yaml:"requests"`
+}
+
+// ToK8sResources converts config to Kubernetes ResourceRequirements.
+func (r *ResourcesConfig) ToK8sResources() corev1.ResourceRequirements {
+	result := corev1.ResourceRequirements{}
+
+	if len(r.Limits) > 0 {
+		result.Limits = make(corev1.ResourceList)
+		for k, v := range r.Limits {
+			if q, err := resource.ParseQuantity(v); err == nil {
+				result.Limits[corev1.ResourceName(k)] = q
+			}
+		}
+	}
+
+	if len(r.Requests) > 0 {
+		result.Requests = make(corev1.ResourceList)
+		for k, v := range r.Requests {
+			if q, err := resource.ParseQuantity(v); err == nil {
+				result.Requests[corev1.ResourceName(k)] = q
+			}
+		}
+	}
+
+	return result
 }
 
 // Load reads configuration from a YAML file.

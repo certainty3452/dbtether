@@ -22,3 +22,7 @@ data:
       jobLabels:
         {{- toYaml .Values.backup.jobLabels | nindent 8 }}
       {{- end }}
+      {{- if .Values.backup.resources }}
+      resources:
+        {{- toYaml .Values.backup.resources | nindent 8 }}
+      {{- end }}

@@ -2,6 +2,14 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.5.4] - 2026-02-02
+
+### Fixed
+- Track pod name during Running phase for debugging failed jobs
+
+### Added
+- Configurable resources (memory/cpu) for backup pods via `backup.resources`
+
 ## [0.5.3] - 2026-02-02
 
 ### Fixed

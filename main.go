@@ -160,6 +160,7 @@ func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string) {
 		PodAnnotations:       cfg.Backup.PodAnnotations,
 		PodLabels:            cfg.Backup.PodLabels,
 		JobLabels:            cfg.Backup.JobLabels,
+		PodResources:         cfg.Backup.Resources.ToK8sResources(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, errUnableToCreateController, "controller", "Backup")
 		os.Exit(1)
@@ -177,10 +178,11 @@ func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string) {
 	}
 
 	if err := (&backup.RestoreReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		Image:     operatorImage,
-		Namespace: operatorNamespace,
+		Client:       mgr.GetClient(),
+		Scheme:       mgr.GetScheme(),
+		Image:        operatorImage,
+		Namespace:    operatorNamespace,
+		PodResources: cfg.Backup.Resources.ToK8sResources(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, errUnableToCreateController, "controller", "Restore")
 		os.Exit(1)

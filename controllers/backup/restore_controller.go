@@ -34,9 +34,10 @@ const (
 
 type RestoreReconciler struct {
 	client.Client
-	Scheme    *runtime.Scheme
-	Image     string
-	Namespace string
+	Scheme       *runtime.Scheme
+	Image        string
+	Namespace    string
+	PodResources corev1.ResourceRequirements
 }
 
 // +kubebuilder:rbac:groups=dbtether.io,resources=restores,verbs=get;list;watch;create;update;patch;delete
@@ -308,10 +309,11 @@ func (r *RestoreReconciler) buildRestoreJob(
 					ServiceAccountName: "dbtether", // Uses operator's SA for IRSA
 					Containers: []corev1.Container{
 						{
-							Name:  "restore",
-							Image: r.Image,
-							Args:  []string{"--mode=restore"},
-							Env:   env,
+							Name:      "restore",
+							Image:     r.Image,
+							Args:      []string{"--mode=restore"},
+							Env:       env,
+							Resources: r.PodResources,
 						},
 					},
 				},

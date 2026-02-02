@@ -8,7 +8,7 @@ image:
   repository: ghcr.io/certainty3452/dbtether
   pullPolicy: IfNotPresent
   # Automatically updated by release pipeline from git tag
-  tag: "0.5.3"
+  tag: "0.5.4"
 
 imagePullSecrets: []
 nameOverride: ""
@@ -107,6 +107,16 @@ logging:
 backup:
   # Maximum concurrent backup jobs per DBCluster (prevents connection pool exhaustion)
   maxConcurrentPerCluster: 3
+
+  # Resources for backup job pods
+  # Important: pg_dump buffers entire database in memory before upload
+  # Set memory limit based on your largest database size
+  resources:
+    limits:
+      memory: 2Gi
+    requests:
+      cpu: 100m
+      memory: 512Mi
 
   # Annotations for backup job pods
   # Use this to protect backup pods from autoscaler disruption (Karpenter, cluster-autoscaler)
