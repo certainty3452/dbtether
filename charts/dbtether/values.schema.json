@@ -518,6 +518,21 @@
             "type": "string"
           },
           "default": {}
+        },
+        "resources": {
+          "type": "object",
+          "description": "Resource limits/requests for backup job pods.",
+          "properties": {
+            "limits": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            },
+            "requests": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

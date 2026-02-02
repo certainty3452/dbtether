@@ -101,6 +101,31 @@ func strPtr(s string) *string {
 	return &s
 }
 
+// UploadStreaming uploads data using streaming (for large files)
+func (c *AzureClient) UploadStreaming(ctx context.Context, key string, data io.Reader, tags *ObjectTags) error {
+	opts := &azblob.UploadStreamOptions{
+		BlockSize:   8 * 1024 * 1024, // 8MB blocks
+		Concurrency: 3,
+	}
+
+	if tags != nil {
+		opts.Metadata = map[string]*string{
+			"database":   strPtr(tags.Database),
+			"cluster":    strPtr(tags.Cluster),
+			"backupname": strPtr(tags.BackupName),
+			"namespace":  strPtr(tags.Namespace),
+			"timestamp":  strPtr(tags.Timestamp),
+			"createdby":  strPtr(tags.CreatedBy),
+		}
+	}
+
+	_, err := c.client.UploadStream(ctx, c.container, key, data, opts)
+	if err != nil {
+		return fmt.Errorf("failed to upload to Azure Blob: %w", err)
+	}
+	return nil
+}
+
 // Download downloads data from Azure Blob Storage
 func (c *AzureClient) Download(ctx context.Context, key string) (io.ReadCloser, error) {
 	resp, err := c.client.DownloadStream(ctx, c.container, key, nil)

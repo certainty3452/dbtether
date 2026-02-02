@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -133,6 +134,52 @@ func isAccessDeniedError(err error) bool {
 	errStr := err.Error()
 	// Check for AccessDenied in error string (covers various AWS SDK error types)
 	return strings.Contains(errStr, "AccessDenied") || strings.Contains(errStr, "403")
+}
+
+// UploadStreaming uses S3 multipart upload for large files.
+func (c *S3Client) UploadStreaming(ctx context.Context, key string, body io.Reader, tags *ObjectTags) error {
+	uploader := manager.NewUploader(c.client, func(u *manager.Uploader) {
+		u.PartSize = 64 * 1024 * 1024 // 64MB parts
+		u.Concurrency = 3
+	})
+
+	input := &s3.PutObjectInput{
+		Bucket:      aws.String(c.bucket),
+		Key:         aws.String(key),
+		Body:        body,
+		ContentType: aws.String("application/gzip"),
+	}
+
+	if tags != nil {
+		tagging := fmt.Sprintf(
+			"database=%s&cluster=%s&backup-name=%s&namespace=%s&timestamp=%s&created-by=%s",
+			tags.Database,
+			tags.Cluster,
+			tags.BackupName,
+			tags.Namespace,
+			tags.Timestamp,
+			tags.CreatedBy,
+		)
+		input.Tagging = aws.String(tagging)
+	}
+
+	_, err := uploader.Upload(ctx, input)
+	if err != nil {
+		if tags != nil && isAccessDeniedError(err) {
+			c.logger.Warn("S3 tagging permission denied, uploading without tags",
+				"bucket", c.bucket,
+				"key", key,
+			)
+			input.Tagging = nil
+			_, retryErr := uploader.Upload(ctx, input)
+			if retryErr != nil {
+				return fmt.Errorf("failed to upload to S3: %w", retryErr)
+			}
+			return nil
+		}
+		return fmt.Errorf("failed to upload to S3: %w", err)
+	}
+	return nil
 }
 
 func (c *S3Client) Download(ctx context.Context, key string) (io.ReadCloser, error) {

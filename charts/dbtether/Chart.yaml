@@ -157,8 +157,10 @@ annotations:
             name: orders-db-restored
         onConflict: drop
   artifacthub.io/changes: |
+    - kind: changed
+      description: "Streaming backup for constant memory usage"
     - kind: fixed
-      description: "Track pod name during Running phase for debugging failed jobs"
+      description: "Job watching and pod debugging improvements"
     - kind: added
       description: "Configurable resources for backup pods"
 

@@ -5,9 +5,12 @@ import (
 	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"text/template"
 	"time"
 
@@ -61,7 +64,6 @@ type BackupResult struct {
 func RunBackup(ctx context.Context, cfg *BackupConfig) (*BackupResult, error) {
 	startTime := time.Now()
 
-	// Generate path and filename from templates
 	now := time.Now().UTC()
 	data := TemplateData{
 		ClusterName:  cfg.ClusterName,
@@ -85,25 +87,6 @@ func RunBackup(ctx context.Context, cfg *BackupConfig) (*BackupResult, error) {
 
 	fullPath := strings.TrimSuffix(path, "/") + "/" + filename
 
-	// Run pg_dump
-	dumpData, err := runPgDump(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("pg_dump failed: %w", err)
-	}
-	uncompressedSize := int64(len(dumpData))
-
-	// Compress with gzip
-	var compressed bytes.Buffer
-	gzWriter := gzip.NewWriter(&compressed)
-	if _, err := gzWriter.Write(dumpData); err != nil {
-		return nil, fmt.Errorf("gzip compression failed: %w", err)
-	}
-	if err := gzWriter.Close(); err != nil {
-		return nil, fmt.Errorf("gzip close failed: %w", err)
-	}
-	compressedSize := int64(compressed.Len())
-
-	// Build tags for object metadata
 	tags := &storage.ObjectTags{
 		Database:   cfg.DatabaseName,
 		Cluster:    cfg.ClusterName,
@@ -113,48 +96,53 @@ func RunBackup(ctx context.Context, cfg *BackupConfig) (*BackupResult, error) {
 		CreatedBy:  "dbtether",
 	}
 
-	// Upload to storage
-	switch cfg.StorageType {
-	case "s3":
-		s3Client, err := storage.NewS3Client(ctx, &cfg.S3Config, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create S3 client: %w", err)
-		}
-		if err := s3Client.UploadWithTags(ctx, fullPath, bytes.NewReader(compressed.Bytes()), tags); err != nil {
-			return nil, fmt.Errorf("S3 upload failed: %w", err)
-		}
-	case "gcs":
-		gcsClient, err := storage.NewGCSClient(ctx, &cfg.GCSConfig, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create GCS client: %w", err)
-		}
-		defer func() { _ = gcsClient.Close() }()
-		if err := gcsClient.UploadWithTags(ctx, fullPath, bytes.NewReader(compressed.Bytes()), tags); err != nil {
-			return nil, fmt.Errorf("GCS upload failed: %w", err)
-		}
-	case "azure":
-		azureClient, err := storage.NewAzureClient(ctx, &cfg.AzureConfig, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create Azure client: %w", err)
-		}
-		if err := azureClient.UploadWithTags(ctx, fullPath, bytes.NewReader(compressed.Bytes()), tags); err != nil {
-			return nil, fmt.Errorf("azure blob upload failed: %w", err)
-		}
-	default:
-		return nil, fmt.Errorf("unsupported storage type: %s", cfg.StorageType)
+	result, err := runStreamingBackup(ctx, cfg, fullPath, tags)
+	if err != nil {
+		return nil, err
+	}
+
+	result.Duration = time.Since(startTime)
+	return result, nil
+}
+
+// runStreamingBackup streams pg_dump output through gzip directly to storage.
+// Memory usage is O(buffer size) instead of O(database size).
+func runStreamingBackup(ctx context.Context, cfg *BackupConfig, fullPath string, tags *storage.ObjectTags) (*BackupResult, error) {
+	pr, pw := io.Pipe()
+
+	var uncompressedSize atomic.Int64
+	var compressedSize atomic.Int64
+	var pgDumpErr error
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		pgDumpErr = runPgDumpToWriter(ctx, cfg, pw, &uncompressedSize)
+	}()
+
+	gzipReader := newGzipStreamReader(pr, &compressedSize)
+	uploadErr := uploadToStorage(ctx, cfg, fullPath, gzipReader, tags)
+
+	wg.Wait()
+
+	if pgDumpErr != nil {
+		return nil, fmt.Errorf("pg_dump failed: %w", pgDumpErr)
+	}
+	if uploadErr != nil {
+		return nil, fmt.Errorf("upload failed: %w", uploadErr)
 	}
 
 	return &BackupResult{
 		Path:             fullPath,
-		Size:             compressedSize,
-		UncompressedSize: uncompressedSize,
-		Duration:         time.Since(startTime),
+		Size:             compressedSize.Load(),
+		UncompressedSize: uncompressedSize.Load(),
 	}, nil
 }
 
-func runPgDump(ctx context.Context, cfg *BackupConfig) ([]byte, error) {
-	// Use separate arguments instead of connection string for security
-	// Each argument is isolated and properly escaped by exec.CommandContext
+func runPgDumpToWriter(ctx context.Context, cfg *BackupConfig, pw *io.PipeWriter, size *atomic.Int64) error {
+	defer func() { _ = pw.Close() }()
+
 	// #nosec G204 -- args from trusted config (CRD spec), not user input
 	cmd := exec.CommandContext(ctx, "pg_dump",
 		"--host", cfg.Host,
@@ -165,19 +153,92 @@ func runPgDump(ctx context.Context, cfg *BackupConfig) ([]byte, error) {
 		"--no-owner",
 		"--no-acl",
 	)
-
-	// Password via environment variable (standard PostgreSQL approach)
 	cmd.Env = append(os.Environ(), "PGPASSWORD="+cfg.Password)
+	cmd.Stdout = &countingWriter{w: pw, count: size}
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("pg_dump error: %s, stderr: %s", err, stderr.String())
+		err = fmt.Errorf("pg_dump error: %s, stderr: %s", err, stderr.String())
+		_ = pw.CloseWithError(err)
+		return err
+	}
+	return nil
+}
+
+func uploadToStorage(ctx context.Context, cfg *BackupConfig, path string, data io.Reader, tags *storage.ObjectTags) error {
+	switch cfg.StorageType {
+	case "s3":
+		client, err := storage.NewS3Client(ctx, &cfg.S3Config, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create S3 client: %w", err)
+		}
+		return client.UploadStreaming(ctx, path, data, tags)
+	case "gcs":
+		client, err := storage.NewGCSClient(ctx, &cfg.GCSConfig, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create GCS client: %w", err)
+		}
+		defer func() { _ = client.Close() }()
+		return client.UploadWithTags(ctx, path, data, tags)
+	case "azure":
+		client, err := storage.NewAzureClient(ctx, &cfg.AzureConfig, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create Azure client: %w", err)
+		}
+		return client.UploadStreaming(ctx, path, data, tags)
+	default:
+		return fmt.Errorf("unsupported storage type: %s", cfg.StorageType)
+	}
+}
+
+type countingWriter struct {
+	w     io.Writer
+	count *atomic.Int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.count.Add(int64(n))
+	return n, err
+}
+
+type gzipStreamReader struct {
+	pr            *io.PipeReader
+	pw            *io.PipeWriter
+	compressedCnt *atomic.Int64
+	done          chan struct{}
+}
+
+func newGzipStreamReader(input io.Reader, compressedCount *atomic.Int64) io.Reader {
+	pr, pw := io.Pipe()
+	g := &gzipStreamReader{
+		pr:            pr,
+		pw:            pw,
+		compressedCnt: compressedCount,
+		done:          make(chan struct{}),
 	}
 
-	return stdout.Bytes(), nil
+	go func() {
+		defer close(g.done)
+		defer func() { _ = pw.Close() }()
+
+		countingPW := &countingWriter{w: pw, count: compressedCount}
+		gzWriter := gzip.NewWriter(countingPW)
+
+		_, err := io.Copy(gzWriter, input)
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if err := gzWriter.Close(); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+	}()
+
+	return pr
 }
 
 func executeTemplate(tmpl string, data *TemplateData) (string, error) {
