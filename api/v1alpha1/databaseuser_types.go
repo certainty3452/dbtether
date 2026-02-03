@@ -145,7 +145,7 @@ type SecretKeys struct {
 	// +optional
 	Database string `json:"database,omitempty"`
 	// +optional
-	User string `json:"user,omitempty"`
+	Username string `json:"username,omitempty"`
 	// +optional
 	Password string `json:"password,omitempty"`
 }

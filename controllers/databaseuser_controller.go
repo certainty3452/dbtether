@@ -189,7 +189,7 @@ func (r *DatabaseUserReconciler) getSecretNameForDatabase(user *databasesv1alpha
 }
 
 func (r *DatabaseUserReconciler) getSecretKeys(user *databasesv1alpha1.DatabaseUser) (host, port, db, username, password string) {
-	host, port, db, username, password = "host", "port", "database", "user", "password"
+	host, port, db, username, password = "host", "port", "database", "username", "password"
 
 	if user.Spec.Secret == nil {
 		return
@@ -222,8 +222,8 @@ func (r *DatabaseUserReconciler) applyCustomKeys(k *databasesv1alpha1.SecretKeys
 	if k.Database != "" {
 		outDB = k.Database
 	}
-	if k.User != "" {
-		outUser = k.User
+	if k.Username != "" {
+		outUser = k.Username
 	}
 	if k.Password != "" {
 		outPwd = k.Password

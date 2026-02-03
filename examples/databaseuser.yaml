@@ -128,7 +128,7 @@ spec:
       host: PGHOST
       port: PGPORT
       database: PGDATABASE
-      user: PGUSER
+      username: PGUSER
       password: PGPASSWORD
 ---
 # User with onConflict: Adopt - take over existing secret

@@ -47,7 +47,7 @@ type BackupJobConfig struct {
 
 	// TTLSecondsAfterFailed specifies the TTL for the Job after it fails.
 	// This allows keeping failed jobs longer for debugging.
-	// Defaults to the same value as TTLAfterCompletion (or 1 hour if not set).
+	// Defaults to 12 hours (43200 seconds).
 	// +optional
 	TTLSecondsAfterFailed *int32 `json:"ttlSecondsAfterFailed,omitempty"`
 }

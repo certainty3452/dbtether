@@ -169,7 +169,7 @@ spec:
                         type: string
                       port:
                         type: string
-                      user:
+                      username:
                         type: string
                     type: object
                   name:

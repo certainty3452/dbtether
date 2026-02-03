@@ -198,7 +198,7 @@ func TestDatabaseUserReconciler_GetSecretKeys(t *testing.T) {
 				Spec: databasesv1alpha1.DatabaseUserSpec{},
 			},
 			wantHost: "host", wantPort: "port", wantDB: "database",
-			wantUser: "user", wantPwd: "password",
+			wantUser: "username", wantPwd: "password",
 		},
 		{
 			name: "explicit raw template",
@@ -208,7 +208,7 @@ func TestDatabaseUserReconciler_GetSecretKeys(t *testing.T) {
 				},
 			},
 			wantHost: "host", wantPort: "port", wantDB: "database",
-			wantUser: "user", wantPwd: "password",
+			wantUser: "username", wantPwd: "password",
 		},
 		{
 			name: "empty template defaults to raw",
@@ -218,7 +218,7 @@ func TestDatabaseUserReconciler_GetSecretKeys(t *testing.T) {
 				},
 			},
 			wantHost: "host", wantPort: "port", wantDB: "database",
-			wantUser: "user", wantPwd: "password",
+			wantUser: "username", wantPwd: "password",
 		},
 		{
 			name: "DB template",
@@ -258,7 +258,7 @@ func TestDatabaseUserReconciler_GetSecretKeys(t *testing.T) {
 						Template: "custom",
 						Keys: &databasesv1alpha1.SecretKeys{
 							Host: "PGHOST", Port: "PGPORT", Database: "PGDATABASE",
-							User: "PGUSER", Password: "PGPASSWORD",
+							Username: "PGUSER", Password: "PGPASSWORD",
 						},
 					},
 				},
@@ -277,7 +277,7 @@ func TestDatabaseUserReconciler_GetSecretKeys(t *testing.T) {
 				},
 			},
 			wantHost: "host", wantPort: "port", wantDB: "database",
-			wantUser: "user", wantPwd: "SECRET_PWD",
+			wantUser: "username", wantPwd: "SECRET_PWD",
 		},
 		{
 			name: "custom template with nil keys uses defaults",
@@ -287,7 +287,7 @@ func TestDatabaseUserReconciler_GetSecretKeys(t *testing.T) {
 				},
 			},
 			wantHost: "host", wantPort: "port", wantDB: "database",
-			wantUser: "user", wantPwd: "password",
+			wantUser: "username", wantPwd: "password",
 		},
 	}
 
@@ -2135,7 +2135,7 @@ func TestDatabaseUserReconciler_CreateDatabaseSecret(t *testing.T) {
 							Host:     "PGHOST",
 							Port:     "PGPORT",
 							Database: "PGDATABASE",
-							User:     "PGUSER",
+							Username: "PGUSER",
 							Password: "PGPASSWORD",
 						},
 					},

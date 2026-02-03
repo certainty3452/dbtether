@@ -611,6 +611,14 @@ func (r *BackupReconciler) findJobByLabels(ctx context.Context, backup *database
 	}
 
 	if len(jobs.Items) == 0 {
+		// Job may not be visible yet due to cache propagation right after creation.
+		// If backup was started recently, requeue instead of failing immediately.
+		if backup.Status.StartedAt != nil {
+			age := time.Since(backup.Status.StartedAt.Time)
+			if age < 90*time.Second {
+				return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+			}
+		}
 		return r.updateStatus(ctx, backup, "Failed", "backup job not found", specHash)
 	}
 
@@ -636,6 +644,10 @@ func (r *BackupReconciler) evaluateJobStatus(ctx context.Context, backup *databa
 	}
 
 	if _, failed := r.isJobFailed(job); failed {
+		// Update Job TTL for failed jobs if TTLSecondsAfterFailed is configured
+		if err := r.updateFailedJobTTL(ctx, backup, job); err != nil {
+			log.FromContext(ctx).Error(err, "failed to update TTL for failed job")
+		}
 		failureInfo := r.getJobFailureInfo(job)
 		return r.updateStatusFailedWithInfo(ctx, backup, job, specHash, failureInfo)
 	}
@@ -891,6 +903,35 @@ func (r *BackupReconciler) populateBackupResults(backup *databasesv1alpha1.Backu
 	if duration := job.Annotations["dbtether.io/backup-duration"]; duration != "" {
 		backup.Status.Duration = duration
 	}
+}
+
+// updateFailedJobTTL updates the TTL of a failed job to allow longer retention for debugging
+func (r *BackupReconciler) updateFailedJobTTL(ctx context.Context, backup *databasesv1alpha1.Backup, job *batchv1.Job) error {
+	logger := log.FromContext(ctx)
+
+	// Get TTL for failed jobs (default: 12 hours = 43200 seconds)
+	var ttlAfterFailed int32 = 43200
+	if backup.Spec.JobConfig != nil && backup.Spec.JobConfig.TTLSecondsAfterFailed != nil {
+		ttlAfterFailed = *backup.Spec.JobConfig.TTLSecondsAfterFailed
+	}
+
+	// Check if TTL needs updating
+	currentTTL := job.Spec.TTLSecondsAfterFinished
+	if currentTTL != nil && *currentTTL == ttlAfterFailed {
+		// Already updated, skip
+		return nil
+	}
+
+	logger.Info("updating TTL for failed job", "oldTTL", currentTTL, "newTTL", ttlAfterFailed)
+
+	// Update Job TTL
+	patch := client.MergeFrom(job.DeepCopy())
+	job.Spec.TTLSecondsAfterFinished = &ttlAfterFailed
+	if err := r.Patch(ctx, job, patch); err != nil {
+		return fmt.Errorf("failed to patch job TTL: %w", err)
+	}
+
+	return nil
 }
 
 func (r *BackupReconciler) SetupWithManager(mgr ctrl.Manager) error {

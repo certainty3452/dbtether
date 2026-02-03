@@ -266,7 +266,7 @@ func runRestoreJob() {
 		Host:     getEnvRequired("DB_HOST"),
 		Port:     getEnvInt("DB_PORT", 5432),
 		Database: getEnvRequired("DB_NAME"),
-		User:     getEnvRequired("DB_USER"),
+		Username: getEnvRequired("DB_USER"),
 		Password: getEnvRequired("DB_PASSWORD"),
 		SSLMode:  getEnv("DB_SSLMODE", "require"),
 

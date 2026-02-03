@@ -2,8 +2,8 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.5.4
-appVersion: "0.5.4"
+version: 0.5.5
+appVersion: "0.5.5"
 home: https://github.com/certainty3452/dbtether
 # icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
@@ -157,10 +157,8 @@ annotations:
             name: orders-db-restored
         onConflict: drop
   artifacthub.io/changes: |
-    - kind: changed
-      description: "Streaming backup for constant memory usage"
     - kind: fixed
-      description: "Job watching and pod debugging improvements"
-    - kind: added
-      description: "Configurable resources for backup pods"
+      description: "Race condition causing backup job not found errors"
+    - kind: changed
+      description: "Improved secret key naming consistency (user → username)"
 

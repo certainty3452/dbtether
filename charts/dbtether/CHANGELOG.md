@@ -2,6 +2,15 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.5.5] - 2026-02-03
+
+### Fixed
+- Race condition causing "backup job not found" errors immediately after job creation
+- Added retry logic for recently started backups to allow Kubernetes cache propagation
+
+### Changed
+- Improved secret key naming consistency: default template now uses `username` instead of `user`
+
 ## [0.5.4] - 2026-02-02
 
 ### Changed

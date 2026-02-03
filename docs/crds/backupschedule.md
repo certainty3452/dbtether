@@ -48,7 +48,7 @@ Configure Kubernetes Job parameters inherited by all scheduled Backups. See [Bac
 |-------|------|---------|-------------|
 | `backoffLimit` | int | `3` | Number of retries before marking backup failed (0-10) |
 | `activeDeadlineSeconds` | int | — | Hard timeout for the entire backup (seconds, min 60) |
-| `ttlSecondsAfterFailed` | int | — | Keep failed Job for debugging (seconds) |
+| `ttlSecondsAfterFailed` | int | `43200` (12h) | Keep failed Job for debugging (seconds) |
 
 **Example:**
 

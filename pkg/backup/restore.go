@@ -19,7 +19,7 @@ type RestoreConfig struct {
 	Host     string
 	Port     int
 	Database string
-	User     string
+	Username string
 	Password string
 	SSLMode  string
 
@@ -131,7 +131,7 @@ func dropAndRecreateDatabase(ctx context.Context, cfg *RestoreConfig, logger *sl
 	// Connect to postgres database to drop/create target database
 	connStr := fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=postgres sslmode=%s",
-		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.SSLMode,
+		cfg.Host, cfg.Port, cfg.Username, cfg.Password, cfg.SSLMode,
 	)
 
 	// Drop existing connections
@@ -170,7 +170,7 @@ func dropAndRecreateDatabase(ctx context.Context, cfg *RestoreConfig, logger *sl
 func isDatabaseEmpty(ctx context.Context, cfg *RestoreConfig) (bool, error) {
 	connStr := fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.Database, cfg.SSLMode,
+		cfg.Host, cfg.Port, cfg.Username, cfg.Password, cfg.Database, cfg.SSLMode,
 	)
 
 	// Count tables in public schema
@@ -192,7 +192,7 @@ func restoreWithPsql(ctx context.Context, cfg *RestoreConfig, backupData io.Read
 
 	connStr := fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.Database, cfg.SSLMode,
+		cfg.Host, cfg.Port, cfg.Username, cfg.Password, cfg.Database, cfg.SSLMode,
 	)
 
 	// Decompress if gzipped

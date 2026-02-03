@@ -486,6 +486,84 @@ func TestBackupReconciler_JobFailed(t *testing.T) {
 	if updatedBackup.Status.Phase != "Failed" {
 		t.Errorf(errExpectedPhase, "Failed", updatedBackup.Status.Phase)
 	}
+
+	// Check that Job TTL was updated to default 12 hours for failed jobs
+	var updatedJob batchv1.Job
+	if err := r.Get(context.Background(), types.NamespacedName{Name: testJobName, Namespace: testOperatorNS}, &updatedJob); err != nil {
+		t.Fatalf("Failed to get job: %v", err)
+	}
+	expectedTTL := int32(43200) // 12 hours
+	if updatedJob.Spec.TTLSecondsAfterFinished == nil {
+		t.Error("Job TTL should be set")
+	} else if *updatedJob.Spec.TTLSecondsAfterFinished != expectedTTL {
+		t.Errorf("Expected Job TTL %d (12h), got %d", expectedTTL, *updatedJob.Spec.TTLSecondsAfterFinished)
+	}
+}
+
+// TestBackupReconciler_JobFailedCustomTTL tests that custom TTLSecondsAfterFailed is applied
+func TestBackupReconciler_JobFailedCustomTTL(t *testing.T) {
+	customTTL := int32(86400) // 24 hours
+	backup := newTestBackup(testBackupName, testNamespace)
+	backup.Finalizers = []string{backupFinalizer}
+	backup.Status.JobName = testJobName
+	backup.Status.Phase = "Running"
+	backup.Spec.JobConfig = &databasesv1alpha1.BackupJobConfig{
+		TTLSecondsAfterFailed: &customTTL,
+	}
+
+	backoffLimit := int32(2)
+	oldTTL := int32(3600) // 1 hour
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testJobName,
+			Namespace: testOperatorNS,
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit:            &backoffLimit,
+			TTLSecondsAfterFinished: &oldTTL,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					Containers:    []corev1.Container{{Name: "backup", Image: "test"}},
+				},
+			},
+		},
+		Status: batchv1.JobStatus{
+			Failed: 2,
+			Conditions: []batchv1.JobCondition{
+				{
+					Type:   batchv1.JobFailed,
+					Status: corev1.ConditionTrue,
+					Reason: "DeadlineExceeded",
+				},
+			},
+		},
+	}
+
+	r := newTestReconciler(backup, job)
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      testBackupName,
+			Namespace: testNamespace,
+		},
+	}
+
+	_, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf(errUnexpectedError, err)
+	}
+
+	// Check that Job TTL was updated to custom value
+	var updatedJob batchv1.Job
+	if err := r.Get(context.Background(), types.NamespacedName{Name: testJobName, Namespace: testOperatorNS}, &updatedJob); err != nil {
+		t.Fatalf("Failed to get job: %v", err)
+	}
+	if updatedJob.Spec.TTLSecondsAfterFinished == nil {
+		t.Error("Job TTL should be set")
+	} else if *updatedJob.Spec.TTLSecondsAfterFinished != customTTL {
+		t.Errorf("Expected Job TTL %d (24h), got %d", customTTL, *updatedJob.Spec.TTLSecondsAfterFinished)
+	}
 }
 
 // TestBackupReconciler_Deletion tests finalizer cleanup
@@ -893,6 +971,213 @@ func TestBackupReconciler_DeleteJobNotFound(t *testing.T) {
 	err = r.Get(context.Background(), req.NamespacedName, &updatedBackup)
 	if err == nil && controllerutil.ContainsFinalizer(&updatedBackup, backupFinalizer) {
 		t.Error("finalizer should be removed even if job not found")
+	}
+}
+
+// TestBackupReconciler_JobNotFoundRecentlyStarted tests requeue behavior when job not found for recent backup
+func TestBackupReconciler_JobNotFoundRecentlyStarted(t *testing.T) {
+	// Backup was started 30 seconds ago - should requeue, not fail
+	recentStart := metav1.NewTime(time.Now().Add(-30 * time.Second))
+	backup := newTestBackup(testBackupName, testNamespace)
+	backup.Finalizers = []string{backupFinalizer}
+	backup.Status.Phase = "Running"
+	backup.Status.JobName = testJobName
+	backup.Status.StartedAt = &recentStart
+	backup.Status.SpecHash = "test-hash"
+
+	// No job exists - should requeue, not fail
+	r := newTestReconciler(backup)
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      testBackupName,
+			Namespace: testNamespace,
+		},
+	}
+
+	result, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should requeue after 15 seconds
+	if result.RequeueAfter != 15*time.Second {
+		t.Errorf("expected RequeueAfter=15s, got %v", result.RequeueAfter)
+	}
+
+	// Verify backup is NOT marked as Failed
+	var updatedBackup databasesv1alpha1.Backup
+	if err := r.Get(context.Background(), req.NamespacedName, &updatedBackup); err != nil {
+		t.Fatalf("failed to get backup: %v", err)
+	}
+	if updatedBackup.Status.Phase == "Failed" {
+		t.Errorf("backup should not be marked Failed when recently started, got phase=%s message=%s",
+			updatedBackup.Status.Phase, updatedBackup.Status.Message)
+	}
+}
+
+// TestBackupReconciler_JobNotFoundOldBackup tests failure when job not found for old backup
+func TestBackupReconciler_JobNotFoundOldBackup(t *testing.T) {
+	// Backup was started 2 minutes ago - should fail
+	oldStart := metav1.NewTime(time.Now().Add(-120 * time.Second))
+	backup := newTestBackup(testBackupName, testNamespace)
+	backup.Finalizers = []string{backupFinalizer}
+	backup.Status.Phase = "Running"
+	backup.Status.JobName = testJobName
+	backup.Status.StartedAt = &oldStart
+	backup.Status.SpecHash = "test-hash"
+
+	// No job exists - should fail after 90s threshold
+	r := newTestReconciler(backup)
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      testBackupName,
+			Namespace: testNamespace,
+		},
+	}
+
+	result, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should not requeue
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue for old backup, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	// Verify backup is marked as Failed
+	var updatedBackup databasesv1alpha1.Backup
+	if err := r.Get(context.Background(), req.NamespacedName, &updatedBackup); err != nil {
+		t.Fatalf("failed to get backup: %v", err)
+	}
+	if updatedBackup.Status.Phase != "Failed" {
+		t.Errorf("expected Failed phase, got %s", updatedBackup.Status.Phase)
+	}
+	if updatedBackup.Status.Message != "backup job not found" {
+		t.Errorf("expected 'backup job not found' message, got %s", updatedBackup.Status.Message)
+	}
+}
+
+// TestBackupReconciler_JobNotFoundNoStartedAt tests failure when job not found and no StartedAt
+func TestBackupReconciler_JobNotFoundNoStartedAt(t *testing.T) {
+	// Backup has no StartedAt - should fail immediately
+	backup := newTestBackup(testBackupName, testNamespace)
+	backup.Finalizers = []string{backupFinalizer}
+	backup.Status.Phase = "Running"
+	backup.Status.JobName = testJobName
+	backup.Status.StartedAt = nil // No StartedAt set
+	backup.Status.SpecHash = "test-hash"
+
+	// No job exists - should fail
+	r := newTestReconciler(backup)
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      testBackupName,
+			Namespace: testNamespace,
+		},
+	}
+
+	result, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should not requeue
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue when no StartedAt, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	// Verify backup is marked as Failed
+	var updatedBackup databasesv1alpha1.Backup
+	if err := r.Get(context.Background(), req.NamespacedName, &updatedBackup); err != nil {
+		t.Fatalf("failed to get backup: %v", err)
+	}
+	if updatedBackup.Status.Phase != "Failed" {
+		t.Errorf("expected Failed phase, got %s", updatedBackup.Status.Phase)
+	}
+	if updatedBackup.Status.Message != "backup job not found" {
+		t.Errorf("expected 'backup job not found' message, got %s", updatedBackup.Status.Message)
+	}
+}
+
+// TestBackupReconciler_JobNotFoundBoundaryCase tests boundary at exactly 90 seconds
+func TestBackupReconciler_JobNotFoundBoundaryCase(t *testing.T) {
+	tests := []struct {
+		name            string
+		ageSeconds      int
+		shouldRequeue   bool
+		expectedRequeue time.Duration
+		expectedPhase   string
+	}{
+		{
+			name:            "just under threshold (89s)",
+			ageSeconds:      89,
+			shouldRequeue:   true,
+			expectedRequeue: 15 * time.Second,
+			expectedPhase:   "Running",
+		},
+		{
+			name:            "exactly at threshold (90s)",
+			ageSeconds:      90,
+			shouldRequeue:   false,
+			expectedRequeue: 0,
+			expectedPhase:   "Failed",
+		},
+		{
+			name:            "just over threshold (91s)",
+			ageSeconds:      91,
+			shouldRequeue:   false,
+			expectedRequeue: 0,
+			expectedPhase:   "Failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			startTime := metav1.NewTime(time.Now().Add(-time.Duration(tt.ageSeconds) * time.Second))
+			backup := newTestBackup(testBackupName, testNamespace)
+			backup.Finalizers = []string{backupFinalizer}
+			backup.Status.Phase = "Running"
+			backup.Status.JobName = testJobName
+			backup.Status.StartedAt = &startTime
+			backup.Status.SpecHash = "test-hash"
+
+			r := newTestReconciler(backup)
+
+			req := reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      testBackupName,
+					Namespace: testNamespace,
+				},
+			}
+
+			result, err := r.Reconcile(context.Background(), req)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if result.RequeueAfter != tt.expectedRequeue {
+				t.Errorf("expected RequeueAfter=%v, got %v", tt.expectedRequeue, result.RequeueAfter)
+			}
+
+			var updatedBackup databasesv1alpha1.Backup
+			if err := r.Get(context.Background(), req.NamespacedName, &updatedBackup); err != nil {
+				t.Fatalf("failed to get backup: %v", err)
+			}
+
+			if tt.shouldRequeue {
+				if updatedBackup.Status.Phase == "Failed" {
+					t.Errorf("backup should not be Failed when requeuing, got phase=%s", updatedBackup.Status.Phase)
+				}
+			} else {
+				if updatedBackup.Status.Phase != tt.expectedPhase {
+					t.Errorf("expected phase=%s, got %s", tt.expectedPhase, updatedBackup.Status.Phase)
+				}
+			}
+		})
 	}
 }
 

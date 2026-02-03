@@ -627,7 +627,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 							Host:     "PGHOST",
 							Port:     "PGPORT",
 							Database: "PGDATABASE",
-							User:     "PGUSER",
+							Username: "PGUSER",
 							Password: "PGPASSWORD",
 						},
 					},
@@ -651,7 +651,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 			Expect(createdUser.Spec.Secret.Keys.Host).Should(Equal("PGHOST"))
 			Expect(createdUser.Spec.Secret.Keys.Port).Should(Equal("PGPORT"))
 			Expect(createdUser.Spec.Secret.Keys.Database).Should(Equal("PGDATABASE"))
-			Expect(createdUser.Spec.Secret.Keys.User).Should(Equal("PGUSER"))
+			Expect(createdUser.Spec.Secret.Keys.Username).Should(Equal("PGUSER"))
 			Expect(createdUser.Spec.Secret.Keys.Password).Should(Equal("PGPASSWORD"))
 
 			By(stepCleaningUp)
@@ -1190,7 +1190,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 							Host:     "PGHOST",
 							Port:     "PGPORT",
 							Database: "PGDATABASE",
-							User:     "PGUSER",
+							Username: "PGUSER",
 							Password: "PGPASSWORD",
 						},
 					},

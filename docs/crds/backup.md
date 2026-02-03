@@ -43,7 +43,7 @@ Configure Kubernetes Job parameters for backup execution.
 |-------|------|---------|-------------|
 | `backoffLimit` | int | `3` | Number of retries before marking backup failed (0-10) |
 | `activeDeadlineSeconds` | int | — | Hard timeout for the entire backup (seconds, min 60) |
-| `ttlSecondsAfterFailed` | int | — | Keep failed Job for debugging (seconds) |
+| `ttlSecondsAfterFailed` | int | `43200` (12h) | Keep failed Job for debugging (seconds) |
 
 **Example:**
 
@@ -356,4 +356,3 @@ kubectl get events -n my-team --field-selector involvedObject.name=my-backup
 | Normal | `BackupStarted` | Backup job created |
 | Normal | `BackupCompleted` | Backup finished successfully |
 | Warning | `BackupFailed` | Backup failed (includes reason and message) |
-

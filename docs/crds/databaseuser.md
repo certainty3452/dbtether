@@ -139,7 +139,7 @@ data:
   port: "5432"
   database: airbyte_db         # first database
   databases: airbyte_db,temporal_db,temporal_visibility_db  # informational
-  user: airbyte_service
+  username: airbyte_service
   password: <generated>
 
 # Secret with POSTGRES template (no databases field):
@@ -183,7 +183,7 @@ secret:
     host: PGHOST
     port: PGPORT
     database: PGDATABASE
-    user: PGUSER
+    username: PGUSER
     password: PGPASSWORD
   onConflict: Merge           # Fail, Adopt, Merge
 ```
