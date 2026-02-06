@@ -17,8 +17,10 @@ vendor/
 # IDE
 .idea/
 .vscode/
-.cursor/
 *.swp
+
+# AI assistant rules
+CLAUDE.md
 *.swo
 *~
 

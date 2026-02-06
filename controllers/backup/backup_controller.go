@@ -279,9 +279,10 @@ func (r *BackupReconciler) handleDeletion(ctx context.Context, backup *databases
 		// Continue with finalizer removal - TTL will clean up the job
 	}
 
-	// Remove finalizer
+	// Remove finalizer using Patch to avoid optimistic locking conflicts
+	patch := client.MergeFrom(backup.DeepCopy())
 	controllerutil.RemoveFinalizer(backup, backupFinalizer)
-	if err := r.Update(ctx, backup); err != nil {
+	if err := r.Patch(ctx, backup, patch); err != nil {
 		return ctrl.Result{}, err
 	}
 

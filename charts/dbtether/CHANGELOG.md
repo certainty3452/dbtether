@@ -2,6 +2,13 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.5.6] - 2026-02-06
+
+### Fixed
+- Backup CRD retention now uses full policy (keepDaily/Weekly/Monthly) instead of only keepLast
+- DatabaseUser deletion now gracefully handles cleanup when database is already deleted
+- Optimistic locking conflicts during cascading deletion (all controllers now use Patch instead of Update for finalizer removal)
+
 ## [0.5.5] - 2026-02-03
 
 ### Fixed

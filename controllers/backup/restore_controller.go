@@ -485,8 +485,10 @@ func (r *RestoreReconciler) handleDeletion(ctx context.Context, restore *databas
 		logger.Info("restore deleted, job cleaned up", "job", restore.Status.JobName)
 	}
 
+	// Remove finalizer using Patch to avoid optimistic locking conflicts
+	patch := client.MergeFrom(restore.DeepCopy())
 	controllerutil.RemoveFinalizer(restore, restoreFinalizer)
-	if err := r.Update(ctx, restore); err != nil {
+	if err := r.Patch(ctx, restore, patch); err != nil {
 		return ctrl.Result{}, err
 	}
 

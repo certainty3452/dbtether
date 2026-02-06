@@ -199,8 +199,9 @@ func (r *DatabaseReconciler) handleDeletion(ctx context.Context, db *databasesv1
 		}
 	}
 
+	patch := client.MergeFrom(db.DeepCopy())
 	controllerutil.RemoveFinalizer(db, FinalizerName)
-	return ctrl.Result{}, r.Update(ctx, db)
+	return ctrl.Result{}, r.Patch(ctx, db, patch)
 }
 
 func (r *DatabaseReconciler) dropDatabaseIfPossible(ctx context.Context, db *databasesv1alpha1.Database) error {

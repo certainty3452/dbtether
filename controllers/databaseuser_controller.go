@@ -902,8 +902,9 @@ func (r *DatabaseUserReconciler) handleDeletion(ctx context.Context, user *datab
 		logger.Info("retaining user in PostgreSQL due to deletionPolicy", "username", username)
 	}
 
+	patch := client.MergeFrom(user.DeepCopy())
 	controllerutil.RemoveFinalizer(user, UserFinalizerName)
-	return ctrl.Result{}, r.Update(ctx, user)
+	return ctrl.Result{}, r.Patch(ctx, user, patch)
 }
 
 func (r *DatabaseUserReconciler) dropUserFromPostgres(ctx context.Context, user *databasesv1alpha1.DatabaseUser,

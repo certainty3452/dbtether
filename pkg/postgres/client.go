@@ -2,12 +2,14 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lib/pq"
 )
@@ -363,6 +365,15 @@ func (c *Client) connectToDatabase(ctx context.Context, dbName string) (*pgx.Con
 func IsTransientError(err error) bool {
 	// All connection errors are considered transient for retry purposes
 	return err != nil
+}
+
+// isDatabaseNotExistError checks if error is PostgreSQL "database does not exist" (SQLSTATE 3D000)
+func isDatabaseNotExistError(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "3D000"
+	}
+	return false
 }
 
 // User management methods
@@ -743,6 +754,9 @@ func (c *Client) VerifyDatabaseIsolation(ctx context.Context, username, allowedD
 func (c *Client) RevokePrivilegesInDatabase(ctx context.Context, username, database string) error {
 	conn, err := c.connectToDatabase(ctx, database)
 	if err != nil {
+		if isDatabaseNotExistError(err) {
+			return nil // database already deleted, nothing to revoke
+		}
 		return err
 	}
 	defer func() { _ = conn.Close(ctx) }() // error on close is not actionable
@@ -772,6 +786,9 @@ func (c *Client) RevokePrivilegesInDatabase(ctx context.Context, username, datab
 func (c *Client) ReassignOwnership(ctx context.Context, fromUser, database string) error {
 	conn, err := c.connectToDatabase(ctx, database)
 	if err != nil {
+		if isDatabaseNotExistError(err) {
+			return nil // database already deleted, nothing to reassign
+		}
 		return err
 	}
 	defer func() { _ = conn.Close(ctx) }()

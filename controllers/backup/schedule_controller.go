@@ -566,9 +566,10 @@ func (r *BackupScheduleReconciler) handleDeletion(ctx context.Context, schedule 
 			}
 		}
 
-		// Remove finalizer
+		// Remove finalizer using Patch to avoid optimistic locking conflicts
+		patch := client.MergeFrom(schedule.DeepCopy())
 		controllerutil.RemoveFinalizer(schedule, scheduleFinalizerName)
-		if err := r.Update(ctx, schedule); err != nil {
+		if err := r.Patch(ctx, schedule, patch); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
