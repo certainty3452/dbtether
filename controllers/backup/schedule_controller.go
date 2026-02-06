@@ -332,7 +332,8 @@ func (r *BackupScheduleReconciler) executeRetentionCleanup(ctx context.Context, 
 	}
 }
 
-// cleanupBackupCRDs deletes old Backup CRDs based on retention policy
+// cleanupBackupCRDs deletes old Backup CRDs based on retention policy.
+// Uses the same retention logic as S3 cleanup (keepLast, keepDaily, keepWeekly, keepMonthly).
 func (r *BackupScheduleReconciler) cleanupBackupCRDs(ctx context.Context, schedule *dbtether.BackupSchedule, log *zap.SugaredLogger) {
 	if schedule.Spec.Retention == nil {
 		return
@@ -357,22 +358,21 @@ func (r *BackupScheduleReconciler) cleanupBackupCRDs(ctx context.Context, schedu
 		return backups.Items[i].CreationTimestamp.After(backups.Items[j].CreationTimestamp.Time)
 	})
 
-	// Calculate how many to keep based on keepLast
-	keepCount := 0
-	if schedule.Spec.Retention.KeepLast != nil && *schedule.Spec.Retention.KeepLast > 0 {
-		keepCount = *schedule.Spec.Retention.KeepLast
-	}
+	// Calculate which backups to keep using same logic as S3 retention
+	keepSet := r.calculateBackupKeepSet(backups.Items, schedule.Spec.Retention, time.Now())
 
-	// If no keepLast specified, keep all (only S3 files will be cleaned)
-	if keepCount == 0 {
-		log.Debugw("retention cleanup: keepLast not set, keeping all Backup CRDs")
+	if len(keepSet) == len(backups.Items) {
 		return
 	}
 
-	// Delete CRDs beyond keepLast (only completed ones)
+	// Delete CRDs not in keepSet (only completed ones)
 	deleted := 0
-	for i := keepCount; i < len(backups.Items); i++ {
+	for i := range backups.Items {
 		backup := &backups.Items[i]
+
+		if keepSet[backup.Name] {
+			continue
+		}
 
 		// Only delete completed backups
 		if backup.Status.Phase != "Completed" && backup.Status.Phase != "Failed" {
@@ -396,9 +396,82 @@ func (r *BackupScheduleReconciler) cleanupBackupCRDs(ctx context.Context, schedu
 		log.Infow("retention cleanup: deleted old Backup CRDs",
 			"schedule", schedule.Name,
 			"deleted", deleted,
-			"kept", keepCount,
+			"kept", len(keepSet),
 		)
 	}
+}
+
+// calculateBackupKeepSet determines which Backup CRDs to keep based on retention policy.
+// Mirrors the logic in pkg/backup/retention.go for S3 files.
+//
+//nolint:gocyclo // retention policy logic requires checking multiple conditions
+func (r *BackupScheduleReconciler) calculateBackupKeepSet(
+	backups []dbtether.Backup,
+	policy *dbtether.RetentionPolicy,
+	now time.Time,
+) map[string]bool {
+	keep := make(map[string]bool)
+
+	// keepLast: keep the N most recent backups
+	if policy.KeepLast != nil && *policy.KeepLast > 0 {
+		for i := 0; i < *policy.KeepLast && i < len(backups); i++ {
+			keep[backups[i].Name] = true //nolint:gosec // i is bounded by len(backups)
+		}
+	}
+
+	// keepDaily: keep first backup of each day for N days
+	if policy.KeepDaily != nil && *policy.KeepDaily > 0 {
+		cutoff := now.AddDate(0, 0, -*policy.KeepDaily)
+		seenDays := make(map[string]bool)
+		for i := range backups {
+			ts := backups[i].CreationTimestamp.Time
+			if ts.Before(cutoff) {
+				continue
+			}
+			dayKey := ts.Format("2006-01-02")
+			if !seenDays[dayKey] {
+				seenDays[dayKey] = true
+				keep[backups[i].Name] = true
+			}
+		}
+	}
+
+	// keepWeekly: keep first backup of each week for N weeks
+	if policy.KeepWeekly != nil && *policy.KeepWeekly > 0 {
+		cutoff := now.AddDate(0, 0, -*policy.KeepWeekly*7)
+		seenWeeks := make(map[string]bool)
+		for i := range backups {
+			ts := backups[i].CreationTimestamp.Time
+			if ts.Before(cutoff) {
+				continue
+			}
+			year, week := ts.ISOWeek()
+			weekKey := fmt.Sprintf("%d-W%02d", year, week)
+			if !seenWeeks[weekKey] {
+				seenWeeks[weekKey] = true
+				keep[backups[i].Name] = true
+			}
+		}
+	}
+
+	// keepMonthly: keep first backup of each month for N months
+	if policy.KeepMonthly != nil && *policy.KeepMonthly > 0 {
+		cutoff := now.AddDate(0, -*policy.KeepMonthly, 0)
+		seenMonths := make(map[string]bool)
+		for i := range backups {
+			ts := backups[i].CreationTimestamp.Time
+			if ts.Before(cutoff) {
+				continue
+			}
+			monthKey := ts.Format("2006-01")
+			if !seenMonths[monthKey] {
+				seenMonths[monthKey] = true
+				keep[backups[i].Name] = true
+			}
+		}
+	}
+
+	return keep
 }
 
 // shouldRunRetentionCleanup checks if enough time has passed since last cleanup

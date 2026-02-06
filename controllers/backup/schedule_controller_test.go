@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -803,4 +804,220 @@ func TestBackupWithoutJobConfigFromSchedule(t *testing.T) {
 
 	// JobConfig should remain nil
 	assert.Nil(t, backup.Spec.JobConfig)
+}
+
+func TestCalculateBackupKeepSet_KeepLast(t *testing.T) {
+	r := &BackupScheduleReconciler{}
+	now := time.Date(2026, 2, 6, 12, 0, 0, 0, time.UTC)
+
+	backups := createTestBackups([]time.Time{
+		now.Add(-1 * time.Hour), // backup-0: newest
+		now.Add(-2 * time.Hour), // backup-1
+		now.Add(-3 * time.Hour), // backup-2
+		now.Add(-4 * time.Hour), // backup-3
+		now.Add(-5 * time.Hour), // backup-4: oldest
+	})
+
+	policy := &dbtether.RetentionPolicy{KeepLast: intPtr(3)}
+	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+
+	assert.Len(t, keepSet, 3)
+	assert.True(t, keepSet["backup-0"])
+	assert.True(t, keepSet["backup-1"])
+	assert.True(t, keepSet["backup-2"])
+	assert.False(t, keepSet["backup-3"])
+	assert.False(t, keepSet["backup-4"])
+}
+
+func TestCalculateBackupKeepSet_KeepDaily(t *testing.T) {
+	r := &BackupScheduleReconciler{}
+	now := time.Date(2026, 2, 6, 12, 0, 0, 0, time.UTC)
+
+	backups := createTestBackups([]time.Time{
+		now.Add(-1 * time.Hour),      // backup-0: today (kept)
+		now.Add(-25 * time.Hour),     // backup-1: yesterday (kept)
+		now.Add(-26 * time.Hour),     // backup-2: yesterday (not kept - already have one)
+		now.Add(-49 * time.Hour),     // backup-3: 2 days ago (kept)
+		now.Add(-4 * 24 * time.Hour), // backup-4: 4 days ago (not kept - outside window)
+	})
+
+	policy := &dbtether.RetentionPolicy{KeepDaily: intPtr(3)}
+	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+
+	assert.Len(t, keepSet, 3)
+	assert.True(t, keepSet["backup-0"])  // today
+	assert.True(t, keepSet["backup-1"])  // yesterday (first)
+	assert.False(t, keepSet["backup-2"]) // yesterday (second - not kept)
+	assert.True(t, keepSet["backup-3"])  // 2 days ago
+	assert.False(t, keepSet["backup-4"]) // outside 3-day window
+}
+
+func TestCalculateBackupKeepSet_KeepWeekly(t *testing.T) {
+	r := &BackupScheduleReconciler{}
+	now := time.Date(2026, 2, 6, 12, 0, 0, 0, time.UTC) // Friday
+
+	backups := createTestBackups([]time.Time{
+		now.Add(-1 * time.Hour),       // backup-0: this week (kept)
+		now.Add(-2 * 24 * time.Hour),  // backup-1: this week (not kept - already have one)
+		now.Add(-8 * 24 * time.Hour),  // backup-2: last week (kept)
+		now.Add(-15 * 24 * time.Hour), // backup-3: outside 2-week window (14 days)
+		now.Add(-22 * 24 * time.Hour), // backup-4: outside window
+	})
+
+	policy := &dbtether.RetentionPolicy{KeepWeekly: intPtr(2)}
+	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+
+	// keepWeekly=2 means 14 days window, so only this week and last week are kept
+	assert.Len(t, keepSet, 2)
+	assert.True(t, keepSet["backup-0"])  // this week (first)
+	assert.False(t, keepSet["backup-1"]) // this week (second)
+	assert.True(t, keepSet["backup-2"])  // last week
+	assert.False(t, keepSet["backup-3"]) // outside 14-day window
+	assert.False(t, keepSet["backup-4"]) // outside window
+}
+
+func TestCalculateBackupKeepSet_KeepMonthly(t *testing.T) {
+	r := &BackupScheduleReconciler{}
+	now := time.Date(2026, 2, 6, 12, 0, 0, 0, time.UTC)
+
+	backups := createTestBackups([]time.Time{
+		now.Add(-1 * time.Hour),                        // backup-0: Feb (kept)
+		now.Add(-10 * 24 * time.Hour),                  // backup-1: Jan (kept)
+		time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC),  // backup-2: Jan (not kept)
+		time.Date(2025, 12, 15, 12, 0, 0, 0, time.UTC), // backup-3: Dec (not kept - outside window)
+	})
+
+	policy := &dbtether.RetentionPolicy{KeepMonthly: intPtr(1)}
+	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+
+	assert.Len(t, keepSet, 2)
+	assert.True(t, keepSet["backup-0"])  // Feb (first)
+	assert.True(t, keepSet["backup-1"])  // Jan (first)
+	assert.False(t, keepSet["backup-2"]) // Jan (second)
+	assert.False(t, keepSet["backup-3"]) // outside 1-month window
+}
+
+func TestCalculateBackupKeepSet_CombinedPolicies(t *testing.T) {
+	r := &BackupScheduleReconciler{}
+	now := time.Date(2026, 2, 6, 12, 0, 0, 0, time.UTC)
+
+	backups := createTestBackups([]time.Time{
+		now.Add(-1 * time.Hour),        // backup-0: newest
+		now.Add(-25 * time.Hour),       // backup-1: yesterday
+		now.Add(-8 * 24 * time.Hour),   // backup-2: last week
+		now.Add(-40 * 24 * time.Hour),  // backup-3: last month
+		now.Add(-100 * 24 * time.Hour), // backup-4: old
+	})
+
+	// keepDaily=1, keepWeekly=1, keepMonthly=1
+	policy := &dbtether.RetentionPolicy{
+		KeepDaily:   intPtr(1),
+		KeepWeekly:  intPtr(1),
+		KeepMonthly: intPtr(1),
+	}
+	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+
+	// Should keep: backup-0 (today/this week/this month), backup-3 (last month)
+	assert.True(t, keepSet["backup-0"])
+	assert.False(t, keepSet["backup-4"]) // too old
+}
+
+func TestCalculateBackupKeepSet_EmptyPolicy(t *testing.T) {
+	r := &BackupScheduleReconciler{}
+	now := time.Date(2026, 2, 6, 12, 0, 0, 0, time.UTC)
+
+	backups := createTestBackups([]time.Time{
+		now.Add(-1 * time.Hour),
+		now.Add(-2 * time.Hour),
+	})
+
+	policy := &dbtether.RetentionPolicy{}
+	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+
+	assert.Len(t, keepSet, 0)
+}
+
+func TestCalculateBackupKeepSet_NilValues(t *testing.T) {
+	r := &BackupScheduleReconciler{}
+	now := time.Date(2026, 2, 6, 12, 0, 0, 0, time.UTC)
+
+	backups := createTestBackups([]time.Time{
+		now.Add(-1 * time.Hour),
+	})
+
+	// All nil values
+	policy := &dbtether.RetentionPolicy{
+		KeepLast:    nil,
+		KeepDaily:   nil,
+		KeepWeekly:  nil,
+		KeepMonthly: nil,
+	}
+	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+
+	assert.Len(t, keepSet, 0)
+}
+
+func TestCalculateBackupKeepSet_ZeroValues(t *testing.T) {
+	r := &BackupScheduleReconciler{}
+	now := time.Date(2026, 2, 6, 12, 0, 0, 0, time.UTC)
+
+	backups := createTestBackups([]time.Time{
+		now.Add(-1 * time.Hour),
+	})
+
+	// Zero values should be treated as "not set"
+	zero := 0
+	policy := &dbtether.RetentionPolicy{
+		KeepLast:    &zero,
+		KeepDaily:   &zero,
+		KeepWeekly:  &zero,
+		KeepMonthly: &zero,
+	}
+	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+
+	assert.Len(t, keepSet, 0)
+}
+
+func TestCalculateBackupKeepSet_EmptyBackupsList(t *testing.T) {
+	r := &BackupScheduleReconciler{}
+	now := time.Date(2026, 2, 6, 12, 0, 0, 0, time.UTC)
+
+	backups := []dbtether.Backup{}
+	policy := &dbtether.RetentionPolicy{KeepLast: intPtr(5)}
+	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+
+	assert.Len(t, keepSet, 0)
+}
+
+func TestCalculateBackupKeepSet_KeepLastMoreThanTotal(t *testing.T) {
+	r := &BackupScheduleReconciler{}
+	now := time.Date(2026, 2, 6, 12, 0, 0, 0, time.UTC)
+
+	backups := createTestBackups([]time.Time{
+		now.Add(-1 * time.Hour),
+		now.Add(-2 * time.Hour),
+	})
+
+	// keepLast=10 but only 2 backups exist
+	policy := &dbtether.RetentionPolicy{KeepLast: intPtr(10)}
+	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+
+	assert.Len(t, keepSet, 2)
+	assert.True(t, keepSet["backup-0"])
+	assert.True(t, keepSet["backup-1"])
+}
+
+func createTestBackups(timestamps []time.Time) []dbtether.Backup {
+	backups := make([]dbtether.Backup, len(timestamps))
+	for i, ts := range timestamps {
+		backups[i] = dbtether.Backup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              fmt.Sprintf("backup-%d", i),
+				Namespace:         "default",
+				CreationTimestamp: metav1.NewTime(ts),
+			},
+			Status: dbtether.BackupStatus{Phase: "Completed"},
+		}
+	}
+	return backups
 }
