@@ -169,7 +169,7 @@ func (r *BackupScheduleReconciler) scheduleNextRun(
 
 	// Deep copy schedule for goroutine to avoid race condition
 	scheduleCopy := schedule.DeepCopy()
-	go r.runRetentionCleanup(context.Background(), scheduleCopy, log)
+	go r.runRetentionCleanup(context.Background(), scheduleCopy, log) //nolint:gosec // intentional: goroutine outlives request ctx
 
 	nextRunMeta := metav1.NewTime(nextRun)
 	return r.updateStatusWithRequeue(ctx, schedule, "Active", "", nil, &nextRunMeta, requeueAfter)
