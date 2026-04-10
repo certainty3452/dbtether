@@ -13,7 +13,7 @@ const (
 	lowerChars   = "abcdefghijklmnopqrstuvwxyz"
 	upperChars   = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	digitChars   = "0123456789"
-	specialChars = "._-,^"
+	specialChars = "._-"
 
 	minLower   = 3
 	minUpper   = 3

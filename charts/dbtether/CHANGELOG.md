@@ -2,6 +2,14 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.5.7] - 2026-04-10
+
+### Added
+- New `dsn` secret template — generates a single `dsn` key with full PostgreSQL connection string
+
+### Fixed
+- Password generation now uses only URL-safe special characters (`._-`)
+
 ## [0.5.6] - 2026-02-06
 
 ### Fixed

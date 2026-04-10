@@ -578,12 +578,22 @@ func (r *DatabaseUserReconciler) createPrimarySecret(ctx context.Context, user *
 		primaryDB = r.getDatabaseNameFromSpec(databases[0])
 	}
 
-	secretData := map[string]string{
-		hostKey: cluster.Spec.Endpoint,
-		portKey: fmt.Sprintf("%d", cluster.Spec.Port),
-		dbKey:   primaryDB,
-		userKey: username,
-		pwdKey:  password,
+	var secretData map[string]string
+
+	// DSN template produces a single key with the full connection string
+	if user.Spec.Secret != nil && user.Spec.Secret.Template == "dsn" {
+		secretData = map[string]string{
+			"dsn": fmt.Sprintf("postgres://%s:%s@%s:%d/%s",
+				username, password, cluster.Spec.Endpoint, cluster.Spec.Port, primaryDB),
+		}
+	} else {
+		secretData = map[string]string{
+			hostKey: cluster.Spec.Endpoint,
+			portKey: fmt.Sprintf("%d", cluster.Spec.Port),
+			dbKey:   primaryDB,
+			userKey: username,
+			pwdKey:  password,
+		}
 	}
 
 	// Add databases list only for raw template with multiple databases

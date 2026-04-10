@@ -289,6 +289,16 @@ func TestDatabaseUserReconciler_GetSecretKeys(t *testing.T) {
 			wantHost: "host", wantPort: "port", wantDB: "database",
 			wantUser: "username", wantPwd: "password",
 		},
+		{
+			name: "dsn template uses default keys",
+			user: &databasesv1alpha1.DatabaseUser{
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Secret: &databasesv1alpha1.SecretConfig{Template: "dsn"},
+				},
+			},
+			wantHost: "host", wantPort: "port", wantDB: "database",
+			wantUser: "username", wantPwd: "password",
+		},
 	}
 
 	for _, tt := range tests {

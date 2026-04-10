@@ -2,8 +2,8 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.5.6
-appVersion: "0.5.6"
+version: 0.5.7
+appVersion: "0.5.7"
 home: https://github.com/certainty3452/dbtether
 # icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
@@ -157,10 +157,8 @@ annotations:
             name: orders-db-restored
         onConflict: drop
   artifacthub.io/changes: |
+    - kind: added
+      description: "New `dsn` secret template for DatabaseUser — generates a single `dsn` key with full PostgreSQL connection string"
     - kind: fixed
-      description: "Backup CRD retention now uses full policy (keepDaily/Weekly/Monthly)"
-    - kind: fixed
-      description: "DatabaseUser deletion gracefully handles cleanup when database is already deleted"
-    - kind: fixed
-      description: "Optimistic locking conflicts during cascading deletion"
+      description: "Password generation now uses only URL-safe special characters (._-)"
 

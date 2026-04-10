@@ -178,7 +178,7 @@ Secret configuration for customizing the generated credentials:
 ```yaml
 secret:
   name: my-custom-secret      # Custom secret name (default: {name}-credentials)
-  template: DATABASE          # Key format: raw, DB, DATABASE, POSTGRES, custom
+  template: DATABASE          # Key format: raw, DB, DATABASE, POSTGRES, custom, dsn
   keys:                       # Custom key names (only when template: custom)
     host: PGHOST
     port: PGPORT
@@ -197,6 +197,9 @@ secret:
 | `DATABASE` | `DATABASE_HOST` | `DATABASE_PORT` | `DATABASE_NAME` | `DATABASE_USER` | `DATABASE_PASSWORD` |
 | `POSTGRES` | `POSTGRES_HOST` | `POSTGRES_PORT` | `POSTGRES_DATABASE` | `POSTGRES_USER` | `POSTGRES_PASSWORD` |
 | `custom` | custom | custom | custom | custom | custom |
+| `dsn` | — | — | — | — | — |
+
+The `dsn` template produces a single key `dsn` with a full PostgreSQL connection string: `postgres://user:password@host:port/database`. Useful for applications like ORY Hydra that expect a DSN.
 
 **Note:** The `databases` field (comma-separated list of all databases) is only added when:
 - `secretGeneration` is `primary` (default)

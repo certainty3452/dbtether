@@ -1215,6 +1215,40 @@ var _ = Describe("DatabaseUser Controller", func() {
 			By(stepCleaningUp)
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
 		})
+
+		It("Should accept dsn template", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-dsn-template",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{
+						Name: databaseName,
+					},
+					Privileges: "readonly",
+					Secret: &databasesv1alpha1.SecretConfig{
+						Template: "dsn",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Verifying dsn template is stored")
+			createdUser := &databasesv1alpha1.DatabaseUser{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-dsn-template",
+					Namespace: namespace,
+				}, createdUser)
+			}, timeout, interval).Should(Succeed())
+
+			Expect(createdUser.Spec.Secret.Template).Should(Equal("dsn"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
 	})
 
 	Context("When user has cross-namespace database reference", func() {

@@ -191,7 +191,7 @@ See full documentation in [docs/](docs/README.md):
 - `spec.password.length` - Password length (default 16, range 12-64)
 - `spec.secretGeneration` - `primary` (default) or `perDatabase`
 - `spec.secret.name` - Custom secret name (default: `{name}-credentials`)
-- `spec.secret.template` - Key format: `raw` (default), `DB`, `DATABASE`, `POSTGRES`, `custom`
+- `spec.secret.template` - Key format: `raw` (default), `DB`, `DATABASE`, `POSTGRES`, `custom`, `dsn`
 - `spec.secret.onConflict` - If secret exists: `Fail` (default), `Adopt`, `Merge`
 
 **BackupStorage:**

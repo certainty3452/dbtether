@@ -124,7 +124,7 @@ type SecretConfig struct {
 	Name string `json:"name,omitempty"`
 
 	// +optional
-	// +kubebuilder:validation:Enum=raw;DB;DATABASE;POSTGRES;custom
+	// +kubebuilder:validation:Enum=raw;DB;DATABASE;POSTGRES;custom;dsn
 	// +kubebuilder:default=raw
 	Template string `json:"template,omitempty"`
 
