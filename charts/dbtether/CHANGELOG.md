@@ -2,6 +2,11 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.5.8] - 2026-04-24
+
+### Fixed
+- Retention cleanup no longer deletes manually-created backups with non-standard naming
+
 ## [0.5.7] - 2026-04-10
 
 ### Added

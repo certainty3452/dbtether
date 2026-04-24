@@ -369,7 +369,7 @@ func TestApplyRetention_WithMockClient(t *testing.T) {
 
 	// Apply retention: keep last 2
 	policy := &dbtether.RetentionPolicy{KeepLast: intPtr(2)}
-	toDelete, err := rm.ApplyRetention(ctx, mockClient, "cluster/db/", policy)
+	toDelete, err := rm.ApplyRetention(ctx, mockClient, "cluster/db/", policy, nil)
 
 	require.NoError(t, err)
 	assert.Len(t, toDelete, 3, "should mark 3 files for deletion")
@@ -396,7 +396,7 @@ func TestApplyRetention_EmptyStorage(t *testing.T) {
 	mockClient := storage.NewMockClient()
 	policy := &dbtether.RetentionPolicy{KeepLast: intPtr(5)}
 
-	toDelete, err := rm.ApplyRetention(ctx, mockClient, "prefix/", policy)
+	toDelete, err := rm.ApplyRetention(ctx, mockClient, "prefix/", policy, nil)
 
 	require.NoError(t, err)
 	assert.Empty(t, toDelete)
@@ -410,7 +410,7 @@ func TestApplyRetention_NilPolicy(t *testing.T) {
 	mockClient := storage.NewMockClient()
 	mockClient.AddObject("cluster/db/20260120-140000.sql.gz", []byte("data"), time.Now())
 
-	toDelete, err := rm.ApplyRetention(ctx, mockClient, "cluster/db/", nil)
+	toDelete, err := rm.ApplyRetention(ctx, mockClient, "cluster/db/", nil, nil)
 
 	require.NoError(t, err)
 	assert.Empty(t, toDelete)
@@ -426,7 +426,7 @@ func TestApplyRetention_ListError(t *testing.T) {
 	mockClient.ListError = fmt.Errorf("S3 unavailable")
 
 	policy := &dbtether.RetentionPolicy{KeepLast: intPtr(2)}
-	_, err := rm.ApplyRetention(ctx, mockClient, "prefix/", policy)
+	_, err := rm.ApplyRetention(ctx, mockClient, "prefix/", policy, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to list backup files")
@@ -463,7 +463,7 @@ func TestApplyRetention_FallbackToLastModified(t *testing.T) {
 	mockClient.AddObject("cluster/db/old.sql.gz", []byte("oldest"), now.Add(-3*time.Hour))
 
 	policy := &dbtether.RetentionPolicy{KeepLast: intPtr(2)}
-	toDelete, err := rm.ApplyRetention(ctx, mockClient, "cluster/db/", policy)
+	toDelete, err := rm.ApplyRetention(ctx, mockClient, "cluster/db/", policy, nil)
 
 	require.NoError(t, err)
 	assert.Len(t, toDelete, 1, "should mark 1 file for deletion using LastModified fallback")
@@ -561,4 +561,136 @@ func TestMockClient_Clear(t *testing.T) {
 	mockClient.Clear()
 
 	assert.Equal(t, 0, mockClient.Count())
+}
+
+func TestFilenameTemplateToRegex(t *testing.T) {
+	tests := []struct {
+		name     string
+		template string
+		match    []string
+		noMatch  []string
+	}{
+		{
+			name:     "default template",
+			template: "{{ .Timestamp }}.sql.gz",
+			match: []string{
+				"cluster/db/20260424-030101.sql.gz",
+				"microservices/ingestion_dev/20260331-030202.sql.gz",
+			},
+			noMatch: []string{
+				"cluster/db/pre-migration-uploaded-by-20260422-120000-abc12345.sql.gz",
+				"cluster/db/manual-backup.sql.gz",
+			},
+		},
+		{
+			name:     "template with runID",
+			template: "{{ .Timestamp }}-{{ .RunID }}.sql.gz",
+			match: []string{
+				"cluster/db/20260424-030101-abc12345.sql.gz",
+			},
+			noMatch: []string{
+				"cluster/db/20260424-030101.sql.gz",
+				"cluster/db/pre-migration-20260424-030101-abc12345.sql.gz",
+			},
+		},
+		{
+			name:     "custom prefix template",
+			template: "pre-migration-uploaded-by-{{ .Timestamp }}-{{ .RunID }}.sql.gz",
+			match: []string{
+				"cluster/db/pre-migration-uploaded-by-20260422-120000-abc12345.sql.gz",
+			},
+			noMatch: []string{
+				"cluster/db/20260424-030101.sql.gz",
+			},
+		},
+		{
+			name:     "template with database name",
+			template: "{{ .DatabaseName }}-{{ .Timestamp }}.sql.gz",
+			match: []string{
+				"cluster/db/ingestion_dev-20260424-030101.sql.gz",
+			},
+			noMatch: []string{
+				"cluster/db/20260424-030101.sql.gz",
+			},
+		},
+		{
+			name:     "empty template returns nil",
+			template: "",
+			match:    nil,
+			noMatch:  nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			re, err := FilenameTemplateToRegex(tt.template)
+			if tt.template == "" {
+				assert.NoError(t, err)
+				assert.Nil(t, re)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, re)
+
+			for _, s := range tt.match {
+				assert.True(t, re.MatchString(s), "expected %q to match pattern %q", s, re.String())
+			}
+			for _, s := range tt.noMatch {
+				assert.False(t, re.MatchString(s), "expected %q NOT to match pattern %q", s, re.String())
+			}
+		})
+	}
+}
+
+func TestApplyRetention_FilenameFilter(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	rm := NewRetentionManager(logger.Sugar())
+	ctx := context.Background()
+
+	mockClient := storage.NewMockClient()
+
+	now := time.Now()
+	// Scheduled backups (match default template)
+	mockClient.AddObject("cluster/db/20260424-030101.sql.gz", []byte("newest"), now.Add(-1*time.Hour))
+	mockClient.AddObject("cluster/db/20260419-030050.sql.gz", []byte("older"), now.Add(-5*24*time.Hour))
+	mockClient.AddObject("cluster/db/20260331-030202.sql.gz", []byte("oldest"), now.Add(-24*24*time.Hour))
+	// Manual backup (different naming — should NOT be touched)
+	mockClient.AddObject("cluster/db/pre-migration-uploaded-by-20260422-120000-abc12345.sql.gz", []byte("manual"), now.Add(-2*24*time.Hour))
+
+	filter, err := FilenameTemplateToRegex("{{ .Timestamp }}.sql.gz")
+	require.NoError(t, err)
+
+	// keepLast=1: only keep 1 scheduled backup, but manual backup must survive
+	policy := &dbtether.RetentionPolicy{KeepLast: intPtr(1)}
+	toDelete, err := rm.ApplyRetention(ctx, mockClient, "cluster/db/", policy, filter)
+
+	require.NoError(t, err)
+	assert.Len(t, toDelete, 2, "should delete 2 old scheduled backups")
+
+	// Verify manual backup is NOT in the delete list
+	for _, key := range toDelete {
+		assert.NotContains(t, key, "pre-migration", "manual backup must not be deleted")
+	}
+
+	// Verify the newest scheduled backup is kept
+	assert.NotContains(t, toDelete, "cluster/db/20260424-030101.sql.gz")
+}
+
+func TestApplyRetention_NilFilterDeletesAll(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	rm := NewRetentionManager(logger.Sugar())
+	ctx := context.Background()
+
+	mockClient := storage.NewMockClient()
+
+	now := time.Now()
+	mockClient.AddObject("cluster/db/20260424-030101.sql.gz", []byte("scheduled"), now.Add(-1*time.Hour))
+	mockClient.AddObject("cluster/db/pre-migration-20260422-120000-abc12345.sql.gz", []byte("manual"), now.Add(-2*24*time.Hour))
+
+	// Without filter, both files are subject to retention
+	policy := &dbtether.RetentionPolicy{KeepLast: intPtr(1)}
+	toDelete, err := rm.ApplyRetention(ctx, mockClient, "cluster/db/", policy, nil)
+
+	require.NoError(t, err)
+	assert.Len(t, toDelete, 1, "without filter, manual backup is also subject to retention")
 }

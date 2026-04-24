@@ -314,9 +314,16 @@ func (r *BackupScheduleReconciler) prepareRetentionCleanup(ctx context.Context, 
 }
 
 // executeRetentionCleanup applies retention policy and deletes old S3 files.
+// Only files matching the schedule's filenameTemplate are considered;
+// manually-created backups with different naming are left untouched.
 func (r *BackupScheduleReconciler) executeRetentionCleanup(ctx context.Context, s3Client *storage.S3Client, prefix string, schedule *dbtether.BackupSchedule, log *zap.SugaredLogger) {
+	filenameFilter, err := pkgbackup.FilenameTemplateToRegex(schedule.Spec.FilenameTemplate)
+	if err != nil {
+		log.Warnw("retention cleanup: failed to build filename filter, proceeding without filter", "error", err)
+	}
+
 	retentionManager := pkgbackup.NewRetentionManager(log)
-	toDelete, err := retentionManager.ApplyRetention(ctx, s3Client, prefix, schedule.Spec.Retention)
+	toDelete, err := retentionManager.ApplyRetention(ctx, s3Client, prefix, schedule.Spec.Retention, filenameFilter)
 	if err != nil {
 		log.Warnw("retention cleanup: failed to apply retention policy", "error", err)
 		return

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -40,19 +41,22 @@ func (m *RetentionManager) now() time.Time {
 	return time.Now()
 }
 
-// ApplyRetention applies retention policy and returns files to delete
+// ApplyRetention applies retention policy and returns files to delete.
+// If filenameFilter is non-nil, only files whose key matches the pattern are
+// considered for retention; all other files are left untouched.
 func (m *RetentionManager) ApplyRetention(
 	ctx context.Context,
 	storageClient storage.StorageClient,
 	prefix string,
 	policy *dbtether.RetentionPolicy,
+	filenameFilter *regexp.Regexp,
 ) ([]string, error) {
 	if policy == nil {
 		return nil, nil
 	}
 
-	// List all backup files
-	files, err := m.listBackupFiles(ctx, storageClient, prefix)
+	// List backup files, optionally filtered by filename pattern
+	files, err := m.listBackupFiles(ctx, storageClient, prefix, filenameFilter)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list backup files: %w", err)
 	}
@@ -99,7 +103,7 @@ func (m *RetentionManager) DeleteFiles(ctx context.Context, storageClient storag
 	return nil
 }
 
-func (m *RetentionManager) listBackupFiles(ctx context.Context, storageClient storage.StorageClient, prefix string) ([]BackupFile, error) {
+func (m *RetentionManager) listBackupFiles(ctx context.Context, storageClient storage.StorageClient, prefix string, filenameFilter *regexp.Regexp) ([]BackupFile, error) {
 	objects, err := storageClient.List(ctx, prefix)
 	if err != nil {
 		return nil, err
@@ -107,6 +111,12 @@ func (m *RetentionManager) listBackupFiles(ctx context.Context, storageClient st
 
 	files := make([]BackupFile, 0, len(objects))
 	for _, obj := range objects {
+		// Skip files that don't match the schedule's filename pattern
+		if filenameFilter != nil && !filenameFilter.MatchString(obj.Key) {
+			m.Log.Debugw("skipping file not matching schedule pattern", "key", obj.Key)
+			continue
+		}
+
 		// Try to parse timestamp from filename first
 		timestamp, err := parseTimestampFromKey(obj.Key)
 		if err != nil {
@@ -210,6 +220,41 @@ func (m *RetentionManager) applyKeepMonthly(files []BackupFile, policy *dbtether
 			keep[f.Key] = true
 		}
 	}
+}
+
+// FilenameTemplateToRegex converts a Go template filename pattern (e.g. "{{ .Timestamp }}.sql.gz")
+// into a regexp that matches files produced by that template.
+// Files not matching the returned pattern are excluded from retention cleanup,
+// protecting manually-created backups that use a different naming convention.
+func FilenameTemplateToRegex(tmpl string) (*regexp.Regexp, error) {
+	if tmpl == "" {
+		return nil, nil
+	}
+
+	// Replace known template variables with regex equivalents
+	replacements := map[string]string{
+		"{{ .Timestamp }}":    `\d{8}-\d{6}`,
+		"{{.Timestamp}}":      `\d{8}-\d{6}`,
+		"{{ .RunID }}":        `[a-z0-9]{8}`,
+		"{{.RunID}}":          `[a-z0-9]{8}`,
+		"{{ .DatabaseName }}": `[^/]+`,
+		"{{.DatabaseName}}":   `[^/]+`,
+		"{{ .ClusterName }}":  `[^/]+`,
+		"{{.ClusterName}}":    `[^/]+`,
+		"{{ .Year }}":         `\d{4}`,
+		"{{.Year}}":           `\d{4}`,
+		"{{ .Month }}":        `\d{2}`,
+		"{{.Month}}":          `\d{2}`,
+		"{{ .Day }}":          `\d{2}`,
+		"{{.Day}}":            `\d{2}`,
+	}
+
+	pattern := regexp.QuoteMeta(tmpl)
+	for tmplVar, regex := range replacements {
+		pattern = strings.ReplaceAll(pattern, regexp.QuoteMeta(tmplVar), regex)
+	}
+
+	return regexp.Compile("(?:^|/)" + pattern + "$")
 }
 
 // parseTimestampFromKey extracts timestamp from backup filename
