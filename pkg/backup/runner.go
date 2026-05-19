@@ -124,6 +124,11 @@ func runStreamingBackup(ctx context.Context, cfg *BackupConfig, fullPath string,
 	gzipReader := newGzipStreamReader(pr, &compressedSize)
 	uploadErr := uploadToStorage(ctx, cfg, fullPath, gzipReader, tags)
 
+	// Unblocks pg_dump goroutine if upload aborted mid-stream — otherwise it hangs.
+	if uploadErr != nil {
+		_ = pr.CloseWithError(uploadErr)
+	}
+
 	wg.Wait()
 
 	if pgDumpErr != nil {
@@ -168,29 +173,34 @@ func runPgDumpToWriter(ctx context.Context, cfg *BackupConfig, pw *io.PipeWriter
 }
 
 func uploadToStorage(ctx context.Context, cfg *BackupConfig, path string, data io.Reader, tags *storage.ObjectTags) error {
-	switch cfg.StorageType {
-	case "s3":
+	// S3 uses multipart Uploader (UploadStreaming); GCS/Azure unify through
+	// UploadWithTags. Both go through the shared StorageClient factory.
+	if cfg.StorageType == "s3" {
 		client, err := storage.NewS3Client(ctx, &cfg.S3Config, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create S3 client: %w", err)
 		}
 		return client.UploadStreaming(ctx, path, data, tags)
+	}
+
+	var gcs *storage.GCSConfig
+	var az *storage.AzureConfig
+	switch cfg.StorageType {
 	case "gcs":
-		client, err := storage.NewGCSClient(ctx, &cfg.GCSConfig, nil)
-		if err != nil {
-			return fmt.Errorf("failed to create GCS client: %w", err)
-		}
-		defer func() { _ = client.Close() }()
-		return client.UploadWithTags(ctx, path, data, tags)
+		gcs = &cfg.GCSConfig
 	case "azure":
-		client, err := storage.NewAzureClient(ctx, &cfg.AzureConfig, nil)
-		if err != nil {
-			return fmt.Errorf("failed to create Azure client: %w", err)
-		}
-		return client.UploadStreaming(ctx, path, data, tags)
+		az = &cfg.AzureConfig
 	default:
 		return fmt.Errorf("unsupported storage type: %s", cfg.StorageType)
 	}
+	client, err := storage.NewClient(ctx, nil, gcs, az, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create storage client: %w", err)
+	}
+	if closer, ok := client.(io.Closer); ok {
+		defer func() { _ = closer.Close() }()
+	}
+	return client.UploadWithTags(ctx, path, data, tags)
 }
 
 type countingWriter struct {

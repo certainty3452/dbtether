@@ -125,10 +125,7 @@ func downloadBackup(ctx context.Context, cfg *RestoreConfig, logger *slog.Logger
 	}
 }
 
-// Password and sslmode go through libpq env vars only. argv is world-readable
-// via /proc/<pid>/cmdline; --set=sslmode= only sets a psql script variable,
-// not the libpq connection parameter (connection happens before the variable
-// is visible, so SSL would silently fall back to libpq default = prefer).
+// argv is world-readable via /proc; sslmode/password must go through libpq env.
 func psqlArgs(cfg *RestoreConfig, dbName string) []string {
 	return []string{
 		"-h", cfg.Host,
@@ -231,8 +228,7 @@ func restoreWithPsql(ctx context.Context, cfg *RestoreConfig, backupData io.Read
 	return nil
 }
 
-// Local copies so the backup-job binary doesn't pull lib/pq just for two
-// quoters. Keep behaviour identical to pq.QuoteIdentifier / pq.QuoteLiteral.
+// Local copies — backup-job binary doesn't need to pull lib/pq just for two quoters.
 func quoteIdentifier(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }

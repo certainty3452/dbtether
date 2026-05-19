@@ -2,8 +2,8 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.6.0
-appVersion: "0.6.0"
+version: 0.6.1
+appVersion: "0.6.1"
 home: https://github.com/certainty3452/dbtether
 # icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
@@ -158,10 +158,9 @@ annotations:
             name: orders-db-restored
         onConflict: drop
   artifacthub.io/changes: |
-    - kind: added
-      description: "DatabaseUser supports idleInTransactionTimeout to abort hanging transactions per role"
+    - kind: changed
+      description: "ConnectionLimit read-before-write; backup/restore Jobs inherit operator's DB_SSLMODE"
+    - kind: fixed
+      description: "Retention now applies to GCS and Azure backups (was S3-only); BackupSchedule finalizer error swallowed; backup goroutine leak on upload abort"
     - kind: security
-      description: "additionalGrants.privileges is now allowlist-validated to prevent SQL composition from CR input"
-    - kind: security
-      description: "Restore drops password from psql argv and quotes database name in connection-termination SQL"
-
+      description: "additionalGrants.tables restricted to PG identifier pattern; connectionLimit=0 rejected at admission"

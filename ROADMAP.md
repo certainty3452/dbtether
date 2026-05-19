@@ -18,12 +18,6 @@ This document outlines planned features and improvements for the dbtether operat
 - [ ] **Periodic drift detection** for Database/DatabaseUser
   - Detect if resources were deleted externally and update status
 
-## Access Control & Security
-
-### Restore SSL configurability
-
-- [ ] **Per-cluster SSL mode for restore jobs** — `restore_controller.go` does not propagate `DB_SSLMODE` into the job env, so the backup-job binary falls back to the operator's compile-time default (`require`). Surface it via DBCluster or Restore spec so different clusters can carry different SSL postures.
-
 ### Namespace Isolation (recommended)
 
 - [ ] `spec.allowedNamespaces` on DBCluster — explicit list of namespaces that can reference this cluster

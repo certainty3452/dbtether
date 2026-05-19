@@ -270,8 +270,9 @@ func (r *DatabaseUserReconciler) ensureFinalizer(ctx context.Context, user *data
 	if controllerutil.ContainsFinalizer(user, UserFinalizerName) {
 		return nil, nil
 	}
+	patch := client.MergeFrom(user.DeepCopy())
 	controllerutil.AddFinalizer(user, UserFinalizerName)
-	if err := r.Update(ctx, user); err != nil {
+	if err := r.Patch(ctx, user, patch); err != nil {
 		return &ctrl.Result{}, err
 	}
 	return &ctrl.Result{}, nil
@@ -386,16 +387,11 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 		}
 	}
 
-	// Role-level settings: both ConnectionLimit and idle_in_transaction_session_timeout
-	// are load-bearing on the role itself, so a failure here means we didn't reach
-	// desired state — trip to Failed rather than logging and pretending Ready.
-	if user.Spec.ConnectionLimit != 0 {
-		if err := pgClient.SetConnectionLimit(ctx, username, user.Spec.ConnectionLimit); err != nil {
-			baseStatus.Phase = "Failed"
-			baseStatus.Message = fmt.Sprintf("failed to set connection limit: %s", err.Error())
-			baseStatus.SecretName = secretName
-			return r.setStatus(ctx, user, &baseStatus)
-		}
+	if err := r.syncConnectionLimit(ctx, pgClient, username, user); err != nil {
+		baseStatus.Phase = "Failed"
+		baseStatus.Message = fmt.Sprintf("failed to sync connection limit: %s", err.Error())
+		baseStatus.SecretName = secretName
+		return r.setStatus(ctx, user, &baseStatus)
 	}
 
 	if err := r.syncIdleInTransactionTimeout(ctx, pgClient, username, user); err != nil {
@@ -419,8 +415,26 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 	return r.setStatus(ctx, user, &baseStatus)
 }
 
-// Read pg_roles.rolconfig first so periodic reconciles don't emit ALTER ROLE
-// when state already matches — especially RESET in the common unset case.
+// Read-before-write to avoid ALTER USER on every reconcile. CRD blocks
+// ConnectionLimit=0, so the int zero-value is "unset" → -1 (PG default).
+func (r *DatabaseUserReconciler) syncConnectionLimit(ctx context.Context,
+	pgClient postgres.ClientInterface, username string, user *databasesv1alpha1.DatabaseUser) error {
+
+	current, err := pgClient.GetConnectionLimit(ctx, username)
+	if err != nil {
+		return err
+	}
+	desired := user.Spec.ConnectionLimit
+	if desired == 0 {
+		desired = -1
+	}
+	if current == desired {
+		return nil
+	}
+	return pgClient.SetConnectionLimit(ctx, username, desired)
+}
+
+// Read-before-write so RESET isn't sent on every reconcile when field is unset.
 func (r *DatabaseUserReconciler) syncIdleInTransactionTimeout(ctx context.Context,
 	pgClient postgres.ClientInterface, username string, user *databasesv1alpha1.DatabaseUser) error {
 

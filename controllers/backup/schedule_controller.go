@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"sort"
 	"text/template"
@@ -57,8 +58,8 @@ func (r *BackupScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return r.handleDeletion(ctx, &schedule)
 	}
 
-	if result, done := r.ensureScheduleFinalizer(ctx, &schedule); done {
-		return result, nil
+	if result, err := r.ensureScheduleFinalizer(ctx, &schedule); result != nil {
+		return *result, err
 	}
 
 	log.Debugw("reconciling backup schedule",
@@ -85,15 +86,16 @@ func (r *BackupScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	return r.scheduleNextRun(ctx, &schedule, nextRun, log)
 }
 
-func (r *BackupScheduleReconciler) ensureScheduleFinalizer(ctx context.Context, schedule *dbtether.BackupSchedule) (ctrl.Result, bool) {
+func (r *BackupScheduleReconciler) ensureScheduleFinalizer(ctx context.Context, schedule *dbtether.BackupSchedule) (*ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(schedule, scheduleFinalizerName) {
-		return ctrl.Result{}, false
+		return nil, nil
 	}
+	patch := client.MergeFrom(schedule.DeepCopy())
 	controllerutil.AddFinalizer(schedule, scheduleFinalizerName)
-	if err := r.Update(ctx, schedule); err != nil {
-		return ctrl.Result{}, false
+	if err := r.Patch(ctx, schedule, patch); err != nil {
+		return &ctrl.Result{}, err
 	}
-	return ctrl.Result{Requeue: true}, true
+	return &ctrl.Result{Requeue: true}, nil
 }
 
 func (r *BackupScheduleReconciler) parseCronSchedule(cronExpr string) (cron.Schedule, error) {
@@ -239,22 +241,22 @@ func (r *BackupScheduleReconciler) runRetentionCleanup(ctx context.Context, sche
 	}
 
 	// Get resources needed for cleanup
-	s3Client, prefix, err := r.prepareRetentionCleanup(ctx, schedule, log)
-	if err != nil || s3Client == nil {
-		return // Error already logged or storage not supported
+	storageClient, prefix, err := r.prepareRetentionCleanup(ctx, schedule, log)
+	if err != nil || storageClient == nil {
+		return // Error already logged
+	}
+	if closer, ok := storageClient.(io.Closer); ok {
+		defer func() { _ = closer.Close() }()
 	}
 
 	// Apply retention policy and delete old files
-	r.executeRetentionCleanup(ctx, s3Client, prefix, schedule, log)
+	r.executeRetentionCleanup(ctx, storageClient, prefix, schedule, log)
 
 	// Also cleanup old Backup CRDs
 	r.cleanupBackupCRDs(ctx, schedule, log)
 }
 
-// prepareRetentionCleanup fetches resources and creates S3 client for retention cleanup.
-// Returns nil client if storage is not S3 (which is currently the only supported type).
-func (r *BackupScheduleReconciler) prepareRetentionCleanup(ctx context.Context, schedule *dbtether.BackupSchedule, log *zap.SugaredLogger) (*storage.S3Client, string, error) {
-	// Get Database to build path
+func (r *BackupScheduleReconciler) prepareRetentionCleanup(ctx context.Context, schedule *dbtether.BackupSchedule, log *zap.SugaredLogger) (storage.StorageClient, string, error) {
 	var db dbtether.Database
 	if err := r.Get(ctx, types.NamespacedName{
 		Name:      schedule.Spec.DatabaseRef.Name,
@@ -266,7 +268,6 @@ func (r *BackupScheduleReconciler) prepareRetentionCleanup(ctx context.Context, 
 		return nil, "", err
 	}
 
-	// Get DBCluster for cluster name
 	var cluster dbtether.DBCluster
 	if err := r.Get(ctx, types.NamespacedName{Name: db.Spec.ClusterRef.Name}, &cluster); err != nil {
 		if !errors.IsNotFound(err) {
@@ -275,7 +276,6 @@ func (r *BackupScheduleReconciler) prepareRetentionCleanup(ctx context.Context, 
 		return nil, "", err
 	}
 
-	// Get BackupStorage
 	var backupStorage dbtether.BackupStorage
 	if err := r.Get(ctx, types.NamespacedName{Name: schedule.Spec.StorageRef.Name}, &backupStorage); err != nil {
 		if !errors.IsNotFound(err) {
@@ -284,46 +284,44 @@ func (r *BackupScheduleReconciler) prepareRetentionCleanup(ctx context.Context, 
 		return nil, "", err
 	}
 
-	// Only S3 is supported for now
-	if backupStorage.Spec.S3 == nil {
-		log.Debugw("retention cleanup: only S3 storage is supported", "storage", backupStorage.Name)
-		return nil, "", nil
-	}
-
-	// Create S3 client
-	s3Cfg := &storage.S3Config{
-		Bucket:   backupStorage.Spec.S3.Bucket,
-		Region:   backupStorage.Spec.S3.Region,
-		Endpoint: backupStorage.Spec.S3.Endpoint,
-	}
-
-	s3Client, err := storage.NewS3Client(ctx, s3Cfg, slog.Default())
+	storageClient, err := r.newRetentionClient(ctx, &backupStorage)
 	if err != nil {
-		log.Warnw("retention cleanup: failed to create S3 client", "error", err)
+		log.Warnw("retention cleanup: failed to create storage client", "provider", backupStorage.GetProvider(), "error", err)
 		return nil, "", err
 	}
 
-	// Build prefix from path template
 	prefix, err := r.buildStoragePath(&backupStorage, &cluster, &db)
 	if err != nil {
 		log.Warnw("retention cleanup: failed to build storage path", "error", err)
 		return nil, "", err
 	}
 
-	return s3Client, prefix, nil
+	return storageClient, prefix, nil
 }
 
-// executeRetentionCleanup applies retention policy and deletes old S3 files.
-// Only files matching the schedule's filenameTemplate are considered;
-// manually-created backups with different naming are left untouched.
-func (r *BackupScheduleReconciler) executeRetentionCleanup(ctx context.Context, s3Client *storage.S3Client, prefix string, schedule *dbtether.BackupSchedule, log *zap.SugaredLogger) {
+func (r *BackupScheduleReconciler) newRetentionClient(ctx context.Context, bs *dbtether.BackupStorage) (storage.StorageClient, error) {
+	var s3 *storage.S3Config
+	var gcs *storage.GCSConfig
+	var az *storage.AzureConfig
+	switch {
+	case bs.Spec.S3 != nil:
+		s3 = &storage.S3Config{Bucket: bs.Spec.S3.Bucket, Region: bs.Spec.S3.Region, Endpoint: bs.Spec.S3.Endpoint}
+	case bs.Spec.GCS != nil:
+		gcs = &storage.GCSConfig{Bucket: bs.Spec.GCS.Bucket, Project: bs.Spec.GCS.Project}
+	case bs.Spec.Azure != nil:
+		az = &storage.AzureConfig{Container: bs.Spec.Azure.Container, StorageAccount: bs.Spec.Azure.StorageAccount}
+	}
+	return storage.NewClient(ctx, s3, gcs, az, slog.Default())
+}
+
+func (r *BackupScheduleReconciler) executeRetentionCleanup(ctx context.Context, storageClient storage.StorageClient, prefix string, schedule *dbtether.BackupSchedule, log *zap.SugaredLogger) {
 	filenameFilter, err := pkgbackup.FilenameTemplateToRegex(schedule.Spec.FilenameTemplate)
 	if err != nil {
 		log.Warnw("retention cleanup: failed to build filename filter, proceeding without filter", "error", err)
 	}
 
 	retentionManager := pkgbackup.NewRetentionManager(log)
-	toDelete, err := retentionManager.ApplyRetention(ctx, s3Client, prefix, schedule.Spec.Retention, filenameFilter)
+	toDelete, err := retentionManager.ApplyRetention(ctx, storageClient, prefix, schedule.Spec.Retention, filenameFilter)
 	if err != nil {
 		log.Warnw("retention cleanup: failed to apply retention policy", "error", err)
 		return
@@ -334,8 +332,8 @@ func (r *BackupScheduleReconciler) executeRetentionCleanup(ctx context.Context, 
 		return
 	}
 
-	if err := retentionManager.DeleteFiles(ctx, s3Client, toDelete); err != nil {
-		log.Warnw("retention cleanup: failed to delete some S3 files", "error", err)
+	if err := retentionManager.DeleteFiles(ctx, storageClient, toDelete); err != nil {
+		log.Warnw("retention cleanup: failed to delete some files", "error", err)
 	}
 }
 

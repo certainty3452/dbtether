@@ -2,10 +2,10 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"time"
 
 	gcs "cloud.google.com/go/storage"
 	"google.golang.org/api/iterator"
@@ -93,6 +93,17 @@ func (c *GCSClient) Download(ctx context.Context, key string) (io.ReadCloser, er
 	return rc, nil
 }
 
+func (c *GCSClient) Exists(ctx context.Context, key string) (bool, error) {
+	_, err := c.client.Bucket(c.bucket).Object(key).Attrs(ctx)
+	if err != nil {
+		if errors.Is(err, gcs.ErrObjectNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to stat GCS object: %w", err)
+	}
+	return true, nil
+}
+
 // Delete deletes an object from GCS
 func (c *GCSClient) Delete(ctx context.Context, key string) error {
 	if err := c.client.Bucket(c.bucket).Object(key).Delete(ctx); err != nil {
@@ -101,16 +112,9 @@ func (c *GCSClient) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// GCSObject represents an object in GCS
-type GCSObject struct {
-	Key          string
-	Size         int64
-	LastModified time.Time
-}
-
 // List lists all objects with the given prefix
-func (c *GCSClient) List(ctx context.Context, prefix string) ([]GCSObject, error) {
-	var objects []GCSObject
+func (c *GCSClient) List(ctx context.Context, prefix string) ([]StorageObject, error) {
+	var objects []StorageObject
 
 	it := c.client.Bucket(c.bucket).Objects(ctx, &gcs.Query{Prefix: prefix})
 	for {
@@ -122,7 +126,7 @@ func (c *GCSClient) List(ctx context.Context, prefix string) ([]GCSObject, error
 			return nil, fmt.Errorf("failed to list GCS objects: %w", err)
 		}
 
-		objects = append(objects, GCSObject{
+		objects = append(objects, StorageObject{
 			Key:          attrs.Name,
 			Size:         attrs.Size,
 			LastModified: attrs.Updated,

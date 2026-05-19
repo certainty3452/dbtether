@@ -15,6 +15,12 @@ type MockClient struct {
 	users      map[string]string               // username -> password
 	userAccess map[string]map[string]bool      // username -> database -> hasAccess
 	roleParams map[string]map[RoleParam]string // username -> param key -> value
+	connLimits map[string]int                  // username -> connection limit
+
+	// Counters exposed for tests that assert no-op behaviour on steady state.
+	SetConnectionLimitCalls int
+	SetRoleParameterCalls   int
+	ResetRoleParameterCalls int
 
 	Version    string
 	ShouldFail bool
@@ -204,10 +210,29 @@ func (m *MockClient) SetPassword(ctx context.Context, username, password string)
 	return nil
 }
 
+func (m *MockClient) GetConnectionLimit(ctx context.Context, username string) (int, error) {
+	if m.ShouldFail {
+		return 0, m.FailError
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if v, ok := m.connLimits[username]; ok {
+		return v, nil
+	}
+	return -1, nil
+}
+
 func (m *MockClient) SetConnectionLimit(ctx context.Context, username string, limit int) error {
 	if m.ShouldFail {
 		return m.FailError
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.SetConnectionLimitCalls++
+	if m.connLimits == nil {
+		m.connLimits = make(map[string]int)
+	}
+	m.connLimits[username] = limit
 	return nil
 }
 
@@ -236,6 +261,7 @@ func (m *MockClient) SetRoleParameter(ctx context.Context, username string, key 
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.SetRoleParameterCalls++
 	if m.roleParams == nil {
 		m.roleParams = make(map[string]map[RoleParam]string)
 	}
@@ -255,6 +281,7 @@ func (m *MockClient) ResetRoleParameter(ctx context.Context, username string, ke
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.ResetRoleParameterCalls++
 	if m.roleParams[username] != nil {
 		delete(m.roleParams[username], key)
 	}
@@ -415,7 +442,6 @@ func (m *MockClient) GetUsers() []string {
 	return result
 }
 
-// Test-only helper without ctx/error plumbing.
 func (m *MockClient) LookupRoleParameter(username string, key RoleParam) (string, bool) {
 	v, ok, _ := m.GetRoleParameter(context.Background(), username, key)
 	return v, ok

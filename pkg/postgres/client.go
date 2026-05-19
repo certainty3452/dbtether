@@ -14,9 +14,7 @@ import (
 	"github.com/lib/pq"
 )
 
-// Typed aliases make "anything goes" parameters cost a deliberate conversion
-// at the callsite — grep-friendly and reviewable. Runtime allowlist below is
-// the second line of defence over the type.
+// Typed aliases force callsites to cast; allowlists below enforce the type at runtime.
 type RoleParam string
 type TablePrivilege string
 
@@ -74,6 +72,7 @@ type ClientInterface interface {
 	UserExists(ctx context.Context, username string) (bool, error)
 	CreateUser(ctx context.Context, username, password string) error
 	SetPassword(ctx context.Context, username, password string) error
+	GetConnectionLimit(ctx context.Context, username string) (int, error)
 	SetConnectionLimit(ctx context.Context, username string, limit int) error
 	GetRoleParameter(ctx context.Context, username string, key RoleParam) (value string, exists bool, err error)
 	SetRoleParameter(ctx context.Context, username string, key RoleParam, value string) error
@@ -449,6 +448,17 @@ func (c *Client) SetPassword(ctx context.Context, username, password string) err
 	return nil
 }
 
+func (c *Client) GetConnectionLimit(ctx context.Context, username string) (int, error) {
+	var limit int
+	if err := c.pool.QueryRow(ctx,
+		`SELECT rolconnlimit FROM pg_roles WHERE rolname = $1`,
+		username,
+	).Scan(&limit); err != nil {
+		return 0, fmt.Errorf("failed to read connection limit for %s: %w", username, err)
+	}
+	return limit, nil
+}
+
 func (c *Client) SetConnectionLimit(ctx context.Context, username string, limit int) error {
 	query := fmt.Sprintf(
 		"ALTER USER %s CONNECTION LIMIT %d",
@@ -809,11 +819,8 @@ func (c *Client) applyTableGrant(ctx context.Context, conn *pgx.Conn, quotedUser
 	return nil
 }
 
-// Refuses anything off the allowlist before concatenation reaches SQL. Upper-cases
-// are tolerated as hygiene for direct (non-CRD) callers like unit tests; CRD-enum
-// admission is case-sensitive so production traffic is already canonical.
-// Empty slice fails loudly because the CRD MinItems=1 might be bypassed in the future
-// and this helper is the last line of defence before "GRANT  ON TABLE …" syntax error.
+// Upper-case is hygiene for non-CRD callers (CRD enum is case-sensitive). Empty
+// slice fails loudly so admission bypass can't produce "GRANT  ON TABLE …".
 func joinAllowedPrivileges(privileges []TablePrivilege) (string, error) {
 	if len(privileges) == 0 {
 		return "", fmt.Errorf("%w: no privileges provided", ErrInvalidTablePrivilege)

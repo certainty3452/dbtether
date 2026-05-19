@@ -64,18 +64,3 @@ func TestGCSConfig_Fields(t *testing.T) {
 		t.Errorf("project mismatch: got %q", cfg.Project)
 	}
 }
-
-func TestGCSObject_Fields(t *testing.T) {
-	obj := GCSObject{
-		Key:  "backups/mydb/2026/01/20/backup.sql.gz",
-		Size: 1024 * 1024, // 1MB
-	}
-
-	if obj.Key == "" {
-		t.Error("key should not be empty")
-	}
-
-	if obj.Size != 1024*1024 {
-		t.Errorf("size mismatch: got %d", obj.Size)
-	}
-}

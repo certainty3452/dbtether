@@ -3,6 +3,7 @@
 package controllers
 
 import (
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -421,6 +422,159 @@ var _ = Describe("DatabaseUser Controller", func() {
 
 			By(stepCleaningUp)
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should not re-issue ALTER USER on steady state", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-conn-steady",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{
+						Name: databaseName,
+					},
+					Privileges:      "readonly",
+					ConnectionLimit: 15,
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Waiting for first Set to land")
+			Eventually(func() int {
+				v, _ := mockPGCache.DefaultMock.GetConnectionLimit(ctx, "user_conn_steady")
+				return v
+			}, timeout, interval).Should(Equal(15))
+
+			By("Forcing additional reconciles via annotation churn")
+			baseline := mockPGCache.DefaultMock.SetConnectionLimitCalls
+			for i := 0; i < 3; i++ {
+				cur := &databasesv1alpha1.DatabaseUser{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-conn-steady",
+					Namespace: namespace,
+				}, cur)).Should(Succeed())
+				patch := client.MergeFrom(cur.DeepCopy())
+				if cur.Annotations == nil {
+					cur.Annotations = map[string]string{}
+				}
+				cur.Annotations["test/poke"] = fmt.Sprintf("%d", i)
+				Expect(k8sClient.Patch(ctx, cur, patch)).Should(Succeed())
+				time.Sleep(interval)
+			}
+
+			By("Asserting no additional SetConnectionLimit calls were made")
+			Consistently(func() int {
+				return mockPGCache.DefaultMock.SetConnectionLimitCalls - baseline
+			}, time.Second, interval).Should(Equal(0))
+
+			By(stepCleaningUp)
+			cleanup := &databasesv1alpha1.DatabaseUser{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      "user-conn-steady",
+				Namespace: namespace,
+			}, cleanup)).Should(Succeed())
+			Expect(k8sClient.Delete(ctx, cleanup)).Should(Succeed())
+		})
+
+		It("Should not re-issue ALTER ROLE SET when idle_in_transaction is unchanged", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-idle-steady",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{
+						Name: databaseName,
+					},
+					Privileges:               "readonly",
+					IdleInTransactionTimeout: &metav1.Duration{Duration: 2 * time.Minute},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			Eventually(func() string {
+				v, _ := mockPGCache.DefaultMock.LookupRoleParameter(
+					"user_idle_steady", postgres.RoleParamIdleInTransactionTimeout)
+				return v
+			}, timeout, interval).Should(Equal("120000ms"))
+
+			setBaseline := mockPGCache.DefaultMock.SetRoleParameterCalls
+			resetBaseline := mockPGCache.DefaultMock.ResetRoleParameterCalls
+
+			for i := 0; i < 3; i++ {
+				cur := &databasesv1alpha1.DatabaseUser{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{
+					Name:      "user-idle-steady",
+					Namespace: namespace,
+				}, cur)).Should(Succeed())
+				patch := client.MergeFrom(cur.DeepCopy())
+				if cur.Annotations == nil {
+					cur.Annotations = map[string]string{}
+				}
+				cur.Annotations["test/poke"] = fmt.Sprintf("%d", i)
+				Expect(k8sClient.Patch(ctx, cur, patch)).Should(Succeed())
+				time.Sleep(interval)
+			}
+
+			Consistently(func() int {
+				return mockPGCache.DefaultMock.SetRoleParameterCalls - setBaseline
+			}, time.Second, interval).Should(Equal(0))
+			Consistently(func() int {
+				return mockPGCache.DefaultMock.ResetRoleParameterCalls - resetBaseline
+			}, time.Second, interval).Should(Equal(0))
+
+			By(stepCleaningUp)
+			cleanup := &databasesv1alpha1.DatabaseUser{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      "user-idle-steady",
+				Namespace: namespace,
+			}, cleanup)).Should(Succeed())
+			Expect(k8sClient.Delete(ctx, cleanup)).Should(Succeed())
+		})
+
+		It("Should drift-sync ConnectionLimit via read-before-write", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-conn-drift",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{
+						Name: databaseName,
+					},
+					Privileges:      "readonly",
+					ConnectionLimit: 20,
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Waiting for initial limit to land on the mock")
+			Eventually(func() int {
+				v, _ := mockPGCache.DefaultMock.GetConnectionLimit(ctx, "user_conn_drift")
+				return v
+			}, timeout, interval).Should(Equal(20))
+
+			By("Patching ConnectionLimit to 10 and verifying drift sync")
+			created := &databasesv1alpha1.DatabaseUser{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      "user-conn-drift",
+				Namespace: namespace,
+			}, created)).Should(Succeed())
+			patch := client.MergeFrom(created.DeepCopy())
+			created.Spec.ConnectionLimit = 10
+			Expect(k8sClient.Patch(ctx, created, patch)).Should(Succeed())
+
+			Eventually(func() int {
+				v, _ := mockPGCache.DefaultMock.GetConnectionLimit(ctx, "user_conn_drift")
+				return v
+			}, timeout, interval).Should(Equal(10))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, created)).Should(Succeed())
 		})
 
 		It("Should reject additionalGrants privileges outside the allowlist", func() {

@@ -37,6 +37,7 @@ type RestoreReconciler struct {
 	Scheme       *runtime.Scheme
 	Image        string
 	Namespace    string
+	SSLMode      string // propagated into Job env so it matches operator's posture
 	PodResources corev1.ResourceRequirements
 }
 
@@ -337,6 +338,9 @@ func (r *RestoreReconciler) buildEnvVars(
 		{Name: "DB_NAME", Value: db.Status.DatabaseName},
 		{Name: "SOURCE_PATH", Value: sourcePath},
 		{Name: "ON_CONFLICT", Value: onConflict},
+	}
+	if r.SSLMode != "" {
+		env = append(env, corev1.EnvVar{Name: "DB_SSLMODE", Value: r.SSLMode})
 	}
 
 	// Add credentials from secret

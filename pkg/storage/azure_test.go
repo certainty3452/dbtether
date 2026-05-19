@@ -66,21 +66,6 @@ func TestAzureConfig_Fields(t *testing.T) {
 	}
 }
 
-func TestAzureObject_Fields(t *testing.T) {
-	obj := AzureObject{
-		Key:  "backups/mydb/2026/01/20/backup.sql.gz",
-		Size: 2 * 1024 * 1024, // 2MB
-	}
-
-	if obj.Key == "" {
-		t.Error("key should not be empty")
-	}
-
-	if obj.Size != 2*1024*1024 {
-		t.Errorf("size mismatch: got %d", obj.Size)
-	}
-}
-
 func TestStrPtr(t *testing.T) {
 	input := "test-value"
 	result := strPtr(input)

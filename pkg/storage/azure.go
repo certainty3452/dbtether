@@ -9,6 +9,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 )
 
 // AzureClient provides Azure Blob Storage operations
@@ -56,59 +57,19 @@ func NewAzureClient(ctx context.Context, cfg *AzureConfig, logger *slog.Logger) 
 	}, nil
 }
 
-// Upload uploads data to Azure Blob Storage
+// Upload streams data to Azure Blob Storage.
 func (c *AzureClient) Upload(ctx context.Context, key string, data io.Reader) error {
-	// Read all data (Azure SDK requires seekable reader or bytes)
-	dataBytes, err := io.ReadAll(data)
-	if err != nil {
-		return fmt.Errorf("failed to read data: %w", err)
-	}
-
-	_, err = c.client.UploadBuffer(ctx, c.container, key, dataBytes, nil)
-	if err != nil {
-		return fmt.Errorf("failed to upload to Azure Blob: %w", err)
-	}
-	return nil
+	return c.UploadWithTags(ctx, key, data, nil)
 }
 
-// UploadWithTags uploads data with metadata
+// UploadWithTags streams data with optional metadata.
 func (c *AzureClient) UploadWithTags(ctx context.Context, key string, data io.Reader, tags *ObjectTags) error {
-	dataBytes, err := io.ReadAll(data)
-	if err != nil {
-		return fmt.Errorf("failed to read data: %w", err)
-	}
-
-	opts := &azblob.UploadBufferOptions{}
-	if tags != nil {
-		opts.Metadata = map[string]*string{
-			"database":   strPtr(tags.Database),
-			"cluster":    strPtr(tags.Cluster),
-			"backupname": strPtr(tags.BackupName), // Azure metadata keys can't have hyphens
-			"namespace":  strPtr(tags.Namespace),
-			"timestamp":  strPtr(tags.Timestamp),
-			"createdby":  strPtr(tags.CreatedBy),
-		}
-	}
-
-	_, err = c.client.UploadBuffer(ctx, c.container, key, dataBytes, opts)
-	if err != nil {
-		return fmt.Errorf("failed to upload to Azure Blob: %w", err)
-	}
-	return nil
-}
-
-func strPtr(s string) *string {
-	return &s
-}
-
-// UploadStreaming uploads data using streaming (for large files)
-func (c *AzureClient) UploadStreaming(ctx context.Context, key string, data io.Reader, tags *ObjectTags) error {
 	opts := &azblob.UploadStreamOptions{
-		BlockSize:   8 * 1024 * 1024, // 8MB blocks
+		BlockSize:   8 * 1024 * 1024,
 		Concurrency: 3,
 	}
-
 	if tags != nil {
+		// Azure metadata keys reject hyphens — keep names alphanumeric.
 		opts.Metadata = map[string]*string{
 			"database":   strPtr(tags.Database),
 			"cluster":    strPtr(tags.Cluster),
@@ -118,12 +79,14 @@ func (c *AzureClient) UploadStreaming(ctx context.Context, key string, data io.R
 			"createdby":  strPtr(tags.CreatedBy),
 		}
 	}
-
-	_, err := c.client.UploadStream(ctx, c.container, key, data, opts)
-	if err != nil {
+	if _, err := c.client.UploadStream(ctx, c.container, key, data, opts); err != nil {
 		return fmt.Errorf("failed to upload to Azure Blob: %w", err)
 	}
 	return nil
+}
+
+func strPtr(s string) *string {
+	return &s
 }
 
 // Download downloads data from Azure Blob Storage
@@ -135,6 +98,18 @@ func (c *AzureClient) Download(ctx context.Context, key string) (io.ReadCloser, 
 	return resp.Body, nil
 }
 
+func (c *AzureClient) Exists(ctx context.Context, key string) (bool, error) {
+	containerClient := c.client.ServiceClient().NewContainerClient(c.container)
+	_, err := containerClient.NewBlobClient(key).GetProperties(ctx, nil)
+	if err != nil {
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to stat Azure blob: %w", err)
+	}
+	return true, nil
+}
+
 // Delete deletes a blob from Azure Blob Storage
 func (c *AzureClient) Delete(ctx context.Context, key string) error {
 	_, err := c.client.DeleteBlob(ctx, c.container, key, nil)
@@ -144,16 +119,9 @@ func (c *AzureClient) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// AzureObject represents an object in Azure Blob Storage
-type AzureObject struct {
-	Key          string
-	Size         int64
-	LastModified time.Time
-}
-
 // List lists all blobs with the given prefix
-func (c *AzureClient) List(ctx context.Context, prefix string) ([]AzureObject, error) {
-	var objects []AzureObject
+func (c *AzureClient) List(ctx context.Context, prefix string) ([]StorageObject, error) {
+	var objects []StorageObject
 
 	pager := c.client.NewListBlobsFlatPager(c.container, &azblob.ListBlobsFlatOptions{
 		Prefix: &prefix,
@@ -175,7 +143,7 @@ func (c *AzureClient) List(ctx context.Context, prefix string) ([]AzureObject, e
 				size = *blob.Properties.ContentLength
 			}
 
-			objects = append(objects, AzureObject{
+			objects = append(objects, StorageObject{
 				Key:          *blob.Name,
 				Size:         size,
 				LastModified: lastMod,

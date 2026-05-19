@@ -142,6 +142,8 @@ func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string) {
 	if operatorImage == "" {
 		operatorImage = "certainty3452/dbtether:latest"
 	}
+	// Read once at setup; reconcilers reuse the cached value.
+	operatorSSLMode := os.Getenv("DB_SSLMODE")
 
 	// Load configuration from YAML file (mounted from ConfigMap at /etc/dbtether/config.yaml)
 	cfg := config.LoadOrDefault(config.DefaultConfigPath)
@@ -156,6 +158,7 @@ func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string) {
 		Recorder:             mgr.GetEventRecorderFor("backup-controller"),
 		Image:                operatorImage,
 		Namespace:            operatorNamespace,
+		SSLMode:              operatorSSLMode,
 		MaxConcurrentBackups: cfg.Backup.MaxConcurrentPerCluster,
 		PodAnnotations:       cfg.Backup.PodAnnotations,
 		PodLabels:            cfg.Backup.PodLabels,
@@ -182,6 +185,7 @@ func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string) {
 		Scheme:       mgr.GetScheme(),
 		Image:        operatorImage,
 		Namespace:    operatorNamespace,
+		SSLMode:      operatorSSLMode,
 		PodResources: cfg.Backup.Resources.ToK8sResources(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, errUnableToCreateController, "controller", "Restore")

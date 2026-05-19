@@ -35,14 +35,15 @@ type DatabaseUserSpec struct {
 	// +optional
 	Rotation *RotationConfig `json:"rotation,omitempty"`
 
+	// 0 is rejected because the int zero-value can't be distinguished from "unset".
 	// +optional
 	// +kubebuilder:validation:Minimum=-1
 	// +kubebuilder:default=-1
+	// +kubebuilder:validation:XValidation:rule="self == -1 || self >= 1",message="connectionLimit 0 is not supported; use -1 for unlimited or >= 1 to cap"
 	ConnectionLimit int `json:"connectionLimit,omitempty"`
 
-	// IdleInTransactionTimeout aborts sessions that stay idle inside a transaction
-	// longer than this duration. Unset clears any role-level override. Minimum 1ms
-	// because PostgreSQL truncates to ms and 0 means "disabled" (use unset for that).
+	// Aborts sessions idle inside a transaction longer than this. Unset clears the
+	// role-level override. 0ms means "disabled" in PG — use unset to express that.
 	// +optional
 	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1ms')",message="idleInTransactionTimeout must be at least 1ms"
 	IdleInTransactionTimeout *metav1.Duration `json:"idleInTransactionTimeout,omitempty"`
@@ -102,12 +103,14 @@ func (s *DatabaseUserSpec) HasDatabases() bool {
 }
 
 type TableGrant struct {
+	// Pattern rules out null-bytes and unicode tricks before SQL layer.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:items:Pattern=`^[a-zA-Z_][a-zA-Z0-9_]*$`
+	// +kubebuilder:validation:items:MaxLength=63
 	Tables []string `json:"tables"`
 
-	// Enum is admission-time gate; controller re-validates before SQL composition
-	// so admission bypass alone cannot reach GRANT.
+	// Enum here is the admission gate; controller re-checks before SQL composition.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:items:Enum=SELECT;INSERT;UPDATE;DELETE;TRUNCATE;REFERENCES;TRIGGER;USAGE

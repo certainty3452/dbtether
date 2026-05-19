@@ -60,9 +60,8 @@ spec:
                 items:
                   properties:
                     privileges:
-                      description: |-
-                        Enum is admission-time gate; controller re-validates before SQL composition
-                        so admission bypass alone cannot reach GRANT.
+                      description: Enum here is the admission gate; controller re-checks
+                        before SQL composition.
                       items:
                         enum:
                         - SELECT
@@ -77,7 +76,11 @@ spec:
                       minItems: 1
                       type: array
                     tables:
+                      description: Pattern rules out null-bytes and unicode tricks
+                        before SQL layer.
                       items:
+                        maxLength: 63
+                        pattern: ^[a-zA-Z_][a-zA-Z0-9_]*$
                         type: string
                       minItems: 1
                       type: array
@@ -88,8 +91,14 @@ spec:
                 type: array
               connectionLimit:
                 default: -1
+                description: 0 is rejected because the int zero-value can't be distinguished
+                  from "unset".
                 minimum: -1
                 type: integer
+                x-kubernetes-validations:
+                - message: connectionLimit 0 is not supported; use -1 for unlimited
+                    or >= 1 to cap
+                  rule: self == -1 || self >= 1
               database:
                 description: |-
                   Simple case: single database reference
@@ -144,9 +153,8 @@ spec:
                 type: string
               idleInTransactionTimeout:
                 description: |-
-                  IdleInTransactionTimeout aborts sessions that stay idle inside a transaction
-                  longer than this duration. Unset clears any role-level override. Minimum 1ms
-                  because PostgreSQL truncates to ms and 0 means "disabled" (use unset for that).
+                  Aborts sessions idle inside a transaction longer than this. Unset clears the
+                  role-level override. 0ms means "disabled" in PG — use unset to express that.
                 type: string
                 x-kubernetes-validations:
                 - message: idleInTransactionTimeout must be at least 1ms

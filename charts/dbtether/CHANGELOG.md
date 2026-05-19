@@ -2,6 +2,24 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.6.1] - 2026-05-19
+
+### Changed
+- DatabaseUser ConnectionLimit now read-before-write
+- DatabaseUser finalizers added via Patch instead of Update
+- Backup/Restore Jobs inherit operator's DB_SSLMODE env (was silently locked to compile-time default)
+- Azure Upload no longer buffers the full payload in memory
+
+### Fixed
+- Retention now applies to GCS and Azure backups (was S3-only)
+- BackupSchedule finalizer Update error was swallowed
+- Backup goroutine leak when upload aborts mid-stream
+- countActiveJobsForCluster now uses server-side label filter
+
+### Security
+- DatabaseUser.additionalGrants.tables restricted to standard PostgreSQL identifier pattern
+- DatabaseUser.connectionLimit=0 rejected at admission (was silently mapped to unlimited)
+
 ## [0.6.0] - 2026-05-19
 
 ### Added

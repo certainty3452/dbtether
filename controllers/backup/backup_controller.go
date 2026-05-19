@@ -49,7 +49,8 @@ type BackupReconciler struct {
 	Recorder             record.EventRecorder
 	Image                string
 	Namespace            string
-	MaxConcurrentBackups int // limit per DBCluster, default 3
+	SSLMode              string // propagated into Job env so it matches operator's posture
+	MaxConcurrentBackups int    // limit per DBCluster, default 3
 
 	// PodAnnotations are applied to all backup pods.
 	// Set via Helm values (backup.podAnnotations) for Karpenter/autoscaler protection.
@@ -314,18 +315,16 @@ func (r *BackupReconciler) deleteBackupJob(ctx context.Context, backup *database
 
 func (r *BackupReconciler) countActiveJobsForCluster(ctx context.Context, clusterName string) (int, error) {
 	var jobs batchv1.JobList
-	if err := r.List(ctx, &jobs, client.InNamespace(r.Namespace)); err != nil {
+	if err := r.List(ctx, &jobs,
+		client.InNamespace(r.Namespace),
+		client.MatchingLabels{"dbtether.io/cluster": clusterName},
+	); err != nil {
 		return 0, err
 	}
 
 	active := 0
 	for i := range jobs.Items {
 		job := &jobs.Items[i]
-		// Check if this job is for our cluster (via labels)
-		if job.Labels["dbtether.io/cluster"] != clusterName {
-			continue
-		}
-		// Count running jobs (not completed, not failed)
 		if job.Status.Succeeded == 0 && job.Status.Failed == 0 {
 			active++
 		}
@@ -406,6 +405,9 @@ func (r *BackupReconciler) createBackupJob(ctx context.Context, backup *database
 		{Name: "JOB_NAME", Value: jobName},
 		{Name: "JOB_NAMESPACE", Value: r.Namespace},
 	}...)
+	if r.SSLMode != "" {
+		env = append(env, corev1.EnvVar{Name: "DB_SSLMODE", Value: r.SSLMode})
+	}
 
 	// Add DB credentials from cluster
 	env = append(env, r.getClusterCredentialsEnv(cluster)...)
