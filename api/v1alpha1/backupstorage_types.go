@@ -34,6 +34,8 @@ type AzureStorageConfig struct {
 	StorageAccount string `json:"storageAccount"`
 }
 
+// +kubebuilder:validation:XValidation:rule="has(self.s3) || has(self.gcs) || has(self.azure)",message="one of s3, gcs, or azure must be specified"
+// +kubebuilder:validation:XValidation:rule="!has(self.credentialsSecretRef) || has(self.s3)",message="credentialsSecretRef is only supported with S3; GCS and Azure must use Workload Identity / Managed Identity"
 type BackupStorageSpec struct {
 	// S3 storage configuration (mutually exclusive with gcs and azure)
 	// +optional
@@ -53,7 +55,8 @@ type BackupStorageSpec struct {
 	// +optional
 	PathTemplate string `json:"pathTemplate,omitempty"`
 
-	// Optional: credentials secret reference. If not set, uses cloud-native auth (OIDC/Pod Identity)
+	// Optional credentials Secret reference. Only honored when S3 is used —
+	// GCS and Azure always authenticate via Workload Identity / Managed Identity.
 	// +optional
 	CredentialsSecretRef *SecretReference `json:"credentialsSecretRef,omitempty"`
 }

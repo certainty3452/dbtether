@@ -10,7 +10,27 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Verify CHANGELOG has entry for this release
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          if ! grep -q "^## \[${VERSION}\]" charts/dbtether/CHANGELOG.md; then
+            echo "ERROR: charts/dbtether/CHANGELOG.md has no entry for [${VERSION}]"
+            echo "Add a section like '## [${VERSION}] - YYYY-MM-DD' before tagging."
+            exit 1
+          fi
+          echo "✓ CHANGELOG entry found for ${VERSION}"
+
   build:
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -79,16 +99,22 @@ jobs:
 
       - name: Create and push manifest
         run: |
-          docker manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }} \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-amd64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-arm64
+          VERSION="${{ steps.version.outputs.VERSION }}"
 
-          docker manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-amd64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-arm64
+          docker manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION} \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}-amd64 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}-arm64
+          docker manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}
 
-          docker manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}
-          docker manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          # Only stable releases (no `-rc`, `-beta`, etc.) move the `latest` tag.
+          if [[ "$VERSION" == *-* ]]; then
+            echo "Pre-release tag detected ($VERSION); skipping :latest update"
+          else
+            docker manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}-amd64 \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}-arm64
+            docker manifest push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          fi
 
   # Security scan the built image
   security:

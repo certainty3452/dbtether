@@ -2,6 +2,32 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.6.2] - 2026-05-19
+
+### Breaking
+- BackupStorage probe requires additional read permission on the bucket/container.
+  After upgrade, existing BackupStorage CRs may flip to Failed if IAM lacks:
+  - AWS S3:  `s3:ListBucket` (used by HeadBucket)
+  - GCS:     `storage.buckets.get` (used by Bucket.Attrs)
+  - Azure:   container-level Read (used by GetProperties — covered by `Storage Blob Data Reader` / `Contributor`, but not by all custom roles)
+  Backups will be blocked until IAM is updated, or the BackupStorage spec is corrected.
+- `credentialsSecretRef` is now rejected at admission for GCS and Azure (was silently ignored). Use Workload Identity / Managed Identity instead.
+- A BackupStorage CR with no provider configured is now rejected at admission (was caught later in reconcile). Diagnostic surfaces immediately on `kubectl apply`.
+
+### Added
+- BackupStorage reconciler probes the bucket before flipping to Ready
+- Restore CRD reference documentation
+- `StorageClient.Reachable(ctx) error` on the internal storage interface
+
+### Changed
+- Backup job memory default lowered to match real streaming usage
+- Release pipeline skips `:latest` on pre-release tags
+- CI verifies chart README image tag and CHANGELOG entry
+- Storage probe failures are evaluated continuously; transient cloud errors temporarily block *new* backup jobs (existing jobs continue normally). Failed status auto-recovers within 60s.
+
+### Removed
+- Deprecated populateBackupResults helper
+
 ## [0.6.1] - 2026-05-19
 
 ### Changed

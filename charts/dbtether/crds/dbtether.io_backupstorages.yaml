@@ -62,8 +62,9 @@ spec:
                 - storageAccount
                 type: object
               credentialsSecretRef:
-                description: 'Optional: credentials secret reference. If not set,
-                  uses cloud-native auth (OIDC/Pod Identity)'
+                description: |-
+                  Optional credentials Secret reference. Only honored when S3 is used —
+                  GCS and Azure always authenticate via Workload Identity / Managed Identity.
                 properties:
                   name:
                     type: string
@@ -106,6 +107,12 @@ spec:
                 - region
                 type: object
             type: object
+            x-kubernetes-validations:
+            - message: one of s3, gcs, or azure must be specified
+              rule: has(self.s3) || has(self.gcs) || has(self.azure)
+            - message: credentialsSecretRef is only supported with S3; GCS and Azure
+                must use Workload Identity / Managed Identity
+              rule: '!has(self.credentialsSecretRef) || has(self.s3)'
           status:
             properties:
               lastValidation:

@@ -34,6 +34,13 @@ type StorageClient interface {
 
 	// List lists all objects with the given prefix
 	List(ctx context.Context, prefix string) ([]StorageObject, error)
+
+	// Reachable verifies the bucket/container exists and the current credentials
+	// have access to it. Implementations use the cheapest call that exercises
+	// auth + resource resolution (S3 HeadBucket, GCS bucket Attrs, Azure container
+	// GetProperties). nil = reachable; any non-nil error should be surfaced to
+	// the user verbatim — credentials, region, name, or network are wrong.
+	Reachable(ctx context.Context) error
 }
 
 // Verify implementations satisfy the interface

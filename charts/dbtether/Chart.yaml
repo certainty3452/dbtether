@@ -2,8 +2,8 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.6.1
-appVersion: "0.6.1"
+version: 0.6.2
+appVersion: "0.6.2"
 home: https://github.com/certainty3452/dbtether
 # icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
@@ -159,8 +159,14 @@ annotations:
         onConflict: drop
   artifacthub.io/changes: |
     - kind: changed
-      description: "ConnectionLimit read-before-write; backup/restore Jobs inherit operator's DB_SSLMODE"
-    - kind: fixed
-      description: "Retention now applies to GCS and Azure backups (was S3-only); BackupSchedule finalizer error swallowed; backup goroutine leak on upload abort"
-    - kind: security
-      description: "additionalGrants.tables restricted to PG identifier pattern; connectionLimit=0 rejected at admission"
+      description: "BREAKING: BackupStorage probe now needs s3:ListBucket / storage.buckets.get / Azure container Read; minimal IAM setups must be widened before upgrade or BackupStorage will flip to Failed and block new backups"
+    - kind: changed
+      description: "BREAKING: credentialsSecretRef is rejected at admission on GCS and Azure (was silently ignored); use Workload Identity / Managed Identity"
+    - kind: added
+      description: "BackupStorage reconciler probes the bucket on Ready; misconfigured credentials surface immediately instead of at first backup"
+    - kind: added
+      description: "Restore CRD reference docs; README section on required permissions and security implications"
+    - kind: changed
+      description: "Helm chart: backup job memory default 2Gi→256Mi (streaming backup is O(buffer), not O(database size)); requests==limits per policy"
+    - kind: changed
+      description: "Release pipeline no longer moves :latest on pre-release tags; CI verifies chart README image.tag and CHANGELOG entry presence"

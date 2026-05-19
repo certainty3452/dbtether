@@ -119,6 +119,21 @@ func (c *AzureClient) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// Reachable verifies container existence and access via GetProperties.
+// One HEAD-style call against the container; surfaces ContainerNotFound,
+// AuthenticationFailed, AuthorizationFailure, etc. verbatim.
+func (c *AzureClient) Reachable(ctx context.Context) error {
+	containerClient := c.client.ServiceClient().NewContainerClient(c.container)
+	_, err := containerClient.GetProperties(ctx, nil)
+	if err != nil {
+		if bloberror.HasCode(err, bloberror.ContainerNotFound) {
+			return fmt.Errorf("azure container %q does not exist", c.container)
+		}
+		return fmt.Errorf("azure container %q not reachable: %w", c.container, err)
+	}
+	return nil
+}
+
 // List lists all blobs with the given prefix
 func (c *AzureClient) List(ctx context.Context, prefix string) ([]StorageObject, error) {
 	var objects []StorageObject

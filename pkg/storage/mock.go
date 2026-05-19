@@ -15,11 +15,12 @@ type MockClient struct {
 	objects map[string]*mockObject
 
 	// Error injection for testing error handling
-	UploadError   error
-	DownloadError error
-	DeleteError   error
-	ListError     error
-	ExistsError   error
+	UploadError    error
+	DownloadError  error
+	DeleteError    error
+	ListError      error
+	ExistsError    error
+	ReachableError error
 }
 
 type mockObject struct {
@@ -121,6 +122,10 @@ func (m *MockClient) List(ctx context.Context, prefix string) ([]StorageObject, 
 	}
 
 	return objects, nil
+}
+
+func (m *MockClient) Reachable(ctx context.Context) error {
+	return m.ReachableError
 }
 
 // Helper methods for testing

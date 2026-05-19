@@ -889,25 +889,6 @@ func (r *BackupReconciler) updateStatusCompleted(ctx context.Context, backup *da
 	return ctrl.Result{}, nil
 }
 
-// populateBackupResults reads backup results from Job annotations and populates Backup status.
-//
-// Deprecated: use updateStatusCompleted instead which handles patching correctly.
-func (r *BackupReconciler) populateBackupResults(backup *databasesv1alpha1.Backup, job *batchv1.Job) {
-	if job.Annotations == nil {
-		return
-	}
-
-	if path := job.Annotations["dbtether.io/backup-path"]; path != "" {
-		backup.Status.Path = path
-	}
-	if size := job.Annotations["dbtether.io/backup-size-human"]; size != "" {
-		backup.Status.Size = size
-	}
-	if duration := job.Annotations["dbtether.io/backup-duration"]; duration != "" {
-		backup.Status.Duration = duration
-	}
-}
-
 // updateFailedJobTTL updates the TTL of a failed job to allow longer retention for debugging
 func (r *BackupReconciler) updateFailedJobTTL(ctx context.Context, backup *databasesv1alpha1.Backup, job *batchv1.Job) error {
 	logger := log.FromContext(ctx)

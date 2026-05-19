@@ -50,7 +50,8 @@ spec:
 | `additionalGrants` | array | ❌ | `[]` | Additional table-level grants |
 | `password.length` | int | ❌ | `16` | Password length (12-64) |
 | `rotation.days` | int | ❌ | — | Password rotation interval in days (1-365) |
-| `connectionLimit` | int | ❌ | `-1` | Max concurrent connections (`-1` = unlimited) |
+| `connectionLimit` | int | ❌ | `-1` | Max concurrent connections (`-1` = unlimited, `>= 1` to cap; `0` is rejected) |
+| `idleInTransactionTimeout` | duration | ❌ | — | Abort sessions idle inside a transaction for longer than this (min `1ms`). Unset clears the role-level override |
 | `deletionPolicy` | enum | ❌ | `Delete` | What to do with user when resource is deleted |
 | `secret` | object | ❌ | — | Secret configuration (see below) |
 | `secretGeneration` | enum | ❌ | `primary` | How to generate secrets: `primary` or `perDatabase` |
@@ -115,6 +116,45 @@ Can be set at spec level (default for all databases) or per-database.
 - Transfers ownership of all existing tables and sequences to the user
 - Required for operations like `ALTER TABLE ... ADD CONSTRAINT`, schema modifications, or running `pg_restore`
 - On user deletion or when a database is removed from access list, ownership is automatically reassigned back to the master user
+
+## additionalGrants
+
+Table-level grants on top of the preset. Useful for surgical access (e.g. read-only role that can also INSERT into a single audit table).
+
+```yaml
+spec:
+  privileges: readonly
+  additionalGrants:
+    - tables: ["audit_log", "events"]
+      privileges: ["INSERT"]
+```
+
+| Field | Constraints |
+|-------|-------------|
+| `tables` | At least one entry. Each must match `^[a-zA-Z_][a-zA-Z0-9_]*$`, max 63 chars. Validated at admission to block null bytes and unicode tricks before they reach SQL composition. |
+| `privileges` | At least one entry. Enum: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`, `USAGE`. Re-checked in the controller before SQL composition. |
+
+## connectionLimit
+
+PostgreSQL `CONNECTION LIMIT` for the role.
+
+| Value | Meaning |
+|-------|---------|
+| `-1` (default) | Unlimited |
+| `>= 1` | Cap concurrent connections at this number |
+| `0` | **Rejected** — the integer zero-value can't be distinguished from "unset", so it's explicitly disallowed |
+
+## idleInTransactionTimeout
+
+Sets `idle_in_transaction_session_timeout` on the role. Sessions that remain idle inside an open transaction for longer than this are aborted server-side.
+
+```yaml
+spec:
+  idleInTransactionTimeout: 30s
+```
+
+- Minimum: `1ms`. PostgreSQL's `0` (disabled) cannot be expressed — leave the field unset instead, which clears any role-level override.
+- Useful for long-lived connection pools (PgBouncer transaction mode) where a stuck transaction can hold locks indefinitely.
 
 ## secretGeneration
 

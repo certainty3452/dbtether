@@ -73,13 +73,27 @@ jobs:
         run: |
           APP_VERSION=$(grep '^appVersion:' charts/dbtether/Chart.yaml | sed 's/appVersion: *"\(.*\)"/\1/')
           IMAGE_TAG=$(grep '^\s*tag:' charts/dbtether/values.yaml | sed 's/.*tag: *"\(.*\)"/\1/')
-          
+          # Anchor on the values-table row to avoid breakage if `image.tag`
+          # is mentioned again elsewhere in the README. The row is:
+          # | `image.tag` | Image tag | `0.6.2` |
+          README_TAG=$(grep -E '^\| `image\.tag` \|' charts/dbtether/README.md | awk -F'`' '{print $4}')
+          if [ -z "$README_TAG" ]; then
+            echo "ERROR: could not extract image.tag from charts/dbtether/README.md (values table row missing or malformed)"
+            exit 1
+          fi
+
           echo "Chart appVersion: $APP_VERSION"
-          echo "Image tag: $IMAGE_TAG"
-          
+          echo "Image tag:       $IMAGE_TAG"
+          echo "README image.tag: $README_TAG"
+
           if [ "$APP_VERSION" != "$IMAGE_TAG" ]; then
             echo "ERROR: image.tag ($IMAGE_TAG) does not match appVersion ($APP_VERSION)"
             echo "Please update charts/dbtether/values.yaml to match Chart.yaml appVersion"
+            exit 1
+          fi
+          if [ "$APP_VERSION" != "$README_TAG" ]; then
+            echo "ERROR: README.md image.tag ($README_TAG) does not match appVersion ($APP_VERSION)"
+            echo "Please update charts/dbtether/README.md values table"
             exit 1
           fi
           echo "✓ Versions match"

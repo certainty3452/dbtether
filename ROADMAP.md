@@ -7,46 +7,35 @@ This document outlines planned features and improvements for the dbtether operat
 - [ ] **Database owner** via `spec.owner` (reference to DatabaseUser)
 - [ ] **Database templates** via `spec.template` (for encoding/collation)
 - [ ] **Schema management** via `spec.schemas` (create additional schemas beyond public)
-- [ ] **Deletion protection** via `spec.deletionProtection`
-  - Prevents accidental CRD deletion (not just database in PostgreSQL)
-  - Implementation: Finalizer (simple) or ValidatingWebhook (better UX)
-  - User must first set `deletionProtection: false`, then delete
+- [ ] **Deletion protection** via `spec.deletionProtection` — prevents accidental `kubectl delete` of production databases and users
 - [ ] **Explicit adoption mode** via `spec.adopt: true` for existing databases
+
+## Multi-tenant Safety
+
+- [ ] **Namespace isolation** on DBCluster via `spec.allowedNamespaces` (explicit list) and `spec.namespaceSelector` (label-based)
+- [ ] **Validating Webhook** to enforce namespace restrictions on Database / DatabaseUser
 
 ## Observability
 
-- [ ] **Periodic drift detection** for Database/DatabaseUser
-  - Detect if resources were deleted externally and update status
+- [ ] **Custom Prometheus metrics** for backup duration, backup size, role sync results, and database state — for SRE dashboards
+- [ ] **Periodic drift detection** for Database / DatabaseUser when resources are changed outside the operator
 
-### Namespace Isolation (recommended)
+## Authentication
 
-- [ ] `spec.allowedNamespaces` on DBCluster — explicit list of namespaces that can reference this cluster
-- [ ] `spec.namespaceSelector` on DBCluster — label selector for allowed namespaces (e.g., `team=backend`)
-- [ ] **Validating Webhook** to enforce namespace restrictions when creating Database/DatabaseUser
-
-### Authentication Improvements (optional, for sensitive data)
-
-- [ ] **AWS IAM Authentication** for RDS/Aurora
-  - Use AWS IAM roles instead of long-lived passwords
-  - Support both IRSA and EKS Pod Identity Agent
-  - Eliminates secret sprawl, enables CloudTrail audit
-
-- [ ] **Azure AD Authentication** for Azure Database for PostgreSQL
-  - Use managed identities
-
-- [ ] **GCP IAM Authentication** for Cloud SQL
-  - Use Workload Identity
+- [ ] **AWS IAM Authentication** for RDS / Aurora (IRSA, EKS Pod Identity)
+- [ ] **Azure AD Authentication** for Azure Database for PostgreSQL (managed identities)
+- [ ] **GCP IAM Authentication** for Cloud SQL (Workload Identity)
 
 ## Secret Management Integrations
 
-Goal: Allow storing credentials in external secret stores instead of (or in addition to) Kubernetes Secrets.
+Store credentials in external secret stores instead of (or alongside) Kubernetes Secrets.
 
-### Option A: Direct write to secret store
+### Option A: direct write to secret store
 
-- [ ] AWS Secrets Manager integration via `spec.secretStore.aws`
-- [ ] Google Cloud Secret Manager integration via `spec.secretStore.gcp`
-- [ ] Azure Key Vault integration via `spec.secretStore.azure`
-- [ ] HashiCorp Vault integration via `spec.secretStore.vault`
+- [ ] AWS Secrets Manager via `spec.secretStore.aws`
+- [ ] Google Cloud Secret Manager via `spec.secretStore.gcp`
+- [ ] Azure Key Vault via `spec.secretStore.azure`
+- [ ] HashiCorp Vault via `spec.secretStore.vault`
 
 ### Option B: External Secrets Operator (ESO) integration
 

@@ -140,8 +140,34 @@ spec:
 
 | Phase | Description |
 |-------|-------------|
-| `Ready` | Storage is validated and ready for use |
-| `Failed` | Configuration error (see `message`) |
+| `Ready` | Spec validated and the bucket/container is reachable with current credentials |
+| `Failed` | Configuration error or reachability probe failed (see `message`) |
+
+## Reachability probe
+
+On every reconcile (and at least every 30 minutes) the operator issues a single low-cost call against the bucket / container — `HeadBucket` for S3, `Bucket.Attrs` for GCS, `Container.GetProperties` for Azure. The intent is to surface misconfigured credentials, wrong region, missing bucket, or revoked IAM **immediately** at `kubectl apply` time, not an hour later when the first backup job fails.
+
+### Required permissions
+
+| Provider | Probe call | Required permission |
+|----------|------------|---------------------|
+| AWS S3 | `HeadBucket` | `s3:ListBucket` on the bucket |
+| GCS | `Bucket.Attrs` | `storage.buckets.get` on the bucket |
+| Azure Blob | `Container.GetProperties` | container-level Read (covered by `Storage Blob Data Reader` / `Contributor`) |
+
+These are in addition to the write-path grants (`s3:PutObject` / `storage.objects.create` / Blob Data Contributor) needed for actual backups — see [IAM Policy (AWS S3)](#iam-policy-aws-s3) below.
+
+### What the probe does NOT verify
+
+The probe checks **auth + bucket existence**, not **write access**. A role with `ListBucket` but no `PutObject` will pass the probe and fail at first backup. Keep the IAM policies in this doc as the source of truth for the full set of permissions.
+
+### Transient failures
+
+A probe failure flips status to `Failed` and blocks *new* backup jobs (existing jobs continue uninterrupted). Transient cloud errors auto-recover within 60 seconds. Persistent failures requeue every 60 seconds; successful state requeues every 30 minutes.
+
+### credentialsSecretRef
+
+Only honored when `s3` is configured. The CRD admission rule rejects `credentialsSecretRef` together with `gcs` or `azure` — those providers must authenticate via Workload Identity / Managed Identity. When using `credentialsSecretRef` on S3, the Secret must contain `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` keys; the operator reads them to build the probe client matching what subsequent jobs will use.
 
 ## kubectl Commands
 

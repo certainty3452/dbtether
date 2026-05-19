@@ -112,6 +112,20 @@ func (c *GCSClient) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// Reachable verifies bucket existence and access via Bucket.Attrs.
+// Returns ErrBucketNotExist for missing bucket; other errors are auth /
+// network / permission failures and should be surfaced verbatim.
+func (c *GCSClient) Reachable(ctx context.Context) error {
+	_, err := c.client.Bucket(c.bucket).Attrs(ctx)
+	if err != nil {
+		if errors.Is(err, gcs.ErrBucketNotExist) {
+			return fmt.Errorf("gcs bucket %q does not exist", c.bucket)
+		}
+		return fmt.Errorf("gcs bucket %q not reachable: %w", c.bucket, err)
+	}
+	return nil
+}
+
 // List lists all objects with the given prefix
 func (c *GCSClient) List(ctx context.Context, prefix string) ([]StorageObject, error) {
 	var objects []StorageObject

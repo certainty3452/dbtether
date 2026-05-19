@@ -1,5 +1,8 @@
 # Default values for dbtether
 
+# replicaCount=1 with leaderElection.enabled=true is the safe default — single
+# active reconciler, no split-brain. Set replicaCount >= 2 to enable HA: extra
+# replicas sit on standby and one takes over via lease if the leader dies.
 replicaCount: 1
 # Number of old ReplicaSets to retain (Kubernetes default is 10)
 revisionHistoryLimit: ""
@@ -8,7 +11,7 @@ image:
   repository: ghcr.io/certainty3452/dbtether
   pullPolicy: IfNotPresent
   # Automatically updated by release pipeline from git tag
-  tag: "0.6.1"
+  tag: "0.6.2"
 
 imagePullSecrets: []
 nameOverride: ""
@@ -53,7 +56,8 @@ tolerations: []
 
 affinity: {}
 
-# Leader election configuration
+# Leader election (coordination.k8s.io lease). Required if replicaCount > 1;
+# harmless overhead if replicaCount == 1.
 leaderElection:
   enabled: true
 
@@ -108,15 +112,15 @@ backup:
   # Maximum concurrent backup jobs per DBCluster (prevents connection pool exhaustion)
   maxConcurrentPerCluster: 3
 
-  # Resources for backup job pods
-  # Important: pg_dump buffers entire database in memory before upload
-  # Set memory limit based on your largest database size
+  # Resources for backup job pods.
+  # Backup uses pipe-based streaming (pg_dump | gzip | upload), so memory is O(buffer),
+  # not O(database size). 256Mi handles databases of any size.
   resources:
     limits:
-      memory: 2Gi
+      memory: 256Mi
     requests:
       cpu: 100m
-      memory: 512Mi
+      memory: 256Mi
 
   # Annotations for backup job pods
   # Use this to protect backup pods from autoscaler disruption (Karpenter, cluster-autoscaler)
@@ -140,10 +144,13 @@ backup:
   #   app.kubernetes.io/name: dbtether-backup
   #   app.kubernetes.io/managed-by: dbtether
 
-# Extra environment variables for the operator pod
-# Use this for credentialsFromEnv in DBCluster resources
+# Extra environment variables for the operator pod.
+# Used for credentialsFromEnv in DBCluster resources, and for tunables like
+# DB_SSLMODE that the operator propagates to backup/restore jobs.
 extraEnv: []
 # Example:
+#   - name: DB_SSLMODE
+#     value: "verify-full"
 #   - name: AURORA_USERNAME
 #     valueFrom:
 #       secretKeyRef:

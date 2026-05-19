@@ -216,6 +216,19 @@ func (c *S3Client) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// Reachable verifies bucket existence and access via HeadBucket.
+// HeadBucket is the canonical S3 reachability probe: one round-trip,
+// no body, requires only s3:ListBucket on the bucket resource.
+func (c *S3Client) Reachable(ctx context.Context) error {
+	_, err := c.client.HeadBucket(ctx, &s3.HeadBucketInput{
+		Bucket: aws.String(c.bucket),
+	})
+	if err != nil {
+		return fmt.Errorf("s3 bucket %q not reachable: %w", c.bucket, err)
+	}
+	return nil
+}
+
 // List lists all objects with the given prefix
 func (c *S3Client) List(ctx context.Context, prefix string) ([]StorageObject, error) {
 	var objects []StorageObject

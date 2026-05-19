@@ -224,6 +224,49 @@ See full documentation in [docs/](docs/README.md):
 - `spec.onConflict` - `fail` (default), `drop`, or `overwrite`
 - `spec.ttlAfterCompletion` - Auto-cleanup duration
 
+## Required permissions and security implications
+
+The operator runs with cluster-scoped RBAC. Two grants are worth understanding before installing into a multi-tenant cluster.
+
+### Secrets (cluster-wide, full CRUD)
+
+The operator's ClusterRole grants `get, list, watch, create, update, patch, delete` on `secrets` across **all namespaces**. This is required to:
+
+- Read `DBCluster.spec.credentialsSecretRef` from any namespace (clusters are cluster-scoped, but their master credentials usually live in a platform namespace).
+- Write generated `DatabaseUser` credentials into the user's namespace (which is arbitrary).
+- Manage cross-namespace storage credentials referenced by `BackupStorage`.
+
+**Blast radius:** compromise of the operator ServiceAccount token = read/write of every Secret in the cluster. Treat the operator namespace as a high-trust zone. Concretely:
+
+- Pin the operator namespace as restricted in your admission policy (PSA/OPA).
+- Do not co-locate untrusted workloads in the operator's namespace.
+- Apply NetworkPolicies to limit egress from the operator pod to your DB endpoints only.
+- Rotate the operator's ServiceAccount token if you suspect compromise; cluster-wide Secret access is what an attacker would target.
+
+A namespace-scoped variant (operator only reads/writes Secrets in an allowlisted set of namespaces) is on the roadmap.
+
+### Cluster-scoped CRs
+
+`DBCluster` and `BackupStorage` are cluster-scoped. Any namespace can today create a `Database` or `DatabaseUser` referencing any `DBCluster`. If you run a shared platform with multiple tenants, see `spec.allowedNamespaces` on the roadmap — until it lands, gate `clusterRef` usage with admission policy (Kyverno / Gatekeeper / Validating Webhook).
+
+### Backup pod identity
+
+Backup and restore Jobs run under the same ServiceAccount as the operator. The IRSA / Workload Identity / Managed Identity role attached to it has access to **every** bucket configured via `BackupStorage`. If you need per-tenant storage isolation, use a separate operator install per tenant (each with its own ServiceAccount and cloud-IAM binding) rather than one operator with cluster-wide buckets.
+
+### Storage probe IAM requirements
+
+Since `0.6.2` the operator probes each `BackupStorage` on reconcile (every 30 minutes by default, and on every spec change). The probe issues one cheap call against the bucket/container to surface misconfiguration immediately instead of at first backup. This is a strict superset of what `0.6.1` required:
+
+| Provider | Probe call | Required permission |
+|----------|------------|---------------------|
+| AWS S3 | `HeadBucket` | `s3:ListBucket` on the bucket |
+| GCS | `Bucket.Attrs` | `storage.buckets.get` on the bucket |
+| Azure Blob | `Container.GetProperties` | container-level Read (covered by `Storage Blob Data Reader` / `Contributor`) |
+
+The probe verifies **auth and bucket existence**, not write access — if the role can list the bucket but lacks `s3:PutObject` / `storage.objects.create` / `Storage Blob Data Contributor`, the probe will report Ready and the first backup will fail. Treat the IAM policies below in the BackupStorage docs as the canonical write-path grants.
+
+Probe failures continuously block *new* backup jobs (existing jobs continue normally). Transient cloud errors will briefly flip the storage to `Failed`; it auto-recovers within 60 seconds once the probe succeeds again.
+
 ## Development
 
 ```bash
