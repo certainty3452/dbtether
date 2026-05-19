@@ -10,10 +10,11 @@ import (
 type MockClient struct {
 	mu         sync.RWMutex
 	databases  map[string]bool
-	dbOwners   map[string]string          // database -> "namespace/name"
-	extensions map[string][]string        // database -> extensions
-	users      map[string]string          // username -> password
-	userAccess map[string]map[string]bool // username -> database -> hasAccess
+	dbOwners   map[string]string               // database -> "namespace/name"
+	extensions map[string][]string             // database -> extensions
+	users      map[string]string               // username -> password
+	userAccess map[string]map[string]bool      // username -> database -> hasAccess
+	roleParams map[string]map[RoleParam]string // username -> param key -> value
 
 	Version    string
 	ShouldFail bool
@@ -210,6 +211,56 @@ func (m *MockClient) SetConnectionLimit(ctx context.Context, username string, li
 	return nil
 }
 
+func (m *MockClient) GetRoleParameter(ctx context.Context, username string, key RoleParam) (value string, exists bool, err error) {
+	if m.ShouldFail {
+		return "", false, m.FailError
+	}
+	if _, ok := allowedRoleParams[key]; !ok {
+		return "", false, fmt.Errorf("%w: %q", ErrInvalidRoleParam, key)
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.roleParams[username] == nil {
+		return "", false, nil
+	}
+	v, ok := m.roleParams[username][key]
+	return v, ok, nil
+}
+
+func (m *MockClient) SetRoleParameter(ctx context.Context, username string, key RoleParam, value string) error {
+	if m.ShouldFail {
+		return m.FailError
+	}
+	if _, ok := allowedRoleParams[key]; !ok {
+		return fmt.Errorf("%w: %q", ErrInvalidRoleParam, key)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.roleParams == nil {
+		m.roleParams = make(map[string]map[RoleParam]string)
+	}
+	if m.roleParams[username] == nil {
+		m.roleParams[username] = make(map[RoleParam]string)
+	}
+	m.roleParams[username][key] = value
+	return nil
+}
+
+func (m *MockClient) ResetRoleParameter(ctx context.Context, username string, key RoleParam) error {
+	if m.ShouldFail {
+		return m.FailError
+	}
+	if _, ok := allowedRoleParams[key]; !ok {
+		return fmt.Errorf("%w: %q", ErrInvalidRoleParam, key)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.roleParams[username] != nil {
+		delete(m.roleParams[username], key)
+	}
+	return nil
+}
+
 func (m *MockClient) DropUser(ctx context.Context, username string) error {
 	if m.ShouldFail {
 		return m.FailError
@@ -362,6 +413,12 @@ func (m *MockClient) GetUsers() []string {
 		result = append(result, user)
 	}
 	return result
+}
+
+// Test-only helper without ctx/error plumbing.
+func (m *MockClient) LookupRoleParameter(username string, key RoleParam) (string, bool) {
+	v, ok, _ := m.GetRoleParameter(context.Background(), username, key)
+	return v, ok
 }
 
 // MockClientCache implements ClientCacheInterface for testing

@@ -60,9 +60,9 @@ jobs:
 
       - name: Verify CRDs are up to date
         run: |
-          go run sigs.k8s.io/controller-tools/cmd/controller-gen@latest object:headerFile="hack/boilerplate.go.txt" paths="./..."
-          go run sigs.k8s.io/controller-tools/cmd/controller-gen@latest rbac:roleName=manager-role crd paths="./..." output:crd:artifacts:config=config/crd/bases
-          git diff --exit-code config/crd/bases/
+          go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.20.1 object:headerFile="hack/boilerplate.go.txt" paths="./..."
+          go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.20.1 rbac:roleName=manager-role crd paths="./..." output:crd:artifacts:config=config/crd/bases
+          git diff --exit-code config/crd/bases/ api/v1alpha1/zz_generated.deepcopy.go
 
   chart:
     runs-on: ubuntu-latest

@@ -60,7 +60,19 @@ spec:
                 items:
                   properties:
                     privileges:
+                      description: |-
+                        Enum is admission-time gate; controller re-validates before SQL composition
+                        so admission bypass alone cannot reach GRANT.
                       items:
+                        enum:
+                        - SELECT
+                        - INSERT
+                        - UPDATE
+                        - DELETE
+                        - TRUNCATE
+                        - REFERENCES
+                        - TRIGGER
+                        - USAGE
                         type: string
                       minItems: 1
                       type: array
@@ -130,6 +142,15 @@ spec:
                 - Delete
                 - Retain
                 type: string
+              idleInTransactionTimeout:
+                description: |-
+                  IdleInTransactionTimeout aborts sessions that stay idle inside a transaction
+                  longer than this duration. Unset clears any role-level override. Minimum 1ms
+                  because PostgreSQL truncates to ms and 0 means "disabled" (use unset for that).
+                type: string
+                x-kubernetes-validations:
+                - message: idleInTransactionTimeout must be at least 1ms
+                  rule: duration(self) >= duration('1ms')
               password:
                 properties:
                   length:

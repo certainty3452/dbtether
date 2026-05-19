@@ -14,6 +14,36 @@ import (
 	"github.com/lib/pq"
 )
 
+// Typed aliases make "anything goes" parameters cost a deliberate conversion
+// at the callsite — grep-friendly and reviewable. Runtime allowlist below is
+// the second line of defence over the type.
+type RoleParam string
+type TablePrivilege string
+
+const (
+	RoleParamIdleInTransactionTimeout RoleParam = "idle_in_transaction_session_timeout"
+)
+
+var allowedRoleParams = map[RoleParam]struct{}{
+	RoleParamIdleInTransactionTimeout: {},
+}
+
+var allowedTablePrivileges = map[TablePrivilege]struct{}{
+	"SELECT":     {},
+	"INSERT":     {},
+	"UPDATE":     {},
+	"DELETE":     {},
+	"TRUNCATE":   {},
+	"REFERENCES": {},
+	"TRIGGER":    {},
+	"USAGE":      {},
+}
+
+var (
+	ErrInvalidTablePrivilege = errors.New("invalid table privilege")
+	ErrInvalidRoleParam      = errors.New("invalid role parameter")
+)
+
 type Config struct {
 	Host     string
 	Port     int
@@ -45,6 +75,9 @@ type ClientInterface interface {
 	CreateUser(ctx context.Context, username, password string) error
 	SetPassword(ctx context.Context, username, password string) error
 	SetConnectionLimit(ctx context.Context, username string, limit int) error
+	GetRoleParameter(ctx context.Context, username string, key RoleParam) (value string, exists bool, err error)
+	SetRoleParameter(ctx context.Context, username string, key RoleParam, value string) error
+	ResetRoleParameter(ctx context.Context, username string, key RoleParam) error
 	DropUser(ctx context.Context, username string) error
 	RevokeAllDatabaseAccess(ctx context.Context, username string) error
 	GrantDatabaseAccess(ctx context.Context, username, database string) error
@@ -429,6 +462,57 @@ func (c *Client) SetConnectionLimit(ctx context.Context, username string, limit 
 	return nil
 }
 
+func (c *Client) GetRoleParameter(ctx context.Context, username string, key RoleParam) (value string, exists bool, err error) {
+	if _, ok := allowedRoleParams[key]; !ok {
+		return "", false, fmt.Errorf("%w: %q", ErrInvalidRoleParam, key)
+	}
+	var rolconfig []string
+	if scanErr := c.pool.QueryRow(ctx,
+		`SELECT COALESCE(rolconfig, '{}'::text[]) FROM pg_roles WHERE rolname = $1`,
+		username,
+	).Scan(&rolconfig); scanErr != nil {
+		return "", false, fmt.Errorf("failed to read role config for %s: %w", username, scanErr)
+	}
+	for _, entry := range rolconfig {
+		k, v, ok := strings.Cut(entry, "=")
+		if ok && k == string(key) {
+			return v, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+func (c *Client) SetRoleParameter(ctx context.Context, username string, key RoleParam, value string) error {
+	if _, ok := allowedRoleParams[key]; !ok {
+		return fmt.Errorf("%w: %q", ErrInvalidRoleParam, key)
+	}
+	query := fmt.Sprintf(
+		"ALTER ROLE %s SET %s = %s",
+		pq.QuoteIdentifier(username),
+		string(key),
+		pq.QuoteLiteral(value),
+	)
+	if _, err := c.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("failed to set role parameter %s on %s: %w", key, username, err)
+	}
+	return nil
+}
+
+func (c *Client) ResetRoleParameter(ctx context.Context, username string, key RoleParam) error {
+	if _, ok := allowedRoleParams[key]; !ok {
+		return fmt.Errorf("%w: %q", ErrInvalidRoleParam, key)
+	}
+	query := fmt.Sprintf(
+		"ALTER ROLE %s RESET %s",
+		pq.QuoteIdentifier(username),
+		string(key),
+	)
+	if _, err := c.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("failed to reset role parameter %s on %s: %w", key, username, err)
+	}
+	return nil
+}
+
 func (c *Client) DropUser(ctx context.Context, username string) error {
 	query := fmt.Sprintf("DROP USER IF EXISTS %s", pq.QuoteIdentifier(username))
 	_, err := c.pool.Exec(ctx, query)
@@ -712,20 +796,37 @@ func (c *Client) transferSequenceOwnership(ctx context.Context, conn *pgx.Conn, 
 }
 
 func (c *Client) applyTableGrant(ctx context.Context, conn *pgx.Conn, quotedUser string, grant TableGrant) error {
+	privs, err := joinAllowedPrivileges(grant.Privileges)
+	if err != nil {
+		return err
+	}
 	for _, table := range grant.Tables {
-		privs := ""
-		for i, p := range grant.Privileges {
-			if i > 0 {
-				privs += ", "
-			}
-			privs += p
-		}
 		query := fmt.Sprintf("GRANT %s ON TABLE %s TO %s", privs, pq.QuoteIdentifier(table), quotedUser)
 		if _, err := conn.Exec(ctx, query); err != nil {
 			return fmt.Errorf("failed to apply table grant on %s: %w", table, err)
 		}
 	}
 	return nil
+}
+
+// Refuses anything off the allowlist before concatenation reaches SQL. Upper-cases
+// are tolerated as hygiene for direct (non-CRD) callers like unit tests; CRD-enum
+// admission is case-sensitive so production traffic is already canonical.
+// Empty slice fails loudly because the CRD MinItems=1 might be bypassed in the future
+// and this helper is the last line of defence before "GRANT  ON TABLE …" syntax error.
+func joinAllowedPrivileges(privileges []TablePrivilege) (string, error) {
+	if len(privileges) == 0 {
+		return "", fmt.Errorf("%w: no privileges provided", ErrInvalidTablePrivilege)
+	}
+	parts := make([]string, 0, len(privileges))
+	for _, p := range privileges {
+		up := TablePrivilege(strings.ToUpper(strings.TrimSpace(string(p))))
+		if _, ok := allowedTablePrivileges[up]; !ok {
+			return "", fmt.Errorf("%w: %q", ErrInvalidTablePrivilege, p)
+		}
+		parts = append(parts, string(up))
+	}
+	return strings.Join(parts, ", "), nil
 }
 
 func (c *Client) VerifyDatabaseIsolation(ctx context.Context, username, allowedDatabase string) ([]string, error) {
@@ -815,5 +916,5 @@ func (c *Client) ReassignOwnership(ctx context.Context, fromUser, database strin
 
 type TableGrant struct {
 	Tables     []string
-	Privileges []string
+	Privileges []TablePrivilege
 }

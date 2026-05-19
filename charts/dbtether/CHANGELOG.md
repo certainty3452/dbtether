@@ -2,6 +2,19 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.6.0] - 2026-05-19
+
+### Added
+- DatabaseUser supports idleInTransactionTimeout to abort hanging transactions per role
+
+### Changed
+- DatabaseUser transitions to Failed (was Ready) when ConnectionLimit cannot be applied, matching the new idle_in_transaction policy
+
+### Security
+- DatabaseUser.additionalGrants.privileges is now restricted to a fixed allowlist; arbitrary strings could previously be composed into GRANT statements by anyone with create rights on the CR
+- Restore no longer passes the database password on the psql argv (was visible via /proc/cmdline)
+- Restore no longer interpolates the database name into a SQL literal unescaped
+
 ## [0.5.8] - 2026-04-24
 
 ### Fixed

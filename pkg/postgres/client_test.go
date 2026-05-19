@@ -70,6 +70,50 @@ func TestIsDatabaseNotExistError(t *testing.T) {
 	}
 }
 
+func TestJoinAllowedPrivileges(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   []TablePrivilege
+		want    string
+		wantErr bool
+		wantBad string
+	}{
+		{name: "single SELECT", input: []TablePrivilege{"SELECT"}, want: "SELECT"},
+		{name: "canonicalises case", input: []TablePrivilege{"select", "Insert"}, want: "SELECT, INSERT"},
+		{name: "trims whitespace", input: []TablePrivilege{" SELECT "}, want: "SELECT"},
+		{name: "full allowlist", input: []TablePrivilege{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "USAGE"},
+			want: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, USAGE"},
+		{name: "rejects SQL injection payload",
+			input: []TablePrivilege{"SELECT; CREATE ROLE evil SUPERUSER --"}, wantErr: true,
+			wantBad: "SELECT; CREATE ROLE evil SUPERUSER --"},
+		{name: "rejects bogus privilege", input: []TablePrivilege{"DROP"}, wantErr: true, wantBad: "DROP"},
+		{name: "rejects empty string", input: []TablePrivilege{""}, wantErr: true, wantBad: ""},
+		{name: "rejects whitespace only", input: []TablePrivilege{" "}, wantErr: true, wantBad: " "},
+		{name: "rejects empty slice", input: []TablePrivilege{}, wantErr: true},
+		{name: "rejects nil slice", input: nil, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := joinAllowedPrivileges(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil (result: %q)", got)
+				}
+				if !errors.Is(err, ErrInvalidTablePrivilege) {
+					t.Fatalf("expected ErrInvalidTablePrivilege, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsTransientError(t *testing.T) {
 	tests := []struct {
 		name     string

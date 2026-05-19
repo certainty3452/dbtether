@@ -40,6 +40,13 @@ type DatabaseUserSpec struct {
 	// +kubebuilder:default=-1
 	ConnectionLimit int `json:"connectionLimit,omitempty"`
 
+	// IdleInTransactionTimeout aborts sessions that stay idle inside a transaction
+	// longer than this duration. Unset clears any role-level override. Minimum 1ms
+	// because PostgreSQL truncates to ms and 0 means "disabled" (use unset for that).
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1ms')",message="idleInTransactionTimeout must be at least 1ms"
+	IdleInTransactionTimeout *metav1.Duration `json:"idleInTransactionTimeout,omitempty"`
+
 	// +optional
 	// +kubebuilder:validation:Enum=Delete;Retain
 	// +kubebuilder:default=Delete
@@ -99,8 +106,11 @@ type TableGrant struct {
 	// +kubebuilder:validation:MinItems=1
 	Tables []string `json:"tables"`
 
+	// Enum is admission-time gate; controller re-validates before SQL composition
+	// so admission bypass alone cannot reach GRANT.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:items:Enum=SELECT;INSERT;UPDATE;DELETE;TRUNCATE;REFERENCES;TRIGGER;USAGE
 	Privileges []string `json:"privileges"`
 }
 

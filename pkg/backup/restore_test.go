@@ -141,6 +141,59 @@ func TestRestoreConfig_SSLMode(t *testing.T) {
 	assert.Equal(t, "verify-full", config.SSLMode)
 }
 
+func TestPsqlArgs_PasswordNotInArgv(t *testing.T) {
+	cfg := &RestoreConfig{
+		Host: "db.example.com", Port: 5432, Username: "admin",
+		Password: "p@ssw0rd!secret", SSLMode: "require",
+	}
+	args := psqlArgs(cfg, "mydb")
+	for _, a := range args {
+		assert.NotContains(t, a, cfg.Password,
+			"password must never appear in psql argv; goes through PGPASSWORD only")
+		assert.NotContains(t, a, "sslmode=",
+			"sslmode must go through PGSSLMODE env, not --set= (psql var) or argv")
+	}
+}
+
+func TestPsqlEnv_PropagatesPasswordAndSSLMode(t *testing.T) {
+	cfg := &RestoreConfig{Password: "secret", SSLMode: "require"}
+	env := psqlEnv(cfg)
+	var sawPwd, sawSSL bool
+	for _, e := range env {
+		if e == "PGPASSWORD=secret" {
+			sawPwd = true
+		}
+		if e == "PGSSLMODE=require" {
+			sawSSL = true
+		}
+	}
+	assert.True(t, sawPwd, "PGPASSWORD missing")
+	assert.True(t, sawSSL, "PGSSLMODE missing — sslmode would silently fall back to libpq default")
+}
+
+func TestPsqlEnv_SkipsEmptySSLMode(t *testing.T) {
+	cfg := &RestoreConfig{Password: "secret", SSLMode: ""}
+	for _, e := range psqlEnv(cfg) {
+		assert.NotEqual(t, "PGSSLMODE=", e,
+			"empty PGSSLMODE would be rejected by libpq; skip the var entirely so libpq uses its default")
+	}
+}
+
+func TestQuoteLiteral(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"mydb", "'mydb'"},
+		{"my'db", "'my''db'"},
+		{"'; DROP DATABASE postgres; --", "'''; DROP DATABASE postgres; --'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			assert.Equal(t, tt.want, quoteLiteral(tt.in))
+		})
+	}
+}
+
 func TestRestoreConfig_SourcePath(t *testing.T) {
 	tests := []struct {
 		path      string

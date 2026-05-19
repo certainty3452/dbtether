@@ -10,8 +10,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
+	"github.com/certainty3452/dbtether/pkg/postgres"
 )
 
 var _ = Describe("DatabaseUser Controller", func() {
@@ -419,6 +421,75 @@ var _ = Describe("DatabaseUser Controller", func() {
 
 			By(stepCleaningUp)
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should reject additionalGrants privileges outside the allowlist", func() {
+			By("Creating a DatabaseUser with a SQL-injection payload in privileges")
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-priv-injection",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{
+						Name: databaseName,
+					},
+					Privileges: "readonly",
+					AdditionalGrants: []databasesv1alpha1.TableGrant{
+						{
+							Tables:     []string{"users"},
+							Privileges: []string{"SELECT; CREATE ROLE evil SUPERUSER --"},
+						},
+					},
+				},
+			}
+			err := k8sClient.Create(ctx, user)
+			Expect(err).Should(HaveOccurred())
+			Expect(err.Error()).Should(ContainSubstring("Unsupported value"))
+		})
+
+		It("Should apply idleInTransactionTimeout via ALTER ROLE SET", func() {
+			By(stepCreatingUser)
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-idle-timeout",
+					Namespace: namespace,
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{
+						Name: databaseName,
+					},
+					Privileges:               "readonly",
+					IdleInTransactionTimeout: &metav1.Duration{Duration: 5 * time.Minute},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+
+			By("Waiting for the role parameter to be set on the mock client")
+			Eventually(func() string {
+				v, _ := mockPGCache.DefaultMock.LookupRoleParameter(
+					"user_idle_timeout", postgres.RoleParamIdleInTransactionTimeout)
+				return v
+			}, timeout, interval).Should(Equal("300000ms"))
+
+			By("Clearing the field and verifying RESET drift handling")
+			created := &databasesv1alpha1.DatabaseUser{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      "user-idle-timeout",
+				Namespace: namespace,
+			}, created)).Should(Succeed())
+			patch := client.MergeFrom(created.DeepCopy())
+			created.Spec.IdleInTransactionTimeout = nil
+			Expect(k8sClient.Patch(ctx, created, patch)).Should(Succeed())
+
+			Eventually(func() bool {
+				_, ok := mockPGCache.DefaultMock.LookupRoleParameter(
+					"user_idle_timeout", postgres.RoleParamIdleInTransactionTimeout)
+				return ok
+			}, timeout, interval).Should(BeFalse())
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, created)).Should(Succeed())
 		})
 
 		It("Should accept unlimited connections (-1)", func() {

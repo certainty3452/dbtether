@@ -351,9 +351,13 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 
 		additionalGrants := make([]postgres.TableGrant, len(user.Spec.AdditionalGrants))
 		for j, g := range user.Spec.AdditionalGrants {
+			privs := make([]postgres.TablePrivilege, len(g.Privileges))
+			for k, p := range g.Privileges {
+				privs[k] = postgres.TablePrivilege(p)
+			}
 			additionalGrants[j] = postgres.TableGrant{
 				Tables:     g.Tables,
-				Privileges: g.Privileges,
+				Privileges: privs,
 			}
 		}
 
@@ -382,11 +386,23 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 		}
 	}
 
-	// Set connection limit
+	// Role-level settings: both ConnectionLimit and idle_in_transaction_session_timeout
+	// are load-bearing on the role itself, so a failure here means we didn't reach
+	// desired state — trip to Failed rather than logging and pretending Ready.
 	if user.Spec.ConnectionLimit != 0 {
 		if err := pgClient.SetConnectionLimit(ctx, username, user.Spec.ConnectionLimit); err != nil {
-			logger.Error(err, "failed to set connection limit")
+			baseStatus.Phase = "Failed"
+			baseStatus.Message = fmt.Sprintf("failed to set connection limit: %s", err.Error())
+			baseStatus.SecretName = secretName
+			return r.setStatus(ctx, user, &baseStatus)
 		}
+	}
+
+	if err := r.syncIdleInTransactionTimeout(ctx, pgClient, username, user); err != nil {
+		baseStatus.Phase = "Failed"
+		baseStatus.Message = fmt.Sprintf("failed to apply idle_in_transaction_session_timeout: %s", err.Error())
+		baseStatus.SecretName = secretName
+		return r.setStatus(ctx, user, &baseStatus)
 	}
 
 	// Verify isolation
@@ -401,6 +417,30 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 	baseStatus.Databases = dbStatuses
 	baseStatus.RequeueAfter = r.calculateRequeueAfter(user)
 	return r.setStatus(ctx, user, &baseStatus)
+}
+
+// Read pg_roles.rolconfig first so periodic reconciles don't emit ALTER ROLE
+// when state already matches — especially RESET in the common unset case.
+func (r *DatabaseUserReconciler) syncIdleInTransactionTimeout(ctx context.Context,
+	pgClient postgres.ClientInterface, username string, user *databasesv1alpha1.DatabaseUser) error {
+
+	current, hasCurrent, err := pgClient.GetRoleParameter(ctx, username, postgres.RoleParamIdleInTransactionTimeout)
+	if err != nil {
+		return err
+	}
+
+	if user.Spec.IdleInTransactionTimeout != nil {
+		desired := fmt.Sprintf("%dms", user.Spec.IdleInTransactionTimeout.Milliseconds())
+		if hasCurrent && current == desired {
+			return nil
+		}
+		return pgClient.SetRoleParameter(ctx, username, postgres.RoleParamIdleInTransactionTimeout, desired)
+	}
+
+	if !hasCurrent {
+		return nil
+	}
+	return pgClient.ResetRoleParameter(ctx, username, postgres.RoleParamIdleInTransactionTimeout)
 }
 
 func (r *DatabaseUserReconciler) shouldRotatePassword(user *databasesv1alpha1.DatabaseUser) bool {

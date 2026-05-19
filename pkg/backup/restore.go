@@ -125,40 +125,57 @@ func downloadBackup(ctx context.Context, cfg *RestoreConfig, logger *slog.Logger
 	}
 }
 
+// Password and sslmode go through libpq env vars only. argv is world-readable
+// via /proc/<pid>/cmdline; --set=sslmode= only sets a psql script variable,
+// not the libpq connection parameter (connection happens before the variable
+// is visible, so SSL would silently fall back to libpq default = prefer).
+func psqlArgs(cfg *RestoreConfig, dbName string) []string {
+	return []string{
+		"-h", cfg.Host,
+		"-p", fmt.Sprintf("%d", cfg.Port),
+		"-U", cfg.Username,
+		"-d", dbName,
+	}
+}
+
+func psqlEnv(cfg *RestoreConfig) []string {
+	env := append(os.Environ(), "PGPASSWORD="+cfg.Password)
+	if cfg.SSLMode != "" {
+		env = append(env, "PGSSLMODE="+cfg.SSLMode)
+	}
+	return env
+}
+
 func dropAndRecreateDatabase(ctx context.Context, cfg *RestoreConfig, logger *slog.Logger) error {
 	logger.Info("dropping and recreating database", "database", cfg.Database)
 
-	// Connect to postgres database to drop/create target database
-	connStr := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=postgres sslmode=%s",
-		cfg.Host, cfg.Port, cfg.Username, cfg.Password, cfg.SSLMode,
-	)
-
-	// Drop existing connections
 	dropConnsSQL := fmt.Sprintf(`
 		SELECT pg_terminate_backend(pid)
 		FROM pg_stat_activity
-		WHERE datname = '%s' AND pid <> pg_backend_pid()
-	`, cfg.Database)
+		WHERE datname = %s AND pid <> pg_backend_pid()
+	`, quoteLiteral(cfg.Database))
 
-	cmd := exec.CommandContext(ctx, "psql", connStr, "-c", dropConnsSQL) //nolint:gosec // intentional variable-based command
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", cfg.Password))
+	base := psqlArgs(cfg, "postgres")
+
+	//nolint:gosec // args are operator-controlled (CRD spec), password via env not argv
+	cmd := exec.CommandContext(ctx, "psql", append(base, "-c", dropConnsSQL)...)
+	cmd.Env = psqlEnv(cfg)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		logger.Warn("failed to terminate connections", "output", string(output))
 	}
 
-	// Drop database
 	dropSQL := fmt.Sprintf("DROP DATABASE IF EXISTS %s", quoteIdentifier(cfg.Database))
-	cmd = exec.CommandContext(ctx, "psql", connStr, "-c", dropSQL) //nolint:gosec // intentional variable-based command
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", cfg.Password))
+	//nolint:gosec // args are operator-controlled (CRD spec), password via env not argv
+	cmd = exec.CommandContext(ctx, "psql", append(base, "-c", dropSQL)...)
+	cmd.Env = psqlEnv(cfg)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to drop database: %s: %w", string(output), err)
 	}
 
-	// Create database
 	createSQL := fmt.Sprintf("CREATE DATABASE %s", quoteIdentifier(cfg.Database))
-	cmd = exec.CommandContext(ctx, "psql", connStr, "-c", createSQL) //nolint:gosec // intentional variable-based command
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", cfg.Password))
+	//nolint:gosec // args are operator-controlled (CRD spec), password via env not argv
+	cmd = exec.CommandContext(ctx, "psql", append(base, "-c", createSQL)...)
+	cmd.Env = psqlEnv(cfg)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to create database: %s: %w", string(output), err)
 	}
@@ -168,16 +185,12 @@ func dropAndRecreateDatabase(ctx context.Context, cfg *RestoreConfig, logger *sl
 }
 
 func isDatabaseEmpty(ctx context.Context, cfg *RestoreConfig) (bool, error) {
-	connStr := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Host, cfg.Port, cfg.Username, cfg.Password, cfg.Database, cfg.SSLMode,
-	)
-
-	// Count tables in public schema
 	sql := `SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public'`
 
-	cmd := exec.CommandContext(ctx, "psql", connStr, "-t", "-c", sql) //nolint:gosec // intentional variable-based command
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", cfg.Password))
+	args := append(psqlArgs(cfg, cfg.Database), "-t", "-c", sql)
+	//nolint:gosec // args are operator-controlled (CRD spec), password via env not argv
+	cmd := exec.CommandContext(ctx, "psql", args...)
+	cmd.Env = psqlEnv(cfg)
 	output, err := cmd.Output()
 	if err != nil {
 		return false, err
@@ -190,12 +203,6 @@ func isDatabaseEmpty(ctx context.Context, cfg *RestoreConfig) (bool, error) {
 func restoreWithPsql(ctx context.Context, cfg *RestoreConfig, backupData io.ReadCloser, logger *slog.Logger) error {
 	logger.Info("restoring database with psql", "database", cfg.Database)
 
-	connStr := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Host, cfg.Port, cfg.Username, cfg.Password, cfg.Database, cfg.SSLMode,
-	)
-
-	// Decompress if gzipped
 	var reader io.Reader = backupData
 	if strings.HasSuffix(cfg.SourcePath, ".gz") {
 		gzReader, err := gzip.NewReader(backupData)
@@ -210,9 +217,10 @@ func restoreWithPsql(ctx context.Context, cfg *RestoreConfig, backupData io.Read
 		reader = gzReader
 	}
 
-	cmd := exec.CommandContext(ctx, "psql", connStr) //nolint:gosec // intentional variable-based command
+	//nolint:gosec // args are operator-controlled (CRD spec), password via env not argv
+	cmd := exec.CommandContext(ctx, "psql", psqlArgs(cfg, cfg.Database)...)
 	cmd.Stdin = reader
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", cfg.Password))
+	cmd.Env = psqlEnv(cfg)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -223,6 +231,12 @@ func restoreWithPsql(ctx context.Context, cfg *RestoreConfig, backupData io.Read
 	return nil
 }
 
+// Local copies so the backup-job binary doesn't pull lib/pq just for two
+// quoters. Keep behaviour identical to pq.QuoteIdentifier / pq.QuoteLiteral.
 func quoteIdentifier(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+func quoteLiteral(s string) string {
+	return `'` + strings.ReplaceAll(s, `'`, `''`) + `'`
 }

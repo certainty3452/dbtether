@@ -777,6 +777,11 @@ func (in *DatabaseUserSpec) DeepCopyInto(out *DatabaseUserSpec) {
 		*out = new(RotationConfig)
 		**out = **in
 	}
+	if in.IdleInTransactionTimeout != nil {
+		in, out := &in.IdleInTransactionTimeout, &out.IdleInTransactionTimeout
+		*out = new(v1.Duration)
+		**out = **in
+	}
 	if in.Secret != nil {
 		in, out := &in.Secret, &out.Secret
 		*out = new(SecretConfig)
