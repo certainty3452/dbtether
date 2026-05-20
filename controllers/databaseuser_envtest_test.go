@@ -1509,4 +1509,405 @@ var _ = Describe("DatabaseUser Controller", func() {
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
 		})
 	})
+
+	Context("When secret template changes after Ready", func() {
+		awaitReady := func(name string) {
+			Eventually(func() string {
+				u := &databasesv1alpha1.DatabaseUser{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, u); err != nil {
+					return ""
+				}
+				return u.Status.Phase
+			}, timeout, interval).Should(Equal("Ready"))
+		}
+
+		It("Should rebuild secret when template changes raw→DB and preserve password", func() {
+			name := "user-tpl-raw-to-db"
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database:   &databasesv1alpha1.DatabaseAccess{Name: databaseName},
+					Privileges: "readonly",
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+			awaitReady(name)
+
+			By("capturing the original password from the raw-shape secret")
+			secretName := name + "-credentials"
+			origSecret := &corev1.Secret{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, origSecret)
+			}, timeout, interval).Should(Succeed())
+			originalPwd := string(origSecret.Data["password"])
+			Expect(originalPwd).ShouldNot(BeEmpty())
+
+			By("switching template to DB")
+			Eventually(func() error {
+				u := &databasesv1alpha1.DatabaseUser{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, u); err != nil {
+					return err
+				}
+				u.Spec.Secret = &databasesv1alpha1.SecretConfig{Template: "DB"}
+				return k8sClient.Update(ctx, u)
+			}, timeout, interval).Should(Succeed())
+
+			By("verifying secret has DB_* keys and no raw keys, password preserved")
+			Eventually(func() bool {
+				s := &corev1.Secret{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, s); err != nil {
+					return false
+				}
+				_, hasOldPassword := s.Data["password"]
+				_, hasOldHost := s.Data["host"]
+				return !hasOldPassword && !hasOldHost && string(s.Data["DB_PASSWORD"]) == originalPwd
+			}, timeout, interval).Should(BeTrue())
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should rebuild secret when template changes dsn→DB and recover password from DSN", func() {
+			name := "user-tpl-dsn-to-db"
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database:   &databasesv1alpha1.DatabaseAccess{Name: databaseName},
+					Privileges: "readonly",
+					Secret:     &databasesv1alpha1.SecretConfig{Template: "dsn"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+			awaitReady(name)
+
+			By("capturing password by parsing the DSN")
+			secretName := name + "-credentials"
+			origSecret := &corev1.Secret{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, origSecret)
+			}, timeout, interval).Should(Succeed())
+			Expect(origSecret.Data["dsn"]).ShouldNot(BeEmpty())
+			originalPwd := passwordFromDSN(origSecret.Data["dsn"])
+			Expect(originalPwd).ShouldNot(BeEmpty())
+
+			By("switching template to DB")
+			Eventually(func() error {
+				u := &databasesv1alpha1.DatabaseUser{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, u); err != nil {
+					return err
+				}
+				u.Spec.Secret.Template = "DB"
+				return k8sClient.Update(ctx, u)
+			}, timeout, interval).Should(Succeed())
+
+			By("verifying old dsn key is gone and DB_PASSWORD matches original")
+			Eventually(func() bool {
+				s := &corev1.Secret{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, s); err != nil {
+					return false
+				}
+				_, hasDSN := s.Data["dsn"]
+				return !hasDSN && string(s.Data["DB_PASSWORD"]) == originalPwd
+			}, timeout, interval).Should(BeTrue())
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should regenerate password when custom password-key is renamed", func() {
+			name := "user-tpl-custom-rename"
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database:   &databasesv1alpha1.DatabaseAccess{Name: databaseName},
+					Privileges: "readonly",
+					Secret: &databasesv1alpha1.SecretConfig{
+						Template: "custom",
+						Keys: &databasesv1alpha1.SecretKeys{
+							Password: "PGPASSWORD",
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+			awaitReady(name)
+
+			secretName := name + "-credentials"
+			origSecret := &corev1.Secret{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, origSecret)
+			}, timeout, interval).Should(Succeed())
+			Expect(origSecret.Data["PGPASSWORD"]).ShouldNot(BeEmpty())
+
+			origUpdatedAt := metav1.Time{}
+			origUser := &databasesv1alpha1.DatabaseUser{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, origUser); err == nil && origUser.Status.PasswordUpdatedAt != nil {
+				origUpdatedAt = *origUser.Status.PasswordUpdatedAt
+			}
+			// metav1.Time strips to second precision — force the rename into a
+			// different second so PasswordUpdatedAt bump is observable.
+			time.Sleep(1100 * time.Millisecond)
+
+			By("renaming custom password key to a non-built-in name")
+			Eventually(func() error {
+				u := &databasesv1alpha1.DatabaseUser{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, u); err != nil {
+					return err
+				}
+				u.Spec.Secret.Keys.Password = "MY_CUSTOM_PWD"
+				return k8sClient.Update(ctx, u)
+			}, timeout, interval).Should(Succeed())
+
+			By("secret has only the new key MY_CUSTOM_PWD; PasswordUpdatedAt bumps (regen, not migrate)")
+			Eventually(func(g Gomega) {
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, s)).Should(Succeed())
+				g.Expect(s.Data).ShouldNot(HaveKey("PGPASSWORD"))
+				g.Expect(s.Data["MY_CUSTOM_PWD"]).ShouldNot(BeEmpty())
+				u := &databasesv1alpha1.DatabaseUser{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, u)).Should(Succeed())
+				g.Expect(u.Status.PasswordUpdatedAt).ShouldNot(BeNil())
+				g.Expect(u.Status.PasswordUpdatedAt.After(origUpdatedAt.Time)).Should(BeTrue(),
+					"PasswordUpdatedAt did not bump: orig=%s, current=%s", origUpdatedAt.Time, u.Status.PasswordUpdatedAt.Time)
+			}, timeout, interval).Should(Succeed())
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+		It("Should rebuild secret when template changes raw→dsn", func() {
+			name := "user-tpl-raw-to-dsn"
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database:   &databasesv1alpha1.DatabaseAccess{Name: databaseName},
+					Privileges: "readonly",
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+			awaitReady(name)
+
+			secretName := name + "-credentials"
+			origSecret := &corev1.Secret{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, origSecret)
+			}, timeout, interval).Should(Succeed())
+			originalPwd := string(origSecret.Data["password"])
+			Expect(originalPwd).ShouldNot(BeEmpty())
+
+			By("switching template to dsn")
+			Eventually(func() error {
+				u := &databasesv1alpha1.DatabaseUser{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, u); err != nil {
+					return err
+				}
+				u.Spec.Secret = &databasesv1alpha1.SecretConfig{Template: "dsn"}
+				return k8sClient.Update(ctx, u)
+			}, timeout, interval).Should(Succeed())
+
+			By("verifying secret has only dsn key and password is preserved")
+			Eventually(func() bool {
+				s := &corev1.Secret{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, s); err != nil {
+					return false
+				}
+				if len(s.Data) != 1 {
+					return false
+				}
+				return passwordFromDSN(s.Data["dsn"]) == originalPwd
+			}, timeout, interval).Should(BeTrue())
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+	})
+
+	Context("When OwnerReference is stripped externally (soft-ownership)", func() {
+		awaitReady := func(name string) {
+			Eventually(func() string {
+				u := &databasesv1alpha1.DatabaseUser{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, u); err != nil {
+					return ""
+				}
+				return u.Status.Phase
+			}, timeout, interval).Should(Equal("Ready"))
+		}
+
+		It("Should re-attach OwnerReference without rotating password", func() {
+			name := "user-soft-owned"
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database:   &databasesv1alpha1.DatabaseAccess{Name: databaseName},
+					Privileges: "readonly",
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+			awaitReady(name)
+
+			secretName := name + "-credentials"
+			origSecret := &corev1.Secret{}
+			Eventually(func() error {
+				return k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, origSecret)
+			}, timeout, interval).Should(Succeed())
+			Expect(origSecret.Annotations[ManagedByAnnotation]).Should(Equal(name))
+			Expect(origSecret.OwnerReferences).ShouldNot(BeEmpty())
+			origPwd := string(origSecret.Data["password"])
+			Expect(origPwd).ShouldNot(BeEmpty())
+
+			By("simulating ArgoCD stripping the OwnerReference")
+			Eventually(func() error {
+				s := &corev1.Secret{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, s); err != nil {
+					return err
+				}
+				s.OwnerReferences = nil
+				return k8sClient.Update(ctx, s)
+			}, timeout, interval).Should(Succeed())
+
+			By("triggering a reconcile (spec bump) and checking OwnerRef restored without password change")
+			Eventually(func() error {
+				u := &databasesv1alpha1.DatabaseUser{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, u); err != nil {
+					return err
+				}
+				u.Spec.Privileges = "readwrite"
+				return k8sClient.Update(ctx, u)
+			}, timeout, interval).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, s)).Should(Succeed())
+				g.Expect(s.OwnerReferences).ShouldNot(BeEmpty())
+				g.Expect(s.OwnerReferences[0].Kind).Should(Equal("DatabaseUser"))
+				g.Expect(s.OwnerReferences[0].Name).Should(Equal(name))
+				g.Expect(string(s.Data["password"])).Should(Equal(origPwd), "password should NOT rotate on soft-owned re-claim")
+			}, timeout, interval).Should(Succeed())
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+
+	})
+
+	Context("When onConflict is Merge", func() {
+		awaitReady := func(name string) {
+			Eventually(func() string {
+				u := &databasesv1alpha1.DatabaseUser{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, u); err != nil {
+					return ""
+				}
+				return u.Status.Phase
+			}, timeout, interval).Should(Equal("Ready"))
+		}
+
+		It("Should preserve foreign keys across subsequent reconciles (regression: Merge degraded to Adopt)", func() {
+			name := "user-merge-persist"
+			secretName := name + "-credentials"
+
+			By("pre-creating an unowned secret with a foreign key")
+			pre := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: namespace},
+				Data: map[string][]byte{
+					"foreign_field": []byte("user-controlled-value"),
+				},
+			}
+			Expect(k8sClient.Create(ctx, pre)).Should(Succeed())
+
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database:   &databasesv1alpha1.DatabaseAccess{Name: databaseName},
+					Privileges: "readonly",
+					Secret: &databasesv1alpha1.SecretConfig{
+						OnConflict: "Merge",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+			awaitReady(name)
+
+			By("verifying our keys merged in and foreign key still present after initial merge")
+			Eventually(func() bool {
+				s := &corev1.Secret{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, s); err != nil {
+					return false
+				}
+				return string(s.Data["foreign_field"]) == "user-controlled-value" &&
+					len(s.Data["password"]) > 0 &&
+					s.Annotations[ConflictPolicyAnnotation] == "Merge"
+			}, timeout, interval).Should(BeTrue())
+
+			By("forcing a follow-up reconcile by bumping generation (spec change)")
+			Eventually(func() error {
+				u := &databasesv1alpha1.DatabaseUser{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, u); err != nil {
+					return err
+				}
+				u.Spec.Privileges = "readwrite"
+				return k8sClient.Update(ctx, u)
+			}, timeout, interval).Should(Succeed())
+
+			By("foreign key must STILL be present (regression: was dropped on tick #2)")
+			Consistently(func() bool {
+				s := &corev1.Secret{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, s); err != nil {
+					return false
+				}
+				return string(s.Data["foreign_field"]) == "user-controlled-value"
+			}, time.Second*2, interval).Should(BeTrue())
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+	})
+
+	Context("CRD admission rejects unsupported combinations", func() {
+		It("Should reject secret.name when secretGeneration=perDatabase", func() {
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "user-bad-perdb-name", Namespace: namespace},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database:         &databasesv1alpha1.DatabaseAccess{Name: databaseName},
+					SecretGeneration: "perDatabase",
+					Secret: &databasesv1alpha1.SecretConfig{
+						Name: "explicit-name",
+					},
+				},
+			}
+			err := k8sClient.Create(ctx, user)
+			Expect(err).Should(HaveOccurred())
+			Expect(err.Error()).Should(ContainSubstring("secret.name cannot be set when secretGeneration=perDatabase"))
+		})
+
+		It("Should reject onConflict=Adopt when secretGeneration=perDatabase", func() {
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "user-bad-perdb-adopt", Namespace: namespace},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database:         &databasesv1alpha1.DatabaseAccess{Name: databaseName},
+					SecretGeneration: "perDatabase",
+					Secret: &databasesv1alpha1.SecretConfig{
+						OnConflict: "Adopt",
+					},
+				},
+			}
+			err := k8sClient.Create(ctx, user)
+			Expect(err).Should(HaveOccurred())
+			Expect(err.Error()).Should(ContainSubstring("Adopt/Merge are not supported when secretGeneration=perDatabase"))
+		})
+
+		It("Should accept onConflict=Fail with secretGeneration=perDatabase", func() {
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "user-good-perdb-fail", Namespace: namespace},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database:         &databasesv1alpha1.DatabaseAccess{Name: databaseName},
+					SecretGeneration: "perDatabase",
+					Secret: &databasesv1alpha1.SecretConfig{
+						OnConflict: "Fail",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
+			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+	})
 })

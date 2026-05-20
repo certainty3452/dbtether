@@ -21,6 +21,7 @@ type MockClient struct {
 	SetConnectionLimitCalls int
 	SetRoleParameterCalls   int
 	ResetRoleParameterCalls int
+	SetPasswordCalls        int
 
 	Version    string
 	ShouldFail bool
@@ -204,6 +205,7 @@ func (m *MockClient) SetPassword(ctx context.Context, username, password string)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.SetPasswordCalls++
 	if _, exists := m.users[username]; exists {
 		m.users[username] = password
 	}

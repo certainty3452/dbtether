@@ -290,14 +290,14 @@ func TestDatabaseUserReconciler_GetSecretKeys(t *testing.T) {
 			wantUser: "username", wantPwd: "password",
 		},
 		{
-			name: "dsn template uses default keys",
+			name: "dsn template returns empty keys",
 			user: &databasesv1alpha1.DatabaseUser{
 				Spec: databasesv1alpha1.DatabaseUserSpec{
 					Secret: &databasesv1alpha1.SecretConfig{Template: "dsn"},
 				},
 			},
-			wantHost: "host", wantPort: "port", wantDB: "database",
-			wantUser: "username", wantPwd: "password",
+			wantHost: "", wantPort: "", wantDB: "",
+			wantUser: "", wantPwd: "",
 		},
 	}
 
@@ -1730,23 +1730,23 @@ func TestDatabaseUserReconciler_RotatePassword(t *testing.T) {
 				mockPG.FailError = errors.New("connection failed")
 			}
 
-			password, secretName, passwordChanged, err := r.rotatePassword(ctx, tt.user, tt.secret, cluster, databases, mockPG, "test_user")
+			password, secretName, passwordChanged, err := r.rotatePrimaryPassword(ctx, tt.user, tt.secret, cluster, databases, mockPG, "test_user")
 
 			if (err != nil) != tt.wantErr {
-				t.Errorf("rotatePassword() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("rotatePrimaryPassword() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 
 			if passwordChanged != tt.wantPasswordChanged {
-				t.Errorf("rotatePassword() passwordChanged = %v, want %v", passwordChanged, tt.wantPasswordChanged)
+				t.Errorf("rotatePrimaryPassword() passwordChanged = %v, want %v", passwordChanged, tt.wantPasswordChanged)
 			}
 
 			if !tt.wantErr {
 				if password == "" {
-					t.Error("rotatePassword() password should not be empty")
+					t.Error("rotatePrimaryPassword() password should not be empty")
 				}
 				if secretName == "" {
-					t.Error("rotatePassword() secretName should not be empty")
+					t.Error("rotatePrimaryPassword() secretName should not be empty")
 				}
 			}
 		})
@@ -2177,29 +2177,28 @@ func TestDatabaseUserReconciler_CreateDatabaseSecret(t *testing.T) {
 				}
 
 				// Verify secret has expected keys based on template
-				// Note: fake client doesn't convert StringData to Data, so check StringData
 				hostKey, portKey, dbKey, userKey, pwdKey := r.getSecretKeys(tt.user)
-				if secret.StringData[hostKey] != cluster.Spec.Endpoint {
-					t.Errorf("secret host = %v, want %v", secret.StringData[hostKey], cluster.Spec.Endpoint)
+				if string(secret.Data[hostKey]) != cluster.Spec.Endpoint {
+					t.Errorf("secret host = %q, want %q", secret.Data[hostKey], cluster.Spec.Endpoint)
 				}
-				if secret.StringData[portKey] != "5432" {
-					t.Errorf("secret port = %v, want 5432", secret.StringData[portKey])
+				if string(secret.Data[portKey]) != "5432" {
+					t.Errorf("secret port = %q, want 5432", secret.Data[portKey])
 				}
-				if secret.StringData[dbKey] != "production_db" {
-					t.Errorf("secret database = %v, want production_db", secret.StringData[dbKey])
+				if string(secret.Data[dbKey]) != "production_db" {
+					t.Errorf("secret database = %q, want production_db", secret.Data[dbKey])
 				}
-				if secret.StringData[userKey] != "test_user" {
-					t.Errorf("secret user = %v, want test_user", secret.StringData[userKey])
+				if string(secret.Data[userKey]) != "test_user" {
+					t.Errorf("secret user = %q, want test_user", secret.Data[userKey])
 				}
-				if secret.StringData[pwdKey] != "securepassword123" {
-					t.Errorf("secret password = %v, want securepassword123", secret.StringData[pwdKey])
+				if string(secret.Data[pwdKey]) != "securepassword123" {
+					t.Errorf("secret password = %q, want securepassword123", secret.Data[pwdKey])
 				}
 			}
 		})
 	}
 }
 
-func TestDatabaseUserReconciler_CreatePrimarySecret(t *testing.T) {
+func TestDatabaseUserReconciler_BuildAndCreatePrimarySecret(t *testing.T) {
 	ctx := context.Background()
 
 	cluster := &databasesv1alpha1.DBCluster{
@@ -2287,48 +2286,42 @@ func TestDatabaseUserReconciler_CreatePrimarySecret(t *testing.T) {
 			r := newTestReconciler()
 
 			secretName := "test-user-credentials"
-			err := r.createPrimarySecret(ctx, tt.user, secretName, cluster, tt.databases, "test_user", "password123")
-			if err != nil {
-				t.Errorf("createPrimarySecret() error = %v", err)
+			data := r.buildSecretData(tt.user, cluster, tt.databases, "test_user", "password123")
+			if err := r.createOwnedSecret(ctx, tt.user, secretName, nil, data); err != nil {
+				t.Errorf("createOwnedSecret error = %v", err)
 				return
 			}
 
-			// Verify secret was created
 			var secret corev1.Secret
-			err = r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: "default"}, &secret)
-			if err != nil {
-				t.Errorf("createPrimarySecret() secret not found: %v", err)
+			if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: "default"}, &secret); err != nil {
+				t.Errorf("secret not found: %v", err)
 				return
 			}
 
-			// Check databases field - fake client uses StringData
-			_, hasDatabases := secret.StringData["databases"]
+			_, hasDatabases := secret.Data["databases"]
 			if hasDatabases != tt.wantDatabases {
 				t.Errorf("secret has databases field = %v, want %v", hasDatabases, tt.wantDatabases)
 			}
 
 			if tt.wantDatabases {
 				expectedDatabases := "app_db,analytics_db"
-				if secret.StringData["databases"] != expectedDatabases {
-					t.Errorf("secret databases = %v, want %v", secret.StringData["databases"], expectedDatabases)
+				if string(secret.Data["databases"]) != expectedDatabases {
+					t.Errorf("secret databases = %q, want %q", secret.Data["databases"], expectedDatabases)
 				}
 			}
 
-			// Verify primary database is first one
 			hostKey, _, dbKey, _, _ := r.getSecretKeys(tt.user)
-			if secret.StringData[dbKey] != tt.databases[0].Spec.DatabaseName {
-				t.Errorf("primary database = %v, want %v", secret.StringData[dbKey], tt.databases[0].Spec.DatabaseName)
+			if string(secret.Data[dbKey]) != tt.databases[0].Spec.DatabaseName {
+				t.Errorf("primary database = %q, want %q", secret.Data[dbKey], tt.databases[0].Spec.DatabaseName)
 			}
-
-			// Verify host
-			if secret.StringData[hostKey] != cluster.Spec.Endpoint {
-				t.Errorf("host = %v, want %v", secret.StringData[hostKey], cluster.Spec.Endpoint)
+			if string(secret.Data[hostKey]) != cluster.Spec.Endpoint {
+				t.Errorf("host = %q, want %q", secret.Data[hostKey], cluster.Spec.Endpoint)
 			}
 		})
 	}
 }
 
-func TestDatabaseUserReconciler_UpdateSecretDatabases(t *testing.T) {
+func TestDatabaseUserReconciler_ReconcileSecretShape_DatabasesList(t *testing.T) {
 	ctx := context.Background()
 
 	cluster := &databasesv1alpha1.DBCluster{
@@ -2344,28 +2337,29 @@ func TestDatabaseUserReconciler_UpdateSecretDatabases(t *testing.T) {
 		user              *databasesv1alpha1.DatabaseUser
 		initialData       map[string][]byte
 		databases         []*databasesv1alpha1.Database
-		expectUpdate      bool
-		wantDatabasesList string
+		wantDatabasesList string // empty means: field must not exist
 	}{
 		{
-			name: "add databases list when adding second database",
+			name: "add databases list when adding second database (raw template)",
 			user: &databasesv1alpha1.DatabaseUser{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-user", Namespace: "default"},
 				Spec:       databasesv1alpha1.DatabaseUserSpec{},
 			},
 			initialData: map[string][]byte{
 				"host":     []byte("db.example.com"),
-				"database": []byte("db1"),
+				"port":     []byte("5432"),
+				"database": []byte("app_db"),
+				"username": []byte("test_user"),
+				"password": []byte("pwd"),
 			},
 			databases: []*databasesv1alpha1.Database{
 				{ObjectMeta: metav1.ObjectMeta{Name: "db1"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "app_db"}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "db2"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "cache_db"}},
 			},
-			expectUpdate:      true,
 			wantDatabasesList: "app_db,cache_db",
 		},
 		{
-			name: "remove databases list with non-raw template",
+			name: "remove databases list when switching to non-raw template (DB)",
 			user: &databasesv1alpha1.DatabaseUser{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-user", Namespace: "default"},
 				Spec: databasesv1alpha1.DatabaseUserSpec{
@@ -2373,15 +2367,17 @@ func TestDatabaseUserReconciler_UpdateSecretDatabases(t *testing.T) {
 				},
 			},
 			initialData: map[string][]byte{
-				"DB_HOST":   []byte("db.example.com"),
-				"DB_NAME":   []byte("old_db"),
-				"databases": []byte("old_db,other_db"),
+				"DB_HOST":     []byte("db.example.com"),
+				"DB_PORT":     []byte("5432"),
+				"DB_NAME":     []byte("new_db"),
+				"DB_USER":     []byte("test_user"),
+				"DB_PASSWORD": []byte("pwd"),
+				"databases":   []byte("new_db,other_db"),
 			},
 			databases: []*databasesv1alpha1.Database{
 				{ObjectMeta: metav1.ObjectMeta{Name: "db1"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "new_db"}},
 				{ObjectMeta: metav1.ObjectMeta{Name: "db2"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "other_db"}},
 			},
-			expectUpdate:      true,
 			wantDatabasesList: "",
 		},
 	}
@@ -2394,27 +2390,23 @@ func TestDatabaseUserReconciler_UpdateSecretDatabases(t *testing.T) {
 			}
 			r := newTestReconciler(secret)
 
-			err := r.updateSecretDatabases(ctx, tt.user, secret, cluster, tt.databases, "test_user")
-			if err != nil {
-				t.Errorf("updateSecretDatabases() error = %v", err)
-				return
+			desired := r.buildSecretData(tt.user, cluster, tt.databases, "test_user", "pwd")
+			if _, err := r.reconcileSecretShape(ctx, secret, desired); err != nil {
+				t.Fatalf("reconcileSecretShape() error = %v", err)
 			}
 
-			// Fetch updated secret
-			var updatedSecret corev1.Secret
-			err = r.Get(ctx, types.NamespacedName{Name: "test-secret", Namespace: "default"}, &updatedSecret)
-			if err != nil {
-				t.Errorf("failed to get updated secret: %v", err)
-				return
+			var updated corev1.Secret
+			if err := r.Get(ctx, types.NamespacedName{Name: "test-secret", Namespace: "default"}, &updated); err != nil {
+				t.Fatalf("get updated secret: %v", err)
 			}
 
 			if tt.wantDatabasesList != "" {
-				if string(updatedSecret.Data["databases"]) != tt.wantDatabasesList {
-					t.Errorf("databases = %v, want %v", string(updatedSecret.Data["databases"]), tt.wantDatabasesList)
+				if string(updated.Data["databases"]) != tt.wantDatabasesList {
+					t.Errorf("databases = %q, want %q", string(updated.Data["databases"]), tt.wantDatabasesList)
 				}
 			} else {
-				if _, exists := updatedSecret.Data["databases"]; exists {
-					t.Errorf("databases field should not exist, but got: %v", string(updatedSecret.Data["databases"]))
+				if _, exists := updated.Data["databases"]; exists {
+					t.Errorf("databases field should not exist, but got: %q", string(updated.Data["databases"]))
 				}
 			}
 		})
@@ -2622,4 +2614,832 @@ func (m *mockPGClientWithDeletionTracking) RevokePrivilegesInDatabase(ctx contex
 func (m *mockPGClientWithDeletionTracking) DropUser(ctx context.Context, username string) error {
 	m.droppedUsers = append(m.droppedUsers, username)
 	return nil
+}
+
+func TestPasswordFromDSN(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"valid postgres URL", "postgres://alice:s3cret@db:5432/app", "s3cret"},
+		{"valid postgresql URL", "postgresql://alice:s3cret@db:5432/app", "s3cret"},
+		{"empty", "", ""},
+		{"no userinfo", "postgres://db:5432/app", ""},
+		{"user without password", "postgres://alice@db:5432/app", ""},
+		{"malformed", "not a url://", ""},
+		{"special chars escaped", "postgres://alice:s%21cret@db:5432/app", "s!cret"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := passwordFromDSN([]byte(tt.in))
+			if got != tt.want {
+				t.Errorf("passwordFromDSN(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractPasswordFromSecret(t *testing.T) {
+	r := newTestReconciler()
+
+	tests := []struct {
+		name   string
+		user   *databasesv1alpha1.DatabaseUser
+		data   map[string][]byte
+		want   string
+		reason string
+	}{
+		{
+			name: "current spec=raw, password key present",
+			user: &databasesv1alpha1.DatabaseUser{Spec: databasesv1alpha1.DatabaseUserSpec{}},
+			data: map[string][]byte{"password": []byte("p1")},
+			want: "p1",
+		},
+		{
+			name: "current spec=DB, DB_PASSWORD key present",
+			user: &databasesv1alpha1.DatabaseUser{Spec: databasesv1alpha1.DatabaseUserSpec{
+				Secret: &databasesv1alpha1.SecretConfig{Template: "DB"},
+			}},
+			data: map[string][]byte{"DB_PASSWORD": []byte("p2")},
+			want: "p2",
+		},
+		{
+			name: "transition dsn→DB: secret still has dsn key",
+			user: &databasesv1alpha1.DatabaseUser{Spec: databasesv1alpha1.DatabaseUserSpec{
+				Secret: &databasesv1alpha1.SecretConfig{Template: "DB"},
+			}},
+			data:   map[string][]byte{"dsn": []byte("postgres://u:fromdsn@host:5432/db")},
+			want:   "fromdsn",
+			reason: "DSN parse fallback recovers password after dsn→DB",
+		},
+		{
+			name: "transition DB→raw: secret still has DB_PASSWORD",
+			user: &databasesv1alpha1.DatabaseUser{Spec: databasesv1alpha1.DatabaseUserSpec{}},
+			data: map[string][]byte{"DB_PASSWORD": []byte("p3")},
+			want: "p3",
+		},
+		{
+			name: "transition raw→dsn: secret still has password key",
+			user: &databasesv1alpha1.DatabaseUser{Spec: databasesv1alpha1.DatabaseUserSpec{
+				Secret: &databasesv1alpha1.SecretConfig{Template: "dsn"},
+			}},
+			data: map[string][]byte{"password": []byte("p4")},
+			want: "p4",
+		},
+		{
+			name: "current spec=custom with key PGPASSWORD",
+			user: &databasesv1alpha1.DatabaseUser{Spec: databasesv1alpha1.DatabaseUserSpec{
+				Secret: &databasesv1alpha1.SecretConfig{
+					Template: "custom",
+					Keys:     &databasesv1alpha1.SecretKeys{Password: "PGPASSWORD"},
+				},
+			}},
+			data: map[string][]byte{"PGPASSWORD": []byte("p5")},
+			want: "p5",
+		},
+		{
+			name: "corrupted: no recognizable password key",
+			user: &databasesv1alpha1.DatabaseUser{Spec: databasesv1alpha1.DatabaseUserSpec{}},
+			data: map[string][]byte{"host": []byte("db"), "port": []byte("5432")},
+			want: "",
+		},
+		{
+			name: "empty secret",
+			user: &databasesv1alpha1.DatabaseUser{Spec: databasesv1alpha1.DatabaseUserSpec{}},
+			data: nil,
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			secret := &corev1.Secret{Data: tt.data}
+			got := r.extractPasswordFromSecret(secret, tt.user)
+			if got != tt.want {
+				t.Errorf("extractPasswordFromSecret() = %q, want %q (%s)", got, tt.want, tt.reason)
+			}
+		})
+	}
+}
+
+func TestBuildSecretData_DSNTemplate(t *testing.T) {
+	r := newTestReconciler()
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "u"},
+		Spec: databasesv1alpha1.DatabaseUserSpec{
+			Secret: &databasesv1alpha1.SecretConfig{Template: "dsn"},
+		},
+	}
+	cluster := &databasesv1alpha1.DBCluster{Spec: databasesv1alpha1.DBClusterSpec{Endpoint: "h", Port: 5432}}
+	databases := []*databasesv1alpha1.Database{{Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "app"}}}
+
+	data := r.buildSecretData(user, cluster, databases, "u", "p")
+	if len(data) != 1 {
+		t.Fatalf("expected only 'dsn' key, got %d keys: %v", len(data), data)
+	}
+	want := "postgres://u:p@h:5432/app"
+	if string(data["dsn"]) != want {
+		t.Errorf("dsn = %q, want %q", data["dsn"], want)
+	}
+}
+
+func TestReconcileSecretShape_NoOpFastPath(t *testing.T) {
+	ctx := context.Background()
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "s",
+			Namespace:       "default",
+			ResourceVersion: "1",
+			Annotations:     map[string]string{ManagedKeysAnnotation: "a,b"},
+		},
+		Data: map[string][]byte{"a": []byte("1"), "b": []byte("2")},
+	}
+	r := newTestReconciler(secret)
+
+	desired := map[string][]byte{"b": []byte("2"), "a": []byte("1")}
+	changed, err := r.reconcileSecretShape(ctx, secret, desired)
+	if err != nil {
+		t.Fatalf("reconcileSecretShape: %v", err)
+	}
+	if changed {
+		t.Errorf("expected no-op fast path, got changed=true")
+	}
+
+	var fresh corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Name: "s", Namespace: "default"}, &fresh); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if fresh.ResourceVersion != "1" {
+		t.Errorf("resourceVersion = %q, want %q (no Update should fire)", fresh.ResourceVersion, "1")
+	}
+}
+
+func TestReconcileSecretShape_StampsAnnotationOnLegacySecret(t *testing.T) {
+	ctx := context.Background()
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "default", ResourceVersion: "1"},
+		Data:       map[string][]byte{"a": []byte("1"), "b": []byte("2")},
+	}
+	r := newTestReconciler(secret)
+
+	desired := map[string][]byte{"a": []byte("1"), "b": []byte("2")}
+	changed, err := r.reconcileSecretShape(ctx, secret, desired)
+	if err != nil {
+		t.Fatalf("reconcileSecretShape: %v", err)
+	}
+	if !changed {
+		t.Errorf("expected Update to stamp annotation, got changed=false")
+	}
+	var fresh corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Name: "s", Namespace: "default"}, &fresh); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got := fresh.Annotations[ManagedKeysAnnotation]; got != "a,b" {
+		t.Errorf("managed-keys annotation = %q, want %q", got, "a,b")
+	}
+}
+
+func TestReconcileSecretMerge_PreservesForeignKeys(t *testing.T) {
+	ctx := context.Background()
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "s",
+			Namespace:   "default",
+			Annotations: map[string]string{ManagedKeysAnnotation: "password,username"},
+		},
+		Data: map[string][]byte{
+			"username":      []byte("u"),
+			"password":      []byte("oldpwd"),
+			"foreign_field": []byte("user-controlled"),
+			"another_alien": []byte("also-user"),
+		},
+	}
+	r := newTestReconciler(secret)
+
+	desired := map[string][]byte{"username": []byte("u"), "password": []byte("newpwd")}
+	changed, err := r.reconcileSecretMerge(ctx, secret, desired)
+	if err != nil {
+		t.Fatalf("reconcileSecretMerge: %v", err)
+	}
+	if !changed {
+		t.Errorf("expected changed=true")
+	}
+
+	var fresh corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Name: "s", Namespace: "default"}, &fresh); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if string(fresh.Data["password"]) != "newpwd" {
+		t.Errorf("password = %q, want %q", fresh.Data["password"], "newpwd")
+	}
+	if string(fresh.Data["foreign_field"]) != "user-controlled" {
+		t.Errorf("foreign_field dropped: %q", fresh.Data["foreign_field"])
+	}
+	if string(fresh.Data["another_alien"]) != "also-user" {
+		t.Errorf("another_alien dropped: %q", fresh.Data["another_alien"])
+	}
+}
+
+func TestReconcileSecretMerge_NoOpFastPath(t *testing.T) {
+	ctx := context.Background()
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "s",
+			Namespace:       "default",
+			ResourceVersion: "1",
+			Annotations:     map[string]string{ManagedKeysAnnotation: "password,username"},
+		},
+		Data: map[string][]byte{
+			"username":      []byte("u"),
+			"password":      []byte("pwd"),
+			"foreign_field": []byte("user"),
+		},
+	}
+	r := newTestReconciler(secret)
+
+	desired := map[string][]byte{"username": []byte("u"), "password": []byte("pwd")}
+	changed, err := r.reconcileSecretMerge(ctx, secret, desired)
+	if err != nil {
+		t.Fatalf("reconcileSecretMerge: %v", err)
+	}
+	if changed {
+		t.Errorf("expected no-op fast path, got changed=true")
+	}
+	var fresh corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Name: "s", Namespace: "default"}, &fresh); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if fresh.ResourceVersion != "1" {
+		t.Errorf("resourceVersion = %q, want %q (no Update should fire)", fresh.ResourceVersion, "1")
+	}
+}
+
+func TestIsSecretSoftOwnedByUser(t *testing.T) {
+	r := newTestReconciler()
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "alice", UID: "alice-uid"},
+	}
+	tBool := true
+
+	tests := []struct {
+		name   string
+		secret *corev1.Secret
+		want   bool
+	}{
+		{
+			name: "annotation matches, no OwnerReferences",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{ManagedByAnnotation: "alice"},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "annotation matches, only self OwnerReference",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{ManagedByAnnotation: "alice"},
+					OwnerReferences: []metav1.OwnerReference{
+						{Kind: "DatabaseUser", Name: "alice", UID: "alice-uid"},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "annotation matches but another DatabaseUser controller-owns it",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{ManagedByAnnotation: "alice"},
+					OwnerReferences: []metav1.OwnerReference{
+						{Kind: "DatabaseUser", Name: "bob", UID: "bob-uid", Controller: &tBool},
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "annotation matches but ExternalSecret controller-owns it",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{ManagedByAnnotation: "alice"},
+					OwnerReferences: []metav1.OwnerReference{
+						{Kind: "ExternalSecret", Name: "shared", UID: "ext-uid", Controller: &tBool},
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "annotation matches, foreign non-controller ref ignored",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{ManagedByAnnotation: "alice"},
+					OwnerReferences: []metav1.OwnerReference{
+						{Kind: "ConfigMap", Name: "info", UID: "cm-uid"},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "annotation missing",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{},
+			},
+			want: false,
+		},
+		{
+			name: "annotation points to different user",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{ManagedByAnnotation: "bob"},
+				},
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := r.isSecretSoftOwnedByUser(tt.secret, user); got != tt.want {
+				t.Errorf("isSecretSoftOwnedByUser = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReclaimOrFail(t *testing.T) {
+	ctx := context.Background()
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "alice", Namespace: "default", UID: "alice-uid"},
+	}
+
+	t.Run("annotation match → re-attaches OwnerReference", func(t *testing.T) {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "s",
+				Namespace:   "default",
+				Annotations: map[string]string{ManagedByAnnotation: "alice"},
+			},
+		}
+		r := newTestReconciler(secret)
+		if err := r.reclaimOrFail(ctx, user, secret); err != nil {
+			t.Fatalf("reclaimOrFail: %v", err)
+		}
+		var fresh corev1.Secret
+		if err := r.Get(ctx, types.NamespacedName{Name: "s", Namespace: "default"}, &fresh); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if len(fresh.OwnerReferences) == 0 {
+			t.Errorf("OwnerReferences not restored")
+		}
+	})
+
+	t.Run("no annotation → returns error", func(t *testing.T) {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "default"},
+		}
+		r := newTestReconciler(secret)
+		err := r.reclaimOrFail(ctx, user, secret)
+		if err == nil {
+			t.Errorf("expected error, got nil")
+		}
+	})
+
+	t.Run("foreign controller ref → returns error", func(t *testing.T) {
+		tBool := true
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "s",
+				Namespace:   "default",
+				Annotations: map[string]string{ManagedByAnnotation: "alice"},
+				OwnerReferences: []metav1.OwnerReference{
+					{Kind: "ExternalSecret", Name: "shared", UID: "ext-uid", Controller: &tBool},
+				},
+			},
+		}
+		r := newTestReconciler(secret)
+		err := r.reclaimOrFail(ctx, user, secret)
+		if err == nil {
+			t.Errorf("expected error for foreign controller ref, got nil")
+		}
+	})
+}
+
+func TestPrivilegesForDatabase(t *testing.T) {
+	tests := []struct {
+		name, perDB, fallback, want string
+	}{
+		{"per-DB override wins", "admin", "readonly", "admin"},
+		{"fallback when per-DB empty", "", "readwrite", "readwrite"},
+		{"default when both empty", "", "", "readonly"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := privilegesForDatabase(tt.perDB, tt.fallback); got != tt.want {
+				t.Errorf("privilegesForDatabase(%q, %q) = %q, want %q", tt.perDB, tt.fallback, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTranslateAdditionalGrants(t *testing.T) {
+	in := []databasesv1alpha1.TableGrant{
+		{Tables: []string{"t1", "t2"}, Privileges: []string{"SELECT", "INSERT"}},
+		{Tables: []string{"audit"}, Privileges: []string{"USAGE"}},
+	}
+	out := translateAdditionalGrants(in)
+	if len(out) != 2 {
+		t.Fatalf("len = %d, want 2", len(out))
+	}
+	if out[0].Tables[1] != "t2" || string(out[0].Privileges[1]) != "INSERT" {
+		t.Errorf("first grant mistranslated: %+v", out[0])
+	}
+	if string(out[1].Privileges[0]) != "USAGE" {
+		t.Errorf("second grant mistranslated: %+v", out[1])
+	}
+	if translateAdditionalGrants(nil) == nil {
+		t.Errorf("nil input should produce non-nil empty slice (caller passes to ApplyPrivileges)")
+	}
+}
+
+func TestSyncPostgresUser_WrapsErrors(t *testing.T) {
+	ctx := context.Background()
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "u", Namespace: "default"},
+	}
+	r := newTestReconciler()
+
+	mock := postgres.NewMockClient()
+	mock.ShouldFail = true
+	mock.FailError = errors.New("boom")
+
+	err := r.syncPostgresUser(ctx, mock, user, "u", "p", []string{"db1"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, mock.FailError) {
+		t.Errorf("error chain broken: %v should wrap %v", err, mock.FailError)
+	}
+}
+
+func TestSyncRuntimeParams_WrapsErrors(t *testing.T) {
+	ctx := context.Background()
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "u", Namespace: "default"},
+		Spec:       databasesv1alpha1.DatabaseUserSpec{ConnectionLimit: 10},
+	}
+	r := newTestReconciler()
+
+	mock := postgres.NewMockClient()
+	mock.ShouldFail = true
+	mock.FailError = errors.New("boom")
+
+	err := r.syncRuntimeParams(ctx, mock, user, "u")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, mock.FailError) {
+		t.Errorf("error chain broken: %v should wrap %v", err, mock.FailError)
+	}
+}
+
+func TestApplyPerDatabasePrivileges(t *testing.T) {
+	ctx := context.Background()
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "u", Namespace: "default"},
+		Spec: databasesv1alpha1.DatabaseUserSpec{
+			Databases: []databasesv1alpha1.DatabaseAccess{
+				{Name: "db1", Privileges: "admin"},
+				{Name: "db2"},
+			},
+			Privileges:       "readonly",
+			SecretGeneration: "perDatabase",
+		},
+	}
+	databases := []*databasesv1alpha1.Database{
+		{ObjectMeta: metav1.ObjectMeta{Name: "db1"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "appdb"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "db2"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "cachedb"}},
+	}
+	r := newTestReconciler()
+	mock := postgres.NewMockClient()
+
+	statuses := r.applyPerDatabasePrivileges(ctx, mock, user, "u", databases)
+	if len(statuses) != 2 {
+		t.Fatalf("got %d statuses, want 2", len(statuses))
+	}
+	if statuses[0].Privileges != "admin" {
+		t.Errorf("db1 privileges = %q, want admin (per-DB override)", statuses[0].Privileges)
+	}
+	if statuses[1].Privileges != "readonly" {
+		t.Errorf("db2 privileges = %q, want readonly (fallback)", statuses[1].Privileges)
+	}
+	if statuses[0].SecretName == "" || statuses[1].SecretName == "" {
+		t.Errorf("perDatabase mode must populate per-status SecretName: %+v", statuses)
+	}
+	if statuses[0].Phase != "Ready" || statuses[1].Phase != "Ready" {
+		t.Errorf("phases = %q, %q; want both Ready", statuses[0].Phase, statuses[1].Phase)
+	}
+}
+
+func TestApplyPerDatabasePrivileges_PerDBError(t *testing.T) {
+	ctx := context.Background()
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "u", Namespace: "default"},
+		Spec: databasesv1alpha1.DatabaseUserSpec{
+			Databases:  []databasesv1alpha1.DatabaseAccess{{Name: "db1"}},
+			Privileges: "readonly",
+		},
+	}
+	databases := []*databasesv1alpha1.Database{
+		{ObjectMeta: metav1.ObjectMeta{Name: "db1"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "appdb"}},
+	}
+	r := newTestReconciler()
+	mock := postgres.NewMockClient()
+	mock.ShouldFail = true
+	mock.FailError = errors.New("boom")
+
+	statuses := r.applyPerDatabasePrivileges(ctx, mock, user, "u", databases)
+	if statuses[0].Phase != "Failed" {
+		t.Errorf("phase = %q, want Failed", statuses[0].Phase)
+	}
+	if statuses[0].Message == "" {
+		t.Errorf("Message should carry the underlying error")
+	}
+}
+
+func TestDoSoftReclaim_AttachesOwnerRef(t *testing.T) {
+	ctx := context.Background()
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "alice", Namespace: "default", UID: "alice-uid"},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "s",
+			Namespace:   "default",
+			Annotations: map[string]string{ManagedByAnnotation: "alice"},
+		},
+	}
+	r := newTestReconciler(secret)
+	if err := r.doSoftReclaim(ctx, user, secret); err != nil {
+		t.Fatalf("doSoftReclaim: %v", err)
+	}
+	var fresh corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Name: "s", Namespace: "default"}, &fresh); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(fresh.OwnerReferences) == 0 {
+		t.Errorf("OwnerReferences not attached")
+	}
+	if fresh.OwnerReferences[0].UID != "alice-uid" {
+		t.Errorf("OwnerReference UID = %q, want alice-uid", fresh.OwnerReferences[0].UID)
+	}
+}
+
+func TestRotatePrimaryPassword_HonoursMergeMode(t *testing.T) {
+	ctx := context.Background()
+
+	cluster := &databasesv1alpha1.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
+		Spec:       databasesv1alpha1.DBClusterSpec{Endpoint: "h", Port: 5432},
+	}
+	databases := []*databasesv1alpha1.Database{
+		{ObjectMeta: metav1.ObjectMeta{Name: "db1"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "app"}},
+	}
+
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "u", Namespace: "default"},
+		Spec: databasesv1alpha1.DatabaseUserSpec{
+			Rotation: &databasesv1alpha1.RotationConfig{Days: 30},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "u-credentials",
+			Namespace: "default",
+			Annotations: map[string]string{
+				ConflictPolicyAnnotation: "Merge",
+				ManagedKeysAnnotation:    "database,host,password,port,username",
+			},
+		},
+		Data: map[string][]byte{
+			"host":           []byte("h"),
+			"port":           []byte("5432"),
+			"database":       []byte("app"),
+			"username":       []byte("test_user"),
+			"password":       []byte("old"),
+			"user_added_key": []byte("preserve-me"),
+		},
+	}
+	r := newTestReconciler(secret)
+	mockPG := postgres.NewMockClient()
+
+	_, _, passwordChanged, err := r.rotatePrimaryPassword(ctx, user, secret, cluster, databases, mockPG, "test_user")
+	if err != nil {
+		t.Fatalf("rotatePrimaryPassword: %v", err)
+	}
+	if !passwordChanged {
+		t.Errorf("passwordChanged = false, want true")
+	}
+	if mockPG.SetPasswordCalls != 1 {
+		t.Errorf("SetPassword calls = %d, want 1", mockPG.SetPasswordCalls)
+	}
+
+	var fresh corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Name: "u-credentials", Namespace: "default"}, &fresh); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if string(fresh.Data["user_added_key"]) != "preserve-me" {
+		t.Errorf("foreign key dropped during Merge rotation: %q", fresh.Data["user_added_key"])
+	}
+	if string(fresh.Data["password"]) == "old" {
+		t.Errorf("password not rotated")
+	}
+}
+
+func TestReconcileSecretMerge_DropsOurKeysNoLongerDesired(t *testing.T) {
+	ctx := context.Background()
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "s",
+			Namespace:   "default",
+			Annotations: map[string]string{ManagedKeysAnnotation: "dsn"},
+		},
+		Data: map[string][]byte{
+			"dsn":     []byte("postgres://u:p@h:5432/app"),
+			"user_kv": []byte("preserve-me"),
+		},
+	}
+	r := newTestReconciler(secret)
+
+	desired := map[string][]byte{
+		"host": []byte("h"), "port": []byte("5432"),
+		"database": []byte("app"), "username": []byte("u"), "password": []byte("p"),
+	}
+	if _, err := r.reconcileSecretMerge(ctx, secret, desired); err != nil {
+		t.Fatalf("reconcileSecretMerge: %v", err)
+	}
+	var fresh corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Name: "s", Namespace: "default"}, &fresh); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if _, hasDSN := fresh.Data["dsn"]; hasDSN {
+		t.Errorf("dsn (previously ours) should be dropped")
+	}
+	if string(fresh.Data["user_kv"]) != "preserve-me" {
+		t.Errorf("foreign user_kv dropped: %q", fresh.Data["user_kv"])
+	}
+	if string(fresh.Data["password"]) != "p" {
+		t.Errorf("password not written: %q", fresh.Data["password"])
+	}
+}
+
+func TestSecretDataEqual_Symmetric(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b map[string][]byte
+		want bool
+	}{
+		{"both empty", nil, nil, true},
+		{"empty vs single", nil, map[string][]byte{"k": []byte("v")}, false},
+		{"single vs empty", map[string][]byte{"k": []byte("v")}, nil, false},
+		{"equal", map[string][]byte{"a": []byte("1"), "b": []byte("2")}, map[string][]byte{"b": []byte("2"), "a": []byte("1")}, true},
+		{"value differs", map[string][]byte{"a": []byte("1")}, map[string][]byte{"a": []byte("2")}, false},
+		{"same len, key swap", map[string][]byte{"a": []byte("1")}, map[string][]byte{"b": []byte("1")}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := secretDataEqual(tt.a, tt.b); got != tt.want {
+				t.Errorf("secretDataEqual = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolvePassword(t *testing.T) {
+	ctx := context.Background()
+
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "u", Namespace: "default"},
+		Spec:       databasesv1alpha1.DatabaseUserSpec{},
+	}
+	readyUser := user.DeepCopy()
+	readyUser.Status.Phase = "Ready"
+
+	tests := []struct {
+		name              string
+		user              *databasesv1alpha1.DatabaseUser
+		existing          *corev1.Secret
+		found             bool
+		wantGenerated     bool
+		wantSetPwdCalls   int
+		wantReturnedKnown string // if non-empty: must equal returned password
+	}{
+		{
+			name:              "found + extractable: returns existing password, no SetPassword",
+			user:              user,
+			existing:          &corev1.Secret{Data: map[string][]byte{"password": []byte("kept")}},
+			found:             true,
+			wantGenerated:     false,
+			wantSetPwdCalls:   0,
+			wantReturnedKnown: "kept",
+		},
+		{
+			name:            "found + corrupted: regenerates and SetPassword",
+			user:            user,
+			existing:        &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "s"}, Data: map[string][]byte{"host": []byte("h")}},
+			found:           true,
+			wantGenerated:   true,
+			wantSetPwdCalls: 1,
+		},
+		{
+			name:            "missing + first-time (Phase empty): generate, skip SetPassword",
+			user:            user,
+			existing:        &corev1.Secret{},
+			found:           false,
+			wantGenerated:   true,
+			wantSetPwdCalls: 0,
+		},
+		{
+			name:            "missing + post-Ready: generate AND SetPassword",
+			user:            readyUser,
+			existing:        &corev1.Secret{},
+			found:           false,
+			wantGenerated:   true,
+			wantSetPwdCalls: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newTestReconciler()
+			mockPG := postgres.NewMockClient()
+
+			pwd, generated, err := r.resolvePassword(ctx, tt.user, tt.existing, tt.found, mockPG, "u")
+			if err != nil {
+				t.Fatalf("resolvePassword: %v", err)
+			}
+			if generated != tt.wantGenerated {
+				t.Errorf("generated = %v, want %v", generated, tt.wantGenerated)
+			}
+			if mockPG.SetPasswordCalls != tt.wantSetPwdCalls {
+				t.Errorf("SetPassword calls = %d, want %d", mockPG.SetPasswordCalls, tt.wantSetPwdCalls)
+			}
+			if tt.wantReturnedKnown != "" && pwd != tt.wantReturnedKnown {
+				t.Errorf("password = %q, want %q", pwd, tt.wantReturnedKnown)
+			}
+			if pwd == "" {
+				t.Errorf("password should never be empty")
+			}
+		})
+	}
+}
+
+func TestSetManagedKeysAnnotation_StableOrder(t *testing.T) {
+	// Guards against Go map iteration order causing spurious Updates each reconcile.
+	secret := &corev1.Secret{}
+	setManagedKeysAnnotation(secret, map[string][]byte{"c": {}, "a": {}, "b": {}})
+	if got := secret.Annotations[ManagedKeysAnnotation]; got != "a,b,c" {
+		t.Errorf("managed-keys = %q, want %q", got, "a,b,c")
+	}
+}
+
+func TestReconcileSecretShape_DropsForeignKeys(t *testing.T) {
+	ctx := context.Background()
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "default"},
+		Data: map[string][]byte{
+			"dsn":           []byte("postgres://u:p@h:5432/app"),
+			"legacy_orphan": []byte("stale"),
+		},
+	}
+	r := newTestReconciler(secret)
+
+	desired := map[string][]byte{
+		"host": []byte("h"), "port": []byte("5432"),
+		"database": []byte("app"), "username": []byte("u"), "password": []byte("p"),
+	}
+	changed, err := r.reconcileSecretShape(ctx, secret, desired)
+	if err != nil {
+		t.Fatalf("reconcileSecretShape: %v", err)
+	}
+	if !changed {
+		t.Errorf("expected changed=true")
+	}
+
+	var fresh corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Name: "s", Namespace: "default"}, &fresh); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if _, ok := fresh.Data["dsn"]; ok {
+		t.Errorf("dsn key should have been dropped, still present")
+	}
+	if _, ok := fresh.Data["legacy_orphan"]; ok {
+		t.Errorf("legacy_orphan key should have been dropped, still present")
+	}
+	if string(fresh.Data["password"]) != "p" {
+		t.Errorf("password = %q, want %q", fresh.Data["password"], "p")
+	}
 }

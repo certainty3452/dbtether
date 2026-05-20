@@ -195,6 +195,10 @@ spec:
                       host:
                         type: string
                       password:
+                        description: |-
+                          Renaming after the secret exists forces a password regeneration — the
+                          previous value can't be located under the old name. PG user keeps
+                          working; consumers must re-read the secret.
                         type: string
                       port:
                         type: string
@@ -207,6 +211,12 @@ spec:
                     type: string
                   onConflict:
                     default: Fail
+                    description: |-
+                      Merge mode persists via an annotation on the produced secret: once a
+                      secret is adopted under Merge, subsequent reconciles keep overlaying
+                      (foreign keys preserved) even if onConflict is later removed from the
+                      spec. Use Adopt then Fail (or recreate the secret) to "fall back" to
+                      full-replace semantics.
                     enum:
                     - Fail
                     - Adopt
@@ -238,6 +248,15 @@ spec:
                 pattern: ^[a-z_][a-z0-9_]*$
                 type: string
             type: object
+            x-kubernetes-validations:
+            - message: spec.secret.name cannot be set when secretGeneration=perDatabase
+                (each per-DB secret derives its name from the DB)
+              rule: '!(self.secretGeneration == ''perDatabase'' && has(self.secret)
+                && has(self.secret.name) && size(self.secret.name) > 0)'
+            - message: onConflict policies Adopt/Merge are not supported when secretGeneration=perDatabase;
+                only Fail is allowed
+              rule: '!(self.secretGeneration == ''perDatabase'' && has(self.secret)
+                && has(self.secret.onConflict) && self.secret.onConflict != ''Fail'')'
           status:
             properties:
               clusterName:

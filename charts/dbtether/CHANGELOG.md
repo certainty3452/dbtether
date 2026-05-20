@@ -2,6 +2,11 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.6.3] - 2026-05-20
+
+### Fixed
+- DatabaseUser secret is rebuilt when `spec.secret.template` or `spec.secret.keys` changes. Previously the secret stayed in the old shape — mixed legacy + new keys, password unreadable by consumers — until manually deleted.
+
 ## [0.6.2] - 2026-05-19
 
 ### Breaking

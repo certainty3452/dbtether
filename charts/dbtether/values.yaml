@@ -11,7 +11,7 @@ image:
   repository: ghcr.io/certainty3452/dbtether
   pullPolicy: IfNotPresent
   # Automatically updated by release pipeline from git tag
-  tag: "0.6.2"
+  tag: "0.6.3"
 
 imagePullSecrets: []
 nameOverride: ""
@@ -112,15 +112,16 @@ backup:
   # Maximum concurrent backup jobs per DBCluster (prevents connection pool exhaustion)
   maxConcurrentPerCluster: 3
 
-  # Resources for backup job pods.
-  # Backup uses pipe-based streaming (pg_dump | gzip | upload), so memory is O(buffer),
-  # not O(database size). 256Mi handles databases of any size.
+  # Peak is O(S3 multipart buffers + Go runtime) ≈ 300-500 MiB regardless of
+  # database size — not O(DB size). Bump on huge schemas (100k+ objects).
+  # Burstable QoS (requests < limits) is intentional for a chart default;
+  # override requests.memory to match limits if you need Guaranteed QoS.
   resources:
     limits:
-      memory: 256Mi
+      memory: 1Gi
     requests:
       cpu: 100m
-      memory: 256Mi
+      memory: 384Mi
 
   # Annotations for backup job pods
   # Use this to protect backup pods from autoscaler disruption (Karpenter, cluster-autoscaler)

@@ -1,13 +1,17 @@
 package controllers
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"net/url"
+	"sort"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -20,7 +24,21 @@ import (
 	"github.com/certainty3452/dbtether/pkg/postgres"
 )
 
-const UserFinalizerName = "databaseusers.dbtether.io/finalizer"
+const (
+	UserFinalizerName = "databaseusers.dbtether.io/finalizer"
+
+	// Soft-ownership signal — lets us re-attach OwnerRef without rotating the
+	// password when stripped externally (ArgoCD/Flux managedFields rewrite).
+	ManagedByAnnotation = "dbtether.io/managed-by"
+
+	// Without this marker the next reconcile after mergeSecret degrades Merge
+	// into Adopt (full-replace nukes foreign keys).
+	ConflictPolicyAnnotation = "dbtether.io/conflict-policy"
+
+	// Lets Merge mode tell foreign keys from ours: drop stale ones we
+	// previously owned, preserve everything else.
+	ManagedKeysAnnotation = "dbtether.io/managed-keys"
+)
 
 type DatabaseUserReconciler struct {
 	client.Client
@@ -111,7 +129,7 @@ func (r *DatabaseUserReconciler) validateAndFetchDatabases(ctx context.Context, 
 			Name:      dbAccess.Name,
 			Namespace: dbNamespace,
 		}, &db); err != nil {
-			if errors.IsNotFound(err) {
+			if apierrors.IsNotFound(err) {
 				result, err := r.setStatus(ctx, user, &statusUpdate{
 					Phase: "Pending", Message: fmt.Sprintf("waiting for Database '%s'", dbAccess.Name), RequeueAfter: 30 * time.Second,
 				})
@@ -144,7 +162,7 @@ func (r *DatabaseUserReconciler) validateAndFetchDatabases(ctx context.Context, 
 	// Fetch the cluster
 	var cluster databasesv1alpha1.DBCluster
 	if err := r.Get(ctx, types.NamespacedName{Name: clusterName}, &cluster); err != nil {
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			result, err := r.setStatus(ctx, user, &statusUpdate{
 				Phase: "Pending", Message: fmt.Sprintf("waiting for DBCluster '%s'", clusterName), RequeueAfter: 30 * time.Second,
 			})
@@ -202,6 +220,9 @@ func (r *DatabaseUserReconciler) getSecretKeys(user *databasesv1alpha1.DatabaseU
 		return "DATABASE_HOST", "DATABASE_PORT", "DATABASE_NAME", "DATABASE_USER", "DATABASE_PASSWORD"
 	case "POSTGRES":
 		return "POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DATABASE", "POSTGRES_USER", "POSTGRES_PASSWORD"
+	case "dsn":
+		// Forces callers to branch on Template — secret.Data[""] reads are harmless.
+		return "", "", "", "", ""
 	case "custom":
 		host, port, db, username, password = r.applyCustomKeys(user.Spec.Secret.Keys, host, port, db, username, password)
 	}
@@ -209,26 +230,17 @@ func (r *DatabaseUserReconciler) getSecretKeys(user *databasesv1alpha1.DatabaseU
 }
 
 func (r *DatabaseUserReconciler) applyCustomKeys(k *databasesv1alpha1.SecretKeys, host, port, db, username, password string) (outHost, outPort, outDB, outUser, outPwd string) {
-	outHost, outPort, outDB, outUser, outPwd = host, port, db, username, password
 	if k == nil {
-		return
+		return host, port, db, username, password
 	}
-	if k.Host != "" {
-		outHost = k.Host
+	return strOr(k.Host, host), strOr(k.Port, port), strOr(k.Database, db), strOr(k.Username, username), strOr(k.Password, password)
+}
+
+func strOr(override, fallback string) string {
+	if override != "" {
+		return override
 	}
-	if k.Port != "" {
-		outPort = k.Port
-	}
-	if k.Database != "" {
-		outDB = k.Database
-	}
-	if k.Username != "" {
-		outUser = k.Username
-	}
-	if k.Password != "" {
-		outPwd = k.Password
-	}
-	return
+	return fallback
 }
 
 // shouldIncludeDatabasesList returns true if the secret should include a "databases" field
@@ -259,11 +271,312 @@ func (r *DatabaseUserReconciler) isSecretOwnedByUser(secret *corev1.Secret, user
 	return false
 }
 
+// Annotation match + no foreign controller OwnerReference; see ManagedByAnnotation.
+// Rejects any other controller-ref (not just DatabaseUser) — SetControllerReference
+// would fail later with "already has a controller", and re-claim would mis-fire.
+func (r *DatabaseUserReconciler) isSecretSoftOwnedByUser(secret *corev1.Secret, user *databasesv1alpha1.DatabaseUser) bool {
+	if secret.Annotations[ManagedByAnnotation] != user.Name {
+		return false
+	}
+	for _, ref := range secret.OwnerReferences {
+		isUs := ref.Kind == "DatabaseUser" && ref.Name == user.Name
+		if isUs {
+			continue
+		}
+		if ref.Controller != nil && *ref.Controller {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *DatabaseUserReconciler) getOnConflictPolicy(user *databasesv1alpha1.DatabaseUser) string {
 	if user.Spec.Secret != nil && user.Spec.Secret.OnConflict != "" {
 		return user.Spec.Secret.OnConflict
 	}
 	return "Fail"
+}
+
+// Recomputed from spec every reconcile — template/keys changes take effect on
+// the next tick without inference from secret.Data.
+func (r *DatabaseUserReconciler) buildSecretData(user *databasesv1alpha1.DatabaseUser,
+	cluster *databasesv1alpha1.DBCluster, databases []*databasesv1alpha1.Database,
+	username, password string) map[string][]byte {
+
+	primaryDB := ""
+	if len(databases) > 0 {
+		primaryDB = r.getDatabaseNameFromSpec(databases[0])
+	}
+
+	if user.Spec.Secret != nil && user.Spec.Secret.Template == "dsn" {
+		return map[string][]byte{"dsn": []byte(buildDSN(cluster, username, password, primaryDB))}
+	}
+
+	hostKey, portKey, dbKey, userKey, pwdKey := r.getSecretKeys(user)
+	data := map[string][]byte{
+		hostKey: []byte(cluster.Spec.Endpoint),
+		portKey: []byte(fmt.Sprintf("%d", cluster.Spec.Port)),
+		dbKey:   []byte(primaryDB),
+		userKey: []byte(username),
+		pwdKey:  []byte(password),
+	}
+	if r.shouldIncludeDatabasesList(user, len(databases)) {
+		dbNames := make([]string, len(databases))
+		for i, db := range databases {
+			dbNames[i] = r.getDatabaseNameFromSpec(db)
+		}
+		data["databases"] = []byte(strings.Join(dbNames, ","))
+	}
+	return data
+}
+
+func (r *DatabaseUserReconciler) buildPerDatabaseSecretData(user *databasesv1alpha1.DatabaseUser,
+	cluster *databasesv1alpha1.DBCluster, db *databasesv1alpha1.Database,
+	username, password string) map[string][]byte {
+
+	dbName := r.getDatabaseNameFromSpec(db)
+
+	if user.Spec.Secret != nil && user.Spec.Secret.Template == "dsn" {
+		return map[string][]byte{"dsn": []byte(buildDSN(cluster, username, password, dbName))}
+	}
+
+	hostKey, portKey, dbKey, userKey, pwdKey := r.getSecretKeys(user)
+	return map[string][]byte{
+		hostKey: []byte(cluster.Spec.Endpoint),
+		portKey: []byte(fmt.Sprintf("%d", cluster.Spec.Port)),
+		dbKey:   []byte(dbName),
+		userKey: []byte(username),
+		pwdKey:  []byte(password),
+	}
+}
+
+// DBCluster.Endpoint and DatabaseName aren't pattern-validated; net/url escaping
+// prevents crafted values from producing a DSN pointing at a different host.
+func buildDSN(cluster *databasesv1alpha1.DBCluster, username, password, dbName string) string {
+	u := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(username, password),
+		Host:   fmt.Sprintf("%s:%d", cluster.Spec.Endpoint, cluster.Spec.Port),
+		Path:   "/" + dbName,
+	}
+	return u.String()
+}
+
+// Returns "" if no password is recoverable; custom-keyed secrets whose pwdKey
+// was renamed are treated as corrupted (caller will regenerate).
+func (r *DatabaseUserReconciler) extractPasswordFromSecret(secret *corev1.Secret, user *databasesv1alpha1.DatabaseUser) string {
+	if secret == nil || len(secret.Data) == 0 {
+		return ""
+	}
+
+	_, _, _, _, currentPwdKey := r.getSecretKeys(user)
+	candidates := []string{currentPwdKey, "password", "DB_PASSWORD", "DATABASE_PASSWORD", "POSTGRES_PASSWORD"}
+	seen := map[string]struct{}{}
+	for _, k := range candidates {
+		if k == "" {
+			continue
+		}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		if pwd := string(secret.Data[k]); pwd != "" {
+			return pwd
+		}
+	}
+
+	return passwordFromDSN(secret.Data["dsn"])
+}
+
+func passwordFromDSN(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	u, err := url.Parse(string(data))
+	if err != nil || u.User == nil {
+		return ""
+	}
+	pwd, ok := u.User.Password()
+	if !ok {
+		return ""
+	}
+	return pwd
+}
+
+// Full-replace; companion to reconcileSecretMerge for Merge-policy secrets.
+func (r *DatabaseUserReconciler) reconcileSecretShape(ctx context.Context, secret *corev1.Secret, desired map[string][]byte) (bool, error) {
+	prevKeys := parseManagedKeysAnnotation(secret)
+	if secretDataEqual(secret.Data, desired) && managedKeysMatch(prevKeys, desired) {
+		return false, nil
+	}
+	secret.Data = desired
+	secret.StringData = nil
+	setManagedKeysAnnotation(secret, desired)
+	if err := r.Update(ctx, secret); err != nil {
+		return false, fmt.Errorf("update secret: %w", err)
+	}
+	return true, nil
+}
+
+// Overlay converge for Merge-policy secrets. Without per-reconcile awareness
+// of Merge mode the cycle would full-replace and degrade Merge into Adopt.
+func (r *DatabaseUserReconciler) reconcileSecretMerge(ctx context.Context, secret *corev1.Secret, desired map[string][]byte) (bool, error) {
+	if secret.Data == nil {
+		secret.Data = map[string][]byte{}
+	}
+	prevOurKeys := parseManagedKeysAnnotation(secret)
+
+	newData := make(map[string][]byte, len(secret.Data)+len(desired))
+	for k, v := range secret.Data {
+		if _, wasOurs := prevOurKeys[k]; wasOurs {
+			if _, stillOurs := desired[k]; !stillOurs {
+				continue
+			}
+		}
+		newData[k] = v
+	}
+	for k, v := range desired {
+		newData[k] = v
+	}
+
+	if secretDataEqual(secret.Data, newData) && managedKeysMatch(prevOurKeys, desired) {
+		return false, nil
+	}
+	secret.Data = newData
+	setManagedKeysAnnotation(secret, desired)
+	if err := r.Update(ctx, secret); err != nil {
+		return false, fmt.Errorf("update secret (merge): %w", err)
+	}
+	return true, nil
+}
+
+func secretDataEqual(a, b map[string][]byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		bv, ok := b[k]
+		if !ok || !bytes.Equal(v, bv) {
+			return false
+		}
+	}
+	return true
+}
+
+// Detects annotation drift independent of secret.Data — needed so legacy
+// secrets (no annotation yet) get stamped on next reconcile.
+func managedKeysMatch(prev map[string]struct{}, desired map[string][]byte) bool {
+	if prev == nil {
+		return false
+	}
+	if len(prev) != len(desired) {
+		return false
+	}
+	for k := range desired {
+		if _, ok := prev[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// generated=true means caller should bump PasswordUpdatedAt.
+func (r *DatabaseUserReconciler) resolvePassword(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	existing *corev1.Secret, found bool, pgClient postgres.ClientInterface, username string) (password string, generated bool, err error) {
+
+	if found {
+		if pwd := r.extractPasswordFromSecret(existing, user); pwd != "" {
+			return pwd, false, nil
+		}
+		log.FromContext(ctx).Info("secret exists but password not extractable, regenerating", "secret", existing.Name)
+	}
+
+	length := user.Spec.Password.Length
+	if length == 0 {
+		length = postgres.DefaultPasswordLength
+	}
+	newPwd, err := postgres.GeneratePassword(length)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to generate password: %w", err)
+	}
+
+	// Skip SetPassword on first-time creation — ensureUserInPostgres will
+	// CREATE USER WITH PASSWORD. Otherwise the PG user has a stale password
+	// (regenerated secret or post-Ready deletion) and must be updated.
+	needSetPassword := found || user.Status.Phase == "Ready"
+	if needSetPassword {
+		if err := pgClient.SetPassword(ctx, username, newPwd); err != nil {
+			return "", false, fmt.Errorf("failed to update password in PostgreSQL: %w", err)
+		}
+	}
+	return newPwd, true, nil
+}
+
+func (r *DatabaseUserReconciler) createOwnedSecret(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	name string, extraAnnotations map[string]string, data map[string][]byte) error {
+
+	annotations := map[string]string{ManagedByAnnotation: user.Name}
+	for k, v := range extraAnnotations {
+		annotations[k] = v
+	}
+	secret := corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   user.Namespace,
+			Annotations: annotations,
+		},
+		Data: data,
+	}
+	setManagedKeysAnnotation(&secret, data)
+	if err := controllerutil.SetControllerReference(user, &secret, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference: %w", err)
+	}
+	if err := r.Create(ctx, &secret); err != nil {
+		return fmt.Errorf("failed to create secret: %w", err)
+	}
+	return nil
+}
+
+// Sorted so the annotation is stable across reconciles — Go map iteration
+// order otherwise causes spurious Updates.
+func setManagedKeysAnnotation(secret *corev1.Secret, data map[string][]byte) {
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if secret.Annotations == nil {
+		secret.Annotations = map[string]string{}
+	}
+	secret.Annotations[ManagedKeysAnnotation] = strings.Join(keys, ",")
+}
+
+// nil ⇒ annotation absent (legacy secret); distinct from empty ⇒ annotation
+// present with zero keys tracked.
+func parseManagedKeysAnnotation(secret *corev1.Secret) map[string]struct{} {
+	raw, ok := secret.Annotations[ManagedKeysAnnotation]
+	if !ok {
+		return nil
+	}
+	if raw == "" {
+		return map[string]struct{}{}
+	}
+	out := make(map[string]struct{})
+	for _, k := range strings.Split(raw, ",") {
+		out[k] = struct{}{}
+	}
+	return out
+}
+
+// Adopting/merging a secret we previously stamped means the OwnerReference
+// was stripped externally (e.g. ArgoCD overwriting managedFields).
+func (r *DatabaseUserReconciler) warnIfOwnershipStripped(ctx context.Context, secret *corev1.Secret, user *databasesv1alpha1.DatabaseUser, op string) {
+	if secret.Annotations[ManagedByAnnotation] == user.Name {
+		log.FromContext(ctx).Info(
+			"WARNING: re-claiming a secret previously managed by this user — OwnerReference appears to have been stripped externally; password will be rotated",
+			"secret", secret.Name, "user", user.Name, "operation", op,
+		)
+	}
 }
 
 func (r *DatabaseUserReconciler) ensureFinalizer(ctx context.Context, user *databasesv1alpha1.DatabaseUser) (*ctrl.Result, error) {
@@ -278,24 +591,15 @@ func (r *DatabaseUserReconciler) ensureFinalizer(ctx context.Context, user *data
 	return &ctrl.Result{}, nil
 }
 
-//nolint:gocyclo,funlen // reconciler orchestration requires multiple steps
 func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
 	databases []*databasesv1alpha1.Database, cluster *databasesv1alpha1.DBCluster) (ctrl.Result, error) {
 
-	logger := log.FromContext(ctx)
 	username := r.getUsername(user)
-
-	// Build database names list
 	dbNames := make([]string, len(databases))
 	for i, db := range databases {
 		dbNames[i] = r.getDatabaseNameFromSpec(db)
 	}
-
-	// Base status
-	baseStatus := statusUpdate{
-		ClusterName: cluster.Name,
-		Username:    username,
-	}
+	baseStatus := statusUpdate{ClusterName: cluster.Name, Username: username}
 
 	pgClient, err := r.getPostgresClient(ctx, cluster)
 	if err != nil {
@@ -305,114 +609,123 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 		return r.setStatus(ctx, user, &baseStatus)
 	}
 
-	// Ensure secrets and get password
 	password, secretName, passwordChanged, err := r.ensureSecrets(ctx, user, databases, cluster, pgClient)
 	if err != nil {
 		baseStatus.Phase = "Failed"
 		baseStatus.Message = fmt.Sprintf("secret error: %s", err.Error())
+		// passwordChanged=true on partial rotation prevents a re-rotation loop
+		// when a per-DB secret write failed.
+		baseStatus.PasswordUpdated = passwordChanged
+		baseStatus.SecretName = secretName
 		return r.setStatus(ctx, user, &baseStatus)
 	}
-
 	if user.Status.SecretName != "" && user.Status.SecretName != secretName {
 		r.deleteOldSecret(ctx, user.Namespace, user.Status.SecretName, user)
 	}
+	baseStatus.SecretName = secretName
 
-	if err := r.ensureUserInPostgres(ctx, pgClient, username, password); err != nil {
+	if err := r.syncPostgresUser(ctx, pgClient, user, username, password, dbNames); err != nil {
 		baseStatus.Phase = "Failed"
 		baseStatus.Message = err.Error()
-		baseStatus.SecretName = secretName
 		return r.setStatus(ctx, user, &baseStatus)
 	}
 
-	// Reassign ownership for databases that are being removed from user's access
-	// This prevents orphan objects when a database is removed from the spec
-	r.reassignOwnershipForRemovedDatabases(ctx, pgClient, user, username, dbNames)
+	dbStatuses := r.applyPerDatabasePrivileges(ctx, pgClient, user, username, databases)
 
-	// Sync database access (grant to allowed, revoke from others)
-	if err := pgClient.SyncDatabaseAccess(ctx, username, dbNames); err != nil {
+	if err := r.syncRuntimeParams(ctx, pgClient, user, username); err != nil {
 		baseStatus.Phase = "Failed"
-		baseStatus.Message = fmt.Sprintf("failed to sync database access: %s", err.Error())
-		baseStatus.SecretName = secretName
+		baseStatus.Message = err.Error()
 		return r.setStatus(ctx, user, &baseStatus)
 	}
 
-	// Apply privileges per database
-	dbStatuses := make([]databasesv1alpha1.DatabaseAccessStatus, len(databases))
-	dbAccesses := user.Spec.GetDatabases()
-
-	for i, db := range databases {
-		dbName := r.getDatabaseNameFromSpec(db)
-		privileges := dbAccesses[i].Privileges
-		if privileges == "" {
-			privileges = user.Spec.Privileges
-		}
-		if privileges == "" {
-			privileges = "readonly"
-		}
-
-		additionalGrants := make([]postgres.TableGrant, len(user.Spec.AdditionalGrants))
-		for j, g := range user.Spec.AdditionalGrants {
-			privs := make([]postgres.TablePrivilege, len(g.Privileges))
-			for k, p := range g.Privileges {
-				privs[k] = postgres.TablePrivilege(p)
-			}
-			additionalGrants[j] = postgres.TableGrant{
-				Tables:     g.Tables,
-				Privileges: privs,
-			}
-		}
-
-		if err := pgClient.ApplyPrivileges(ctx, username, dbName, privileges, additionalGrants); err != nil {
-			dbStatuses[i] = databasesv1alpha1.DatabaseAccessStatus{
-				Name:         dbAccesses[i].Name,
-				Namespace:    dbAccesses[i].Namespace,
-				DatabaseName: dbName,
-				Phase:        "Failed",
-				Privileges:   privileges,
-				Message:      err.Error(),
-			}
-		} else {
-			dbStatuses[i] = databasesv1alpha1.DatabaseAccessStatus{
-				Name:         dbAccesses[i].Name,
-				Namespace:    dbAccesses[i].Namespace,
-				DatabaseName: dbName,
-				Phase:        "Ready",
-				Privileges:   privileges,
-			}
-		}
-
-		// Set secret name for perDatabase mode
-		if user.Spec.SecretGeneration == "perDatabase" {
-			dbStatuses[i].SecretName = r.getSecretNameForDatabase(user, db.Name)
-		}
-	}
-
-	if err := r.syncConnectionLimit(ctx, pgClient, username, user); err != nil {
-		baseStatus.Phase = "Failed"
-		baseStatus.Message = fmt.Sprintf("failed to sync connection limit: %s", err.Error())
-		baseStatus.SecretName = secretName
-		return r.setStatus(ctx, user, &baseStatus)
-	}
-
-	if err := r.syncIdleInTransactionTimeout(ctx, pgClient, username, user); err != nil {
-		baseStatus.Phase = "Failed"
-		baseStatus.Message = fmt.Sprintf("failed to apply idle_in_transaction_session_timeout: %s", err.Error())
-		baseStatus.SecretName = secretName
-		return r.setStatus(ctx, user, &baseStatus)
-	}
-
-	// Verify isolation
 	r.verifyIsolation(ctx, pgClient, username, dbNames)
-
-	logger.Info("user ready", "username", username, "databases", len(databases))
+	log.FromContext(ctx).Info("user ready", "username", username, "databases", len(databases))
 
 	baseStatus.Phase = "Ready"
 	baseStatus.Message = fmt.Sprintf("user created with access to %d database(s)", len(databases))
-	baseStatus.SecretName = secretName
 	baseStatus.PasswordUpdated = passwordChanged
 	baseStatus.Databases = dbStatuses
 	baseStatus.RequeueAfter = r.calculateRequeueAfter(user)
 	return r.setStatus(ctx, user, &baseStatus)
+}
+
+// Mutates the PG role itself before per-DB privileges are applied.
+func (r *DatabaseUserReconciler) syncPostgresUser(ctx context.Context, pgClient postgres.ClientInterface,
+	user *databasesv1alpha1.DatabaseUser, username, password string, dbNames []string) error {
+
+	if err := r.ensureUserInPostgres(ctx, pgClient, username, password); err != nil {
+		return err
+	}
+	r.reassignOwnershipForRemovedDatabases(ctx, pgClient, user, username, dbNames)
+	if err := pgClient.SyncDatabaseAccess(ctx, username, dbNames); err != nil {
+		return fmt.Errorf("failed to sync database access: %w", err)
+	}
+	return nil
+}
+
+func (r *DatabaseUserReconciler) applyPerDatabasePrivileges(ctx context.Context, pgClient postgres.ClientInterface,
+	user *databasesv1alpha1.DatabaseUser, username string, databases []*databasesv1alpha1.Database) []databasesv1alpha1.DatabaseAccessStatus {
+
+	dbStatuses := make([]databasesv1alpha1.DatabaseAccessStatus, len(databases))
+	dbAccesses := user.Spec.GetDatabases()
+	additionalGrants := translateAdditionalGrants(user.Spec.AdditionalGrants)
+
+	for i, db := range databases {
+		dbName := r.getDatabaseNameFromSpec(db)
+		privileges := privilegesForDatabase(dbAccesses[i].Privileges, user.Spec.Privileges)
+
+		status := databasesv1alpha1.DatabaseAccessStatus{
+			Name:         dbAccesses[i].Name,
+			Namespace:    dbAccesses[i].Namespace,
+			DatabaseName: dbName,
+			Privileges:   privileges,
+		}
+		if err := pgClient.ApplyPrivileges(ctx, username, dbName, privileges, additionalGrants); err != nil {
+			status.Phase = "Failed"
+			status.Message = err.Error()
+		} else {
+			status.Phase = "Ready"
+		}
+		if user.Spec.SecretGeneration == "perDatabase" {
+			status.SecretName = r.getSecretNameForDatabase(user, db.Name)
+		}
+		dbStatuses[i] = status
+	}
+	return dbStatuses
+}
+
+func translateAdditionalGrants(grants []databasesv1alpha1.TableGrant) []postgres.TableGrant {
+	out := make([]postgres.TableGrant, len(grants))
+	for j, g := range grants {
+		privs := make([]postgres.TablePrivilege, len(g.Privileges))
+		for k, p := range g.Privileges {
+			privs[k] = postgres.TablePrivilege(p)
+		}
+		out[j] = postgres.TableGrant{Tables: g.Tables, Privileges: privs}
+	}
+	return out
+}
+
+func privilegesForDatabase(perDB, fallback string) string {
+	if perDB != "" {
+		return perDB
+	}
+	if fallback != "" {
+		return fallback
+	}
+	return "readonly"
+}
+
+func (r *DatabaseUserReconciler) syncRuntimeParams(ctx context.Context, pgClient postgres.ClientInterface,
+	user *databasesv1alpha1.DatabaseUser, username string) error {
+
+	if err := r.syncConnectionLimit(ctx, pgClient, username, user); err != nil {
+		return fmt.Errorf("failed to sync connection limit: %w", err)
+	}
+	if err := r.syncIdleInTransactionTimeout(ctx, pgClient, username, user); err != nil {
+		return fmt.Errorf("failed to apply idle_in_transaction_session_timeout: %w", err)
+	}
+	return nil
 }
 
 // Read-before-write to avoid ALTER USER on every reconcile. CRD blocks
@@ -492,18 +805,18 @@ func (r *DatabaseUserReconciler) ensureUserInPostgres(ctx context.Context, pgCli
 
 	exists, err := pgClient.UserExists(ctx, username)
 	if err != nil {
-		return fmt.Errorf("failed to check user: %s", err.Error())
+		return fmt.Errorf("failed to check user: %w", err)
 	}
 
 	if exists {
 		if err := pgClient.SetPassword(ctx, username, password); err != nil {
-			return fmt.Errorf("failed to set password: %s", err.Error())
+			return fmt.Errorf("failed to set password: %w", err)
 		}
 		return nil
 	}
 
 	if err := pgClient.CreateUser(ctx, username, password); err != nil {
-		return fmt.Errorf("failed to create user: %s", err.Error())
+		return fmt.Errorf("failed to create user: %w", err)
 	}
 	return nil
 }
@@ -533,151 +846,199 @@ func (r *DatabaseUserReconciler) verifyIsolation(ctx context.Context, pgClient p
 	}
 }
 
-//nolint:gocyclo // secret management with multiple strategies requires complexity
+// Converge contract:
+//   - owned + extractable: keep password, rebuild shape from spec.
+//   - owned + corrupt: regenerate + SetPassword.
+//   - missing: generate (+ SetPassword if previously Ready) + create.
+//   - unowned: Adopt/Merge/Fail per onConflict.
 func (r *DatabaseUserReconciler) ensureSecrets(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
 	databases []*databasesv1alpha1.Database, cluster *databasesv1alpha1.DBCluster,
 	pgClient postgres.ClientInterface) (password, primarySecretName string, passwordChanged bool, err error) {
 
-	logger := log.FromContext(ctx)
+	if user.Spec.SecretGeneration == "perDatabase" {
+		return r.ensurePerDatabaseSecrets(ctx, user, databases, cluster, pgClient)
+	}
+	return r.ensurePrimarySecret(ctx, user, databases, cluster, pgClient)
+}
+
+func (r *DatabaseUserReconciler) ensurePrimarySecret(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	databases []*databasesv1alpha1.Database, cluster *databasesv1alpha1.DBCluster,
+	pgClient postgres.ClientInterface) (password, primarySecretName string, passwordChanged bool, err error) {
+
 	primarySecretName = r.getSecretName(user)
 	username := r.getUsername(user)
 
-	// Check if primary secret exists
-	var primarySecret corev1.Secret
-	err = r.Get(ctx, types.NamespacedName{Name: primarySecretName, Namespace: user.Namespace}, &primarySecret)
+	var existing corev1.Secret
+	getErr := r.Get(ctx, types.NamespacedName{Name: primarySecretName, Namespace: user.Namespace}, &existing)
+	if getErr != nil && !apierrors.IsNotFound(getErr) {
+		return "", "", false, getErr
+	}
+	found := getErr == nil
 
-	if err == nil { //nolint:nestif // secret handling requires multiple checks
-		// Secret exists
-		if r.isSecretOwnedByUser(&primarySecret, user) {
-			if r.shouldRotatePassword(user) {
-				return r.rotatePassword(ctx, user, &primarySecret, cluster, databases, pgClient, username)
-			}
-			_, _, _, _, pwdKey := r.getSecretKeys(user)
-			password = string(primarySecret.Data[pwdKey])
-			// Update secret with current databases list
-			if err := r.updateSecretDatabases(ctx, user, &primarySecret, cluster, databases, username); err != nil {
-				logger.Error(err, "failed to update secret databases list")
-			}
-			return password, primarySecretName, false, nil
+	if found && !r.isSecretOwnedByUser(&existing, user) {
+		if out := r.handleUnownedPrimarySecret(ctx, user, &existing, cluster, databases, pgClient, username); out.Done {
+			return out.Password, out.SecretName, out.PasswordChanged, out.Err
 		}
-
-		// Not our secret - handle based on onConflict policy
-		policy := r.getOnConflictPolicy(user)
-		switch policy {
-		case "Adopt":
-			return r.adoptSecret(ctx, user, &primarySecret, cluster, databases, pgClient, username)
-		case "Merge":
-			return r.mergeSecret(ctx, user, &primarySecret, cluster, databases, pgClient, username)
-		default:
-			return "", "", false, fmt.Errorf("secret %s already exists and is not owned by this DatabaseUser", primarySecretName)
-		}
+		// Fall through to the standard sync path — re-claim only fixed ownership.
 	}
 
-	if !errors.IsNotFound(err) {
+	if found && r.shouldRotatePassword(user) {
+		return r.rotatePrimaryPassword(ctx, user, &existing, cluster, databases, pgClient, username)
+	}
+
+	password, passwordChanged, err = r.resolvePassword(ctx, user, &existing, found, pgClient, username)
+	if err != nil {
 		return "", "", false, err
 	}
 
-	// Secret is missing - generate new password
-	isRegeneration := user.Status.Phase == "Ready"
+	desired := r.buildSecretData(user, cluster, databases, username, password)
 
-	length := user.Spec.Password.Length
-	if length == 0 {
-		length = postgres.DefaultPasswordLength
+	if !found {
+		if err := r.createOwnedSecret(ctx, user, primarySecretName, nil, desired); err != nil {
+			return "", "", false, err
+		}
+		return password, primarySecretName, true, nil
 	}
-	password, err = postgres.GeneratePassword(length)
+	// Merge-policy secrets stay on the overlay path — full-replace here would
+	// drop the foreign keys mergeSecret preserved.
+	if existing.Annotations[ConflictPolicyAnnotation] == "Merge" {
+		if _, err := r.reconcileSecretMerge(ctx, &existing, desired); err != nil {
+			return "", "", false, err
+		}
+		return password, primarySecretName, passwordChanged, nil
+	}
+	if _, err := r.reconcileSecretShape(ctx, &existing, desired); err != nil {
+		return "", "", false, err
+	}
+	return password, primarySecretName, passwordChanged, nil
+}
+
+// Re-attaches OwnerReference on a soft-owned secret (annotation matches, no
+// foreign controller). Used wherever an unowned-but-managed secret can be
+// healed in place — primary path, perDatabase first secret, per-DB loop.
+func (r *DatabaseUserReconciler) doSoftReclaim(ctx context.Context, user *databasesv1alpha1.DatabaseUser, secret *corev1.Secret) error {
+	log.FromContext(ctx).Info("re-claiming soft-owned secret", "secret", secret.Name, "user", user.Name)
+	if err := controllerutil.SetControllerReference(user, secret, r.Scheme); err != nil {
+		return fmt.Errorf("failed to re-attach OwnerReference: %w", err)
+	}
+	if err := r.Update(ctx, secret); err != nil {
+		return fmt.Errorf("failed to update secret with restored OwnerReference: %w", err)
+	}
+	return nil
+}
+
+// Soft-owned re-claim path for perDatabase mode, where Adopt/Merge isn't
+// supported. Restores OwnerReference if the annotation matches; otherwise fails.
+func (r *DatabaseUserReconciler) reclaimOrFail(ctx context.Context, user *databasesv1alpha1.DatabaseUser, secret *corev1.Secret) error {
+	if !r.isSecretSoftOwnedByUser(secret, user) {
+		return fmt.Errorf("secret %s already exists and is not owned by this DatabaseUser", secret.Name)
+	}
+	return r.doSoftReclaim(ctx, user, secret)
+}
+
+// unownedOutcome carries the result of handleUnownedPrimarySecret. Done=false
+// means the secret was self-healed (soft-owned re-claim) and the caller should
+// continue down the normal sync path.
+type unownedOutcome struct {
+	Done            bool
+	Password        string
+	SecretName      string
+	PasswordChanged bool
+	Err             error
+}
+
+func (r *DatabaseUserReconciler) handleUnownedPrimarySecret(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	existing *corev1.Secret, cluster *databasesv1alpha1.DBCluster, databases []*databasesv1alpha1.Database,
+	pgClient postgres.ClientInterface, username string) unownedOutcome {
+
+	if r.isSecretSoftOwnedByUser(existing, user) {
+		if err := r.doSoftReclaim(ctx, user, existing); err != nil {
+			return unownedOutcome{Done: true, Err: err}
+		}
+		return unownedOutcome{}
+	}
+
+	switch r.getOnConflictPolicy(user) {
+	case "Adopt":
+		p, sn, pc, e := r.adoptSecret(ctx, user, existing, cluster, databases, pgClient, username)
+		return unownedOutcome{Done: true, Password: p, SecretName: sn, PasswordChanged: pc, Err: e}
+	case "Merge":
+		p, sn, pc, e := r.mergeSecret(ctx, user, existing, cluster, databases, pgClient, username)
+		return unownedOutcome{Done: true, Password: p, SecretName: sn, PasswordChanged: pc, Err: e}
+	default:
+		return unownedOutcome{Done: true, Err: fmt.Errorf("secret %s already exists and is not owned by this DatabaseUser", existing.Name)}
+	}
+}
+
+func (r *DatabaseUserReconciler) ensurePerDatabaseSecrets(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	databases []*databasesv1alpha1.Database, cluster *databasesv1alpha1.DBCluster,
+	pgClient postgres.ClientInterface) (password, primarySecretName string, passwordChanged bool, err error) {
+
+	username := r.getUsername(user)
+	if len(databases) == 0 {
+		return "", "", false, fmt.Errorf("no databases to create secrets for")
+	}
+	primarySecretName = r.getSecretNameForDatabase(user, databases[0].Name)
+
+	// First database's secret carries the password — single source for all DBs.
+	var firstSecret corev1.Secret
+	getErr := r.Get(ctx, types.NamespacedName{Name: primarySecretName, Namespace: user.Namespace}, &firstSecret)
+	if getErr != nil && !apierrors.IsNotFound(getErr) {
+		return "", "", false, getErr
+	}
+	found := getErr == nil
+
+	if found && !r.isSecretOwnedByUser(&firstSecret, user) {
+		if err := r.reclaimOrFail(ctx, user, &firstSecret); err != nil {
+			return "", "", false, err
+		}
+	}
+	if found && r.shouldRotatePassword(user) {
+		return r.rotatePerDatabasePassword(ctx, user, cluster, databases, pgClient, username)
+	}
+
+	password, passwordChanged, err = r.resolvePassword(ctx, user, &firstSecret, found, pgClient, username)
 	if err != nil {
-		return "", "", false, fmt.Errorf("failed to generate password: %w", err)
+		return "", "", false, err
 	}
 
-	// If regenerating, update password in PostgreSQL first
-	if isRegeneration {
-		logger.Info("regenerating password (secret was deleted)", "username", username)
-		if err := pgClient.SetPassword(ctx, username, password); err != nil {
-			return "", "", false, fmt.Errorf("failed to update password in PostgreSQL: %w", err)
-		}
-	}
-
-	// Create secrets based on secretGeneration strategy
-	if user.Spec.SecretGeneration == "perDatabase" {
-		// Create separate secret for each database
-		for _, db := range databases {
-			secretName := r.getSecretNameForDatabase(user, db.Name)
-			if err := r.createDatabaseSecret(ctx, user, secretName, cluster, db, username, password); err != nil {
-				return "", "", false, fmt.Errorf("failed to create secret for database %s: %w", db.Name, err)
-			}
-		}
-		// Return the first database's secret name as primary
-		if len(databases) > 0 {
-			primarySecretName = r.getSecretNameForDatabase(user, databases[0].Name)
-		}
-	} else {
-		// Create single primary secret with all databases
-		if err := r.createPrimarySecret(ctx, user, primarySecretName, cluster, databases, username, password); err != nil {
+	for _, db := range databases {
+		if err := r.syncPerDatabaseSecret(ctx, user, cluster, db, username, password); err != nil {
 			return "", "", false, err
 		}
 	}
 
-	return password, primarySecretName, true, nil
+	return password, primarySecretName, passwordChanged, nil
 }
 
-func (r *DatabaseUserReconciler) createPrimarySecret(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
-	secretName string, cluster *databasesv1alpha1.DBCluster, databases []*databasesv1alpha1.Database,
-	username, password string) error {
+// Idempotent reconcile for one per-DB secret: create if missing, soft-reclaim
+// if OwnerRef stripped, then converge shape.
+func (r *DatabaseUserReconciler) syncPerDatabaseSecret(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	cluster *databasesv1alpha1.DBCluster, db *databasesv1alpha1.Database, username, password string) error {
 
-	hostKey, portKey, dbKey, userKey, pwdKey := r.getSecretKeys(user)
+	name := r.getSecretNameForDatabase(user, db.Name)
+	desired := r.buildPerDatabaseSecretData(user, cluster, db, username, password)
 
-	// Primary database is the first one
-	primaryDB := ""
-	if len(databases) > 0 {
-		primaryDB = r.getDatabaseNameFromSpec(databases[0])
-	}
-
-	var secretData map[string]string
-
-	// DSN template produces a single key with the full connection string
-	if user.Spec.Secret != nil && user.Spec.Secret.Template == "dsn" {
-		secretData = map[string]string{
-			"dsn": fmt.Sprintf("postgres://%s:%s@%s:%d/%s",
-				username, password, cluster.Spec.Endpoint, cluster.Spec.Port, primaryDB),
+	var current corev1.Secret
+	getErr := r.Get(ctx, types.NamespacedName{Name: name, Namespace: user.Namespace}, &current)
+	if apierrors.IsNotFound(getErr) {
+		ann := map[string]string{"dbtether.io/database": db.Name}
+		if err := r.createOwnedSecret(ctx, user, name, ann, desired); err != nil {
+			return fmt.Errorf("create secret for database %s: %w", db.Name, err)
 		}
-	} else {
-		secretData = map[string]string{
-			hostKey: cluster.Spec.Endpoint,
-			portKey: fmt.Sprintf("%d", cluster.Spec.Port),
-			dbKey:   primaryDB,
-			userKey: username,
-			pwdKey:  password,
+		return nil
+	}
+	if getErr != nil {
+		return getErr
+	}
+	if !r.isSecretOwnedByUser(&current, user) {
+		if err := r.reclaimOrFail(ctx, user, &current); err != nil {
+			return err
 		}
 	}
-
-	// Add databases list only for raw template with multiple databases
-	if r.shouldIncludeDatabasesList(user, len(databases)) {
-		dbNames := make([]string, len(databases))
-		for i, db := range databases {
-			dbNames[i] = r.getDatabaseNameFromSpec(db)
-		}
-		secretData["databases"] = strings.Join(dbNames, ",")
+	if _, err := r.reconcileSecretShape(ctx, &current, desired); err != nil {
+		return fmt.Errorf("update secret for database %s: %w", db.Name, err)
 	}
-
-	secret := corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: user.Namespace,
-			Annotations: map[string]string{
-				"dbtether.io/managed-by": user.Name,
-			},
-		},
-		StringData: secretData,
-	}
-
-	if err := controllerutil.SetControllerReference(user, &secret, r.Scheme); err != nil {
-		return fmt.Errorf("failed to set controller reference: %w", err)
-	}
-
-	if err := r.Create(ctx, &secret); err != nil {
-		return fmt.Errorf("failed to create secret: %w", err)
-	}
-
 	return nil
 }
 
@@ -685,210 +1046,127 @@ func (r *DatabaseUserReconciler) createDatabaseSecret(ctx context.Context, user 
 	secretName string, cluster *databasesv1alpha1.DBCluster, db *databasesv1alpha1.Database,
 	username, password string) error {
 
-	hostKey, portKey, dbKey, userKey, pwdKey := r.getSecretKeys(user)
+	data := r.buildPerDatabaseSecretData(user, cluster, db, username, password)
+	ann := map[string]string{"dbtether.io/database": db.Name}
 
-	secret := corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: user.Namespace,
-			Annotations: map[string]string{
-				"dbtether.io/managed-by": user.Name,
-				"dbtether.io/database":   db.Name,
-			},
-		},
-		StringData: map[string]string{
-			hostKey: cluster.Spec.Endpoint,
-			portKey: fmt.Sprintf("%d", cluster.Spec.Port),
-			dbKey:   r.getDatabaseNameFromSpec(db),
-			userKey: username,
-			pwdKey:  password,
-		},
-	}
-
-	if err := controllerutil.SetControllerReference(user, &secret, r.Scheme); err != nil {
-		return fmt.Errorf("failed to set controller reference: %w", err)
-	}
-
-	// Check if secret already exists
 	var existing corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: user.Namespace}, &existing); err == nil {
-		// Update existing
-		existing.Data = nil
-		existing.StringData = secret.StringData
-		existing.Annotations = secret.Annotations
-		return r.Update(ctx, &existing)
-	} else if !errors.IsNotFound(err) {
-		return err
+	getErr := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: user.Namespace}, &existing)
+	if apierrors.IsNotFound(getErr) {
+		return r.createOwnedSecret(ctx, user, secretName, ann, data)
 	}
-
-	return r.Create(ctx, &secret)
+	if getErr != nil {
+		return getErr
+	}
+	_, err := r.reconcileSecretShape(ctx, &existing, data)
+	return err
 }
 
-func (r *DatabaseUserReconciler) updateSecretDatabases(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
-	secret *corev1.Secret, cluster *databasesv1alpha1.DBCluster, databases []*databasesv1alpha1.Database,
-	username string) error {
-
-	hostKey, portKey, dbKey, userKey, _ := r.getSecretKeys(user)
-
-	// Primary database is the first one
-	primaryDB := ""
-	if len(databases) > 0 {
-		primaryDB = r.getDatabaseNameFromSpec(databases[0])
-	}
-
-	// Build expected databases list for comparison
-	var expectedDatabasesList string
-	if r.shouldIncludeDatabasesList(user, len(databases)) {
-		dbNames := make([]string, len(databases))
-		for i, db := range databases {
-			dbNames[i] = r.getDatabaseNameFromSpec(db)
-		}
-		expectedDatabasesList = strings.Join(dbNames, ",")
-	}
-
-	// Check if update is needed
-	currentDBs := string(secret.Data["databases"])
-	currentPrimaryDB := string(secret.Data[dbKey])
-	if currentDBs == expectedDatabasesList && currentPrimaryDB == primaryDB {
-		return nil
-	}
-
-	secret.Data[hostKey] = []byte(cluster.Spec.Endpoint)
-	secret.Data[portKey] = []byte(fmt.Sprintf("%d", cluster.Spec.Port))
-	secret.Data[dbKey] = []byte(primaryDB)
-	secret.Data[userKey] = []byte(username)
-
-	// Update or remove databases field
-	if expectedDatabasesList != "" {
-		secret.Data["databases"] = []byte(expectedDatabasesList)
-	} else {
-		delete(secret.Data, "databases")
-	}
-
-	return r.Update(ctx, secret)
-}
-
-func (r *DatabaseUserReconciler) rotatePassword(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+func (r *DatabaseUserReconciler) rotatePrimaryPassword(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
 	secret *corev1.Secret, cluster *databasesv1alpha1.DBCluster, databases []*databasesv1alpha1.Database,
 	pgClient postgres.ClientInterface, username string) (password, secretName string, passwordChanged bool, err error) {
 
 	logger := log.FromContext(ctx)
-	secretName = secret.Name
-
 	logger.Info("rotating password", "username", username, "days", user.Spec.Rotation.Days)
 
-	length := user.Spec.Password.Length
-	if length == 0 {
-		length = postgres.DefaultPasswordLength
-	}
-	password, err = postgres.GeneratePassword(length)
+	password, err = r.generateAndSetPassword(ctx, user, pgClient, username)
 	if err != nil {
-		return "", "", false, fmt.Errorf("failed to generate password: %w", err)
+		return "", "", false, err
 	}
 
-	// Update PostgreSQL first
-	if err := pgClient.SetPassword(ctx, username, password); err != nil {
-		return "", "", false, fmt.Errorf("failed to update password in PostgreSQL: %w", err)
-	}
-
-	// Update secrets based on generation strategy
-	if user.Spec.SecretGeneration == "perDatabase" { //nolint:nestif // per-database secret updates require nested logic
-		for _, db := range databases {
-			dbSecretName := r.getSecretNameForDatabase(user, db.Name)
-			if err := r.createDatabaseSecret(ctx, user, dbSecretName, cluster, db, username, password); err != nil {
-				logger.Error(err, "failed to update database secret during rotation", "secret", dbSecretName)
-			}
-		}
-		if len(databases) > 0 {
-			secretName = r.getSecretNameForDatabase(user, databases[0].Name)
+	desired := r.buildSecretData(user, cluster, databases, username, password)
+	// Merge-mode rotation must overlay — full-replace would nuke foreign keys.
+	if secret.Annotations[ConflictPolicyAnnotation] == "Merge" {
+		if _, err := r.reconcileSecretMerge(ctx, secret, desired); err != nil {
+			return "", "", false, err
 		}
 	} else {
-		// Update primary secret
-		hostKey, portKey, dbKey, userKey, pwdKey := r.getSecretKeys(user)
-
-		primaryDB := ""
-		if len(databases) > 0 {
-			primaryDB = r.getDatabaseNameFromSpec(databases[0])
+		if _, err := r.reconcileSecretShape(ctx, secret, desired); err != nil {
+			return "", "", false, err
 		}
+	}
 
-		secret.Data[pwdKey] = []byte(password)
-		secret.Data[hostKey] = []byte(cluster.Spec.Endpoint)
-		secret.Data[portKey] = []byte(fmt.Sprintf("%d", cluster.Spec.Port))
-		secret.Data[dbKey] = []byte(primaryDB)
-		secret.Data[userKey] = []byte(username)
+	logger.Info("password rotated successfully", "username", username)
+	return password, secret.Name, true, nil
+}
 
-		// Update or remove databases field
-		if r.shouldIncludeDatabasesList(user, len(databases)) {
-			dbNames := make([]string, len(databases))
-			for i, db := range databases {
-				dbNames[i] = r.getDatabaseNameFromSpec(db)
-			}
-			secret.Data["databases"] = []byte(strings.Join(dbNames, ","))
-		} else {
-			delete(secret.Data, "databases")
+func (r *DatabaseUserReconciler) rotatePerDatabasePassword(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	cluster *databasesv1alpha1.DBCluster, databases []*databasesv1alpha1.Database,
+	pgClient postgres.ClientInterface, username string) (password, secretName string, passwordChanged bool, err error) {
+
+	logger := log.FromContext(ctx)
+	logger.Info("rotating password", "username", username, "days", user.Spec.Rotation.Days)
+
+	password, err = r.generateAndSetPassword(ctx, user, pgClient, username)
+	if err != nil {
+		return "", "", false, err
+	}
+
+	if len(databases) > 0 {
+		secretName = r.getSecretNameForDatabase(user, databases[0].Name)
+	}
+
+	// Return passwordChanged=true even on partial failure — PG has already
+	// rotated, so PasswordUpdatedAt must bump or shouldRotatePassword fires
+	// again next reconcile and churns PG until the broken secret heals.
+	var rotationErrs []error
+	for _, db := range databases {
+		dbSecretName := r.getSecretNameForDatabase(user, db.Name)
+		if err := r.createDatabaseSecret(ctx, user, dbSecretName, cluster, db, username, password); err != nil {
+			rotationErrs = append(rotationErrs, fmt.Errorf("secret %s: %w", dbSecretName, err))
 		}
-
-		if err := r.Update(ctx, secret); err != nil {
-			return "", "", false, fmt.Errorf("failed to update secret: %w", err)
-		}
+	}
+	if len(rotationErrs) > 0 {
+		return password, secretName, true, fmt.Errorf("rotation succeeded in PostgreSQL but %d per-database secret write(s) failed: %w", len(rotationErrs), errors.Join(rotationErrs...))
 	}
 
 	logger.Info("password rotated successfully", "username", username)
 	return password, secretName, true, nil
 }
 
-func (r *DatabaseUserReconciler) adoptSecret(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
-	secret *corev1.Secret, cluster *databasesv1alpha1.DBCluster, databases []*databasesv1alpha1.Database,
-	pgClient postgres.ClientInterface, username string) (password, secretName string, passwordChanged bool, err error) {
-
-	logger := log.FromContext(ctx)
-	logger.Info("adopting existing secret", "secret", secret.Name)
+func (r *DatabaseUserReconciler) generateAndSetPassword(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	pgClient postgres.ClientInterface, username string) (string, error) {
 
 	length := user.Spec.Password.Length
 	if length == 0 {
 		length = postgres.DefaultPasswordLength
 	}
-	password, err = postgres.GeneratePassword(length)
+	password, err := postgres.GeneratePassword(length)
 	if err != nil {
-		return "", "", false, fmt.Errorf("failed to generate password: %w", err)
+		return "", fmt.Errorf("failed to generate password: %w", err)
 	}
+	if err := pgClient.SetPassword(ctx, username, password); err != nil {
+		return "", fmt.Errorf("failed to update password in PostgreSQL: %w", err)
+	}
+	return password, nil
+}
 
-	if err = pgClient.SetPassword(ctx, username, password); err != nil {
-		return "", "", false, fmt.Errorf("failed to set password during adopt: %w", err)
+// adoptSecret takes over an unowned secret in one Update — ownership claim,
+// password, and data all in a single transaction. If the Update fails after
+// SetPassword, the next reconcile re-Adopts (potentially generating a fresh
+// password). Avoiding two-phase claim+data prevents the worse failure mode:
+// claim succeeds → secret looks owned → resolvePassword keeps the OLD value
+// indefinitely while PG holds the NEW one.
+func (r *DatabaseUserReconciler) adoptSecret(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	secret *corev1.Secret, cluster *databasesv1alpha1.DBCluster, databases []*databasesv1alpha1.Database,
+	pgClient postgres.ClientInterface, username string) (password, secretName string, passwordChanged bool, err error) {
+
+	log.FromContext(ctx).Info("adopting existing secret", "secret", secret.Name)
+	r.warnIfOwnershipStripped(ctx, secret, user, "adopt")
+
+	password, err = r.generateAndSetPassword(ctx, user, pgClient, username)
+	if err != nil {
+		return "", "", false, err
 	}
 
 	if err = controllerutil.SetControllerReference(user, secret, r.Scheme); err != nil {
 		return "", "", false, fmt.Errorf("failed to set controller reference: %w", err)
 	}
-
-	hostKey, portKey, dbKey, userKey, pwdKey := r.getSecretKeys(user)
-
-	primaryDB := ""
-	if len(databases) > 0 {
-		primaryDB = r.getDatabaseNameFromSpec(databases[0])
-	}
-
-	secret.Data = map[string][]byte{
-		hostKey: []byte(cluster.Spec.Endpoint),
-		portKey: []byte(fmt.Sprintf("%d", cluster.Spec.Port)),
-		dbKey:   []byte(primaryDB),
-		userKey: []byte(username),
-		pwdKey:  []byte(password),
-	}
-
-	// Add databases list only for raw template with multiple databases
-	if r.shouldIncludeDatabasesList(user, len(databases)) {
-		dbNames := make([]string, len(databases))
-		for i, db := range databases {
-			dbNames[i] = r.getDatabaseNameFromSpec(db)
-		}
-		secret.Data["databases"] = []byte(strings.Join(dbNames, ","))
-	}
-
+	secret.Data = r.buildSecretData(user, cluster, databases, username, password)
+	secret.StringData = nil
+	setManagedKeysAnnotation(secret, secret.Data)
 	if err = r.Update(ctx, secret); err != nil {
 		return "", "", false, fmt.Errorf("failed to update secret during adopt: %w", err)
 	}
-
 	return password, secret.Name, true, nil
 }
 
@@ -896,58 +1174,35 @@ func (r *DatabaseUserReconciler) mergeSecret(ctx context.Context, user *database
 	secret *corev1.Secret, cluster *databasesv1alpha1.DBCluster, databases []*databasesv1alpha1.Database,
 	pgClient postgres.ClientInterface, username string) (password, secretName string, passwordChanged bool, err error) {
 
-	logger := log.FromContext(ctx)
-	logger.Info("merging into existing secret", "secret", secret.Name)
+	log.FromContext(ctx).Info("merging into existing secret", "secret", secret.Name)
+	r.warnIfOwnershipStripped(ctx, secret, user, "merge")
 
-	length := user.Spec.Password.Length
-	if length == 0 {
-		length = postgres.DefaultPasswordLength
-	}
-	password, err = postgres.GeneratePassword(length)
+	password, err = r.generateAndSetPassword(ctx, user, pgClient, username)
 	if err != nil {
-		return "", "", false, fmt.Errorf("failed to generate password: %w", err)
-	}
-
-	if err = pgClient.SetPassword(ctx, username, password); err != nil {
-		return "", "", false, fmt.Errorf("failed to set password during merge: %w", err)
+		return "", "", false, err
 	}
 
 	if err = controllerutil.SetControllerReference(user, secret, r.Scheme); err != nil {
 		return "", "", false, fmt.Errorf("failed to set controller reference: %w", err)
 	}
+	if secret.Annotations == nil {
+		secret.Annotations = map[string]string{}
+	}
+	secret.Annotations[ConflictPolicyAnnotation] = "Merge"
 
+	// Overlay; foreign keys stay. managed-keys annotation lets future
+	// reconciles drop our orphans without touching the user's keys.
 	if secret.Data == nil {
 		secret.Data = make(map[string][]byte)
 	}
-
-	hostKey, portKey, dbKey, userKey, pwdKey := r.getSecretKeys(user)
-
-	primaryDB := ""
-	if len(databases) > 0 {
-		primaryDB = r.getDatabaseNameFromSpec(databases[0])
+	desired := r.buildSecretData(user, cluster, databases, username, password)
+	for k, v := range desired {
+		secret.Data[k] = v
 	}
-
-	secret.Data[hostKey] = []byte(cluster.Spec.Endpoint)
-	secret.Data[portKey] = []byte(fmt.Sprintf("%d", cluster.Spec.Port))
-	secret.Data[dbKey] = []byte(primaryDB)
-	secret.Data[userKey] = []byte(username)
-	secret.Data[pwdKey] = []byte(password)
-
-	// Add databases list only for raw template with multiple databases
-	if r.shouldIncludeDatabasesList(user, len(databases)) {
-		dbNames := make([]string, len(databases))
-		for i, db := range databases {
-			dbNames[i] = r.getDatabaseNameFromSpec(db)
-		}
-		secret.Data["databases"] = []byte(strings.Join(dbNames, ","))
-	} else {
-		delete(secret.Data, "databases")
-	}
-
+	setManagedKeysAnnotation(secret, desired)
 	if err = r.Update(ctx, secret); err != nil {
 		return "", "", false, fmt.Errorf("failed to update secret during merge: %w", err)
 	}
-
 	return password, secret.Name, true, nil
 }
 

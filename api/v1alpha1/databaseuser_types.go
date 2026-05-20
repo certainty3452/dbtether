@@ -4,6 +4,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// +kubebuilder:validation:XValidation:rule="!(self.secretGeneration == 'perDatabase' && has(self.secret) && has(self.secret.name) && size(self.secret.name) > 0)",message="spec.secret.name cannot be set when secretGeneration=perDatabase (each per-DB secret derives its name from the DB)"
+// +kubebuilder:validation:XValidation:rule="!(self.secretGeneration == 'perDatabase' && has(self.secret) && has(self.secret.onConflict) && self.secret.onConflict != 'Fail')",message="onConflict policies Adopt/Merge are not supported when secretGeneration=perDatabase; only Fail is allowed"
 type DatabaseUserSpec struct {
 	// Simple case: single database reference
 	// Mutually exclusive with Databases
@@ -144,6 +146,11 @@ type SecretConfig struct {
 	// +optional
 	Keys *SecretKeys `json:"keys,omitempty"`
 
+	// Merge mode persists via an annotation on the produced secret: once a
+	// secret is adopted under Merge, subsequent reconciles keep overlaying
+	// (foreign keys preserved) even if onConflict is later removed from the
+	// spec. Use Adopt then Fail (or recreate the secret) to "fall back" to
+	// full-replace semantics.
 	// +optional
 	// +kubebuilder:validation:Enum=Fail;Adopt;Merge
 	// +kubebuilder:default=Fail
@@ -159,6 +166,9 @@ type SecretKeys struct {
 	Database string `json:"database,omitempty"`
 	// +optional
 	Username string `json:"username,omitempty"`
+	// Renaming after the secret exists forces a password regeneration — the
+	// previous value can't be located under the old name. PG user keeps
+	// working; consumers must re-read the secret.
 	// +optional
 	Password string `json:"password,omitempty"`
 }
