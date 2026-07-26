@@ -417,6 +417,56 @@ func TestApplyRetention_NilPolicy(t *testing.T) {
 	assert.Equal(t, 1, mockClient.Count(), "file should remain untouched")
 }
 
+func TestApplyRetention_NoActiveRule(t *testing.T) {
+	tests := []struct {
+		name       string
+		policy     *dbtether.RetentionPolicy
+		wantDelete int
+	}{
+		{
+			name:       "empty policy deletes nothing",
+			policy:     &dbtether.RetentionPolicy{},
+			wantDelete: 0,
+		},
+		{
+			name: "all-zero policy deletes nothing",
+			policy: &dbtether.RetentionPolicy{
+				KeepLast:    intPtr(0),
+				KeepDaily:   intPtr(0),
+				KeepWeekly:  intPtr(0),
+				KeepMonthly: intPtr(0),
+			},
+			wantDelete: 0,
+		},
+		{
+			name:       "one positive rule still works",
+			policy:     &dbtether.RetentionPolicy{KeepLast: intPtr(2)},
+			wantDelete: 3,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, _ := zap.NewDevelopment()
+			rm := NewRetentionManager(logger.Sugar())
+			ctx := context.Background()
+
+			mockClient := storage.NewMockClient()
+			now := time.Now()
+			mockClient.AddObject("cluster/db/20260120-140000.sql.gz", []byte("backup1"), now.Add(-1*time.Hour))
+			mockClient.AddObject("cluster/db/20260120-130000.sql.gz", []byte("backup2"), now.Add(-2*time.Hour))
+			mockClient.AddObject("cluster/db/20260120-120000.sql.gz", []byte("backup3"), now.Add(-3*time.Hour))
+			mockClient.AddObject("cluster/db/20260120-110000.sql.gz", []byte("backup4"), now.Add(-4*time.Hour))
+			mockClient.AddObject("cluster/db/20260120-100000.sql.gz", []byte("backup5"), now.Add(-5*time.Hour))
+
+			toDelete, err := rm.ApplyRetention(ctx, mockClient, "cluster/db/", tt.policy, nil)
+
+			require.NoError(t, err)
+			assert.Len(t, toDelete, tt.wantDelete)
+		})
+	}
+}
+
 func TestApplyRetention_ListError(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	rm := NewRetentionManager(logger.Sugar())

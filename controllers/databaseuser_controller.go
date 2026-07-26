@@ -68,9 +68,14 @@ func (r *DatabaseUserReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		secretName := r.getSecretName(&user)
 		var secret corev1.Secret
 		if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: user.Namespace}, &secret); err == nil {
-			return ctrl.Result{}, nil
+			// Rotation is time-driven: only fall through when it is actually due,
+			// otherwise re-arm the requeue this fast path would otherwise swallow.
+			if !r.shouldRotatePassword(&user) {
+				return ctrl.Result{RequeueAfter: r.calculateRequeueAfter(&user)}, nil
+			}
+		} else {
+			logger.Info("secret missing, triggering reconciliation", "secret", secretName)
 		}
-		logger.Info("secret missing, triggering reconciliation", "secret", secretName)
 	}
 	logger.V(1).Info("reconciling", "username", username)
 
@@ -639,12 +644,26 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 	}
 
 	r.verifyIsolation(ctx, pgClient, username, dbNames)
+
+	baseStatus.PasswordUpdated = passwordChanged
+	baseStatus.Databases = dbStatuses
+
+	// A per-database apply failure must not read as Ready: surface it top-level
+	// and return an error so controller-runtime retries with backoff.
+	if failed := failedDatabaseNames(dbStatuses); len(failed) > 0 {
+		msg := fmt.Sprintf("failed to apply privileges for database(s): %s", strings.Join(failed, ", "))
+		baseStatus.Phase = "Failed"
+		baseStatus.Message = msg
+		if _, err := r.setStatus(ctx, user, &baseStatus); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, errors.New(msg)
+	}
+
 	log.FromContext(ctx).Info("user ready", "username", username, "databases", len(databases))
 
 	baseStatus.Phase = "Ready"
 	baseStatus.Message = fmt.Sprintf("user created with access to %d database(s)", len(databases))
-	baseStatus.PasswordUpdated = passwordChanged
-	baseStatus.Databases = dbStatuses
 	baseStatus.RequeueAfter = r.calculateRequeueAfter(user)
 	return r.setStatus(ctx, user, &baseStatus)
 }
@@ -1216,7 +1235,11 @@ func (r *DatabaseUserReconciler) handleDeletion(ctx context.Context, user *datab
 	logger.Info("handling deletion", "username", username)
 
 	if user.Spec.DeletionPolicy != "Retain" {
-		r.dropUserFromPostgres(ctx, user, username)
+		if err := r.dropUserFromPostgres(ctx, user, username); err != nil {
+			// Keep the finalizer and requeue: the CR must not disappear while the
+			// PostgreSQL role still exists (e.g. Postgres unreachable at Exec).
+			return ctrl.Result{}, err
+		}
 	} else {
 		logger.Info("retaining user in PostgreSQL due to deletionPolicy", "username", username)
 	}
@@ -1227,47 +1250,49 @@ func (r *DatabaseUserReconciler) handleDeletion(ctx context.Context, user *datab
 }
 
 func (r *DatabaseUserReconciler) dropUserFromPostgres(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
-	username string) {
+	username string) error {
 
 	logger := log.FromContext(ctx)
 
 	clusterName, databaseNames := r.getClusterAndDatabasesForDeletion(ctx, user)
 	if clusterName == "" {
-		logger.Error(nil, "cannot determine cluster for cleanup - user will remain in PostgreSQL")
-		return
+		// No resolvable cluster (never provisioned, or all referenced Databases
+		// gone) — cleanup is impossible by design, so release the finalizer.
+		logger.Info("no cluster resolvable for cleanup, skipping user drop")
+		return nil
 	}
 
 	var cluster databasesv1alpha1.DBCluster
 	if err := r.Get(ctx, types.NamespacedName{Name: clusterName}, &cluster); err != nil {
-		logger.Error(err, "failed to get cluster for cleanup")
-		return
+		if apierrors.IsNotFound(err) {
+			logger.Info("cluster not found, skipping user drop")
+			return nil
+		}
+		return err
 	}
 
 	pgClient, err := r.getPostgresClient(ctx, &cluster)
 	if err != nil {
-		logger.Error(err, "failed to get postgres client for cleanup")
-		return
+		return fmt.Errorf("failed to get postgres client for cleanup: %w", err)
 	}
 
-	// Reassign ownership and revoke privileges from all databases
+	// Reassign ownership and revoke privileges from all databases. These are
+	// best-effort: if the role still owns objects, the DropUser below fails and
+	// gates finalizer removal, so a transient failure here is retried anyway.
 	for _, dbName := range databaseNames {
-		// Reassign ownership first (required if user had "owner" privileges)
-		// This transfers all objects owned by the user back to master
 		if err := pgClient.ReassignOwnership(ctx, username, dbName); err != nil {
 			logger.Error(err, "failed to reassign ownership", "database", dbName)
-			// Continue anyway - user may not have owned any objects
 		}
-
 		if err := pgClient.RevokePrivilegesInDatabase(ctx, username, dbName); err != nil {
 			logger.Error(err, "failed to revoke privileges", "database", dbName)
 		}
 	}
 
 	if err := pgClient.DropUser(ctx, username); err != nil {
-		logger.Error(err, "failed to drop user")
-	} else {
-		logger.Info("user dropped", "username", username)
+		return fmt.Errorf("failed to drop user %s: %w", username, err)
 	}
+	logger.Info("user dropped", "username", username)
+	return nil
 }
 
 func (r *DatabaseUserReconciler) getClusterAndDatabasesForDeletion(ctx context.Context, user *databasesv1alpha1.DatabaseUser) (clusterName string, databaseNames []string) {
@@ -1397,11 +1422,14 @@ type statusUpdate struct {
 }
 
 func (r *DatabaseUserReconciler) setStatus(ctx context.Context, user *databasesv1alpha1.DatabaseUser, update *statusUpdate) (ctrl.Result, error) {
-	// Handle pending timeout (may modify update)
-	r.handlePendingTimeout(user, update)
+	// Snapshot before any status mutation — handlePendingTimeout writes
+	// PendingSince, which must be part of the patch diff to reach the API server.
+	patch := client.MergeFrom(user.DeepCopy())
 
-	// Check if status actually changed
-	statusChanged := user.Status.Phase != update.Phase ||
+	pendingChanged := r.handlePendingTimeout(user, update)
+
+	statusChanged := pendingChanged ||
+		user.Status.Phase != update.Phase ||
 		user.Status.Message != update.Message ||
 		user.Status.ObservedGeneration != user.Generation ||
 		(update.ClusterName != "" && user.Status.ClusterName != update.ClusterName) ||
@@ -1411,8 +1439,6 @@ func (r *DatabaseUserReconciler) setStatus(ctx context.Context, user *databasesv
 		len(update.Databases) > 0
 
 	if statusChanged {
-		patch := client.MergeFrom(user.DeepCopy())
-
 		user.Status.Phase = update.Phase
 		user.Status.Message = update.Message
 		user.Status.ObservedGeneration = user.Generation
@@ -1430,18 +1456,28 @@ func (r *DatabaseUserReconciler) setStatus(ctx context.Context, user *databasesv
 	return ctrl.Result{}, nil
 }
 
-func (r *DatabaseUserReconciler) handlePendingTimeout(user *databasesv1alpha1.DatabaseUser, update *statusUpdate) {
+func (r *DatabaseUserReconciler) handlePendingTimeout(user *databasesv1alpha1.DatabaseUser, update *statusUpdate) (pendingChanged bool) {
 	if update.Phase == "Pending" {
 		now := metav1.Now()
 		if user.Status.PendingSince == nil {
 			user.Status.PendingSince = &now
-		} else if now.Sub(user.Status.PendingSince.Time) > PendingTimeout {
+			return true
+		}
+		if now.Sub(user.Status.PendingSince.Time) > PendingTimeout {
 			update.Phase = "Failed"
 			update.Message = fmt.Sprintf("timeout: %s (pending for over 10 minutes)", update.Message)
+			// Transitioning out of Pending — reset the clock so a later Pending
+			// episode starts fresh instead of re-timing-out immediately.
+			user.Status.PendingSince = nil
+			return true
 		}
-	} else {
-		user.Status.PendingSince = nil
+		return false
 	}
+	if user.Status.PendingSince != nil {
+		user.Status.PendingSince = nil
+		return true
+	}
+	return false
 }
 
 func (r *DatabaseUserReconciler) applyStatusFields(user *databasesv1alpha1.DatabaseUser, update *statusUpdate) {
@@ -1472,6 +1508,16 @@ func (r *DatabaseUserReconciler) buildDatabasesSummary(databases []databasesv1al
 		return databases[0].DatabaseName
 	}
 	return fmt.Sprintf("%s (+%d)", databases[0].DatabaseName, len(databases)-1)
+}
+
+func failedDatabaseNames(statuses []databasesv1alpha1.DatabaseAccessStatus) []string {
+	var failed []string
+	for _, s := range statuses {
+		if s.Phase == "Failed" {
+			failed = append(failed, s.DatabaseName)
+		}
+	}
+	return failed
 }
 
 func (r *DatabaseUserReconciler) SetupWithManager(mgr ctrl.Manager) error {

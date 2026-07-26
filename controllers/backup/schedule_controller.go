@@ -344,6 +344,15 @@ func (r *BackupScheduleReconciler) cleanupBackupCRDs(ctx context.Context, schedu
 		return
 	}
 
+	// Schedules stored before the CEL rule can carry an empty policy; an empty
+	// keepSet here would delete every Backup CR.
+	if !pkgbackup.HasActiveRule(schedule.Spec.Retention) {
+		log.Warnw("retention cleanup: policy has no active rule; no backup CRDs will be deleted",
+			"schedule", schedule.Name,
+		)
+		return
+	}
+
 	// List all Backup CRDs created by this schedule
 	var backups dbtether.BackupList
 	if err := r.List(ctx, &backups,

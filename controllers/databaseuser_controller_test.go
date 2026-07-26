@@ -3,6 +3,8 @@ package controllers
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,7 +14,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
@@ -1633,6 +1638,7 @@ func newTestReconciler(objects ...runtime.Object) *DatabaseUserReconciler {
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithRuntimeObjects(objects...).
+		WithStatusSubresource(&databasesv1alpha1.DatabaseUser{}).
 		Build()
 
 	return &DatabaseUserReconciler{
@@ -1640,6 +1646,38 @@ func newTestReconciler(objects ...runtime.Object) *DatabaseUserReconciler {
 		Scheme: scheme,
 	}
 }
+
+func newTestReconcilerWithCache(pgCache postgres.ClientCacheInterface, objects ...runtime.Object) *DatabaseUserReconciler {
+	scheme := runtime.NewScheme()
+	_ = databasesv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithRuntimeObjects(objects...).
+		WithStatusSubresource(&databasesv1alpha1.DatabaseUser{}).
+		Build()
+
+	return &DatabaseUserReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		PGClientCache: pgCache,
+	}
+}
+
+// singleClientCache lets a test fail one specific ClientInterface method,
+// rather than the blunt global ShouldFail on MockClient.
+type singleClientCache struct {
+	pgClient postgres.ClientInterface
+}
+
+func (c *singleClientCache) Get(_ context.Context, _ string, _ postgres.Config) (postgres.ClientInterface, error) {
+	return c.pgClient, nil
+}
+func (c *singleClientCache) Remove(_ string) {}
+func (c *singleClientCache) Close()          {}
+
+var _ postgres.ClientCacheInterface = (*singleClientCache)(nil)
 
 func TestDatabaseUserReconciler_RotatePassword(t *testing.T) {
 	ctx := context.Background()
@@ -3441,5 +3479,382 @@ func TestReconcileSecretShape_DropsForeignKeys(t *testing.T) {
 	}
 	if string(fresh.Data["password"]) != "p" {
 		t.Errorf("password = %q, want %q", fresh.Data["password"], "p")
+	}
+}
+
+func TestDatabaseUserReconciler_DeletionPolicyDelete_DropFailureKeepsFinalizer(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster-creds", Namespace: "default"},
+		Data:       map[string][]byte{"username": []byte("postgres"), "password": []byte("pw")},
+	}
+	cluster := &databasesv1alpha1.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
+		Spec: databasesv1alpha1.DBClusterSpec{
+			Endpoint: "localhost",
+			Port:     5432,
+			CredentialsSecretRef: &databasesv1alpha1.SecretReference{
+				Name:      "cluster-creds",
+				Namespace: "default",
+			},
+		},
+	}
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "drop-fail-user",
+			Namespace:         "default",
+			Finalizers:        []string{UserFinalizerName},
+			DeletionTimestamp: &now,
+		},
+		Spec: databasesv1alpha1.DatabaseUserSpec{
+			Database: &databasesv1alpha1.DatabaseAccess{Name: "db1"},
+		},
+		Status: databasesv1alpha1.DatabaseUserStatus{
+			ClusterName: "test-cluster",
+			Databases: []databasesv1alpha1.DatabaseAccessStatus{
+				{DatabaseName: "db1"},
+			},
+		},
+	}
+
+	pgCache := postgres.NewMockClientCache()
+	pgCache.DefaultMock.ShouldFail = true
+	pgCache.DefaultMock.FailError = errors.New("postgres unreachable")
+
+	r := newTestReconcilerWithCache(pgCache, secret, cluster, user)
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "drop-fail-user", Namespace: "default"}}
+	if _, err := r.Reconcile(ctx, req); err == nil {
+		t.Fatal("expected error when DropUser fails")
+	}
+
+	var updated databasesv1alpha1.DatabaseUser
+	if err := r.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatalf("failed to get user: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(&updated, UserFinalizerName) {
+		t.Error("finalizer should still be present after a failed drop")
+	}
+}
+
+func TestDatabaseUserReconciler_DeletionPolicyDelete_NoResolvableClusterRemovesFinalizer(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "orphan-user",
+			Namespace:         "default",
+			Finalizers:        []string{UserFinalizerName},
+			DeletionTimestamp: &now,
+		},
+		// No Database/Databases in spec and no Status.ClusterName: cleanup is
+		// impossible by design.
+	}
+
+	r := newTestReconcilerWithCache(postgres.NewMockClientCache(), user)
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "orphan-user", Namespace: "default"}}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var updated databasesv1alpha1.DatabaseUser
+	err := r.Get(ctx, req.NamespacedName, &updated)
+	if err == nil && controllerutil.ContainsFinalizer(&updated, UserFinalizerName) {
+		t.Error("finalizer should be removed when no cluster is resolvable for cleanup")
+	}
+}
+
+func TestDatabaseUserReconciler_ReadyRotationConfigured_FastPathRequeuesPositive(t *testing.T) {
+	ctx := context.Background()
+
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "rotation-steady", Namespace: "default"},
+		Spec: databasesv1alpha1.DatabaseUserSpec{
+			Database: &databasesv1alpha1.DatabaseAccess{Name: "db1"},
+			Rotation: &databasesv1alpha1.RotationConfig{Days: 30},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "rotation-steady-credentials", Namespace: "default"},
+		Data:       map[string][]byte{"password": []byte("pw")},
+	}
+
+	r := newTestReconciler(user, secret)
+	key := types.NamespacedName{Name: "rotation-steady", Namespace: "default"}
+
+	var stored databasesv1alpha1.DatabaseUser
+	if err := r.Get(ctx, key, &stored); err != nil {
+		t.Fatalf("failed to get user: %v", err)
+	}
+	now := metav1.Now()
+	stored.Status.Phase = "Ready"
+	stored.Status.ObservedGeneration = stored.Generation
+	stored.Status.PasswordUpdatedAt = &now
+	if err := r.Status().Update(ctx, &stored); err != nil {
+		t.Fatalf("failed to seed status: %v", err)
+	}
+
+	result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Errorf("expected positive RequeueAfter for steady Ready state with rotation configured, got %v", result.RequeueAfter)
+	}
+}
+
+func TestDatabaseUserReconciler_RotationDue_FullReconcileRotatesPassword(t *testing.T) {
+	ctx := context.Background()
+
+	clusterSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "rotation-due-cluster-creds", Namespace: "default"},
+		Data:       map[string][]byte{"username": []byte("postgres"), "password": []byte("pw")},
+	}
+	cluster := &databasesv1alpha1.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "rotation-due-cluster"},
+		Spec: databasesv1alpha1.DBClusterSpec{
+			Endpoint: "localhost",
+			Port:     5432,
+			CredentialsSecretRef: &databasesv1alpha1.SecretReference{
+				Name:      "rotation-due-cluster-creds",
+				Namespace: "default",
+			},
+		},
+		Status: databasesv1alpha1.DBClusterStatus{Phase: "Connected"},
+	}
+	db := &databasesv1alpha1.Database{
+		ObjectMeta: metav1.ObjectMeta{Name: "rotation-due-db", Namespace: "default"},
+		Spec: databasesv1alpha1.DatabaseSpec{
+			ClusterRef: databasesv1alpha1.ClusterReference{Name: "rotation-due-cluster"},
+		},
+		Status: databasesv1alpha1.DatabaseStatus{Phase: "Ready", DatabaseName: "rotation_due_db"},
+	}
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "rotation-due-user", Namespace: "default"},
+		Spec: databasesv1alpha1.DatabaseUserSpec{
+			Database: &databasesv1alpha1.DatabaseAccess{Name: "rotation-due-db"},
+			Rotation: &databasesv1alpha1.RotationConfig{Days: 30},
+		},
+	}
+
+	r := newTestReconcilerWithCache(postgres.NewMockClientCache(), clusterSecret, cluster, db, user)
+	key := types.NamespacedName{Name: "rotation-due-user", Namespace: "default"}
+	req := reconcile.Request{NamespacedName: key}
+
+	// 1st reconcile: only adds the finalizer.
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("finalizer reconcile: %v", err)
+	}
+	// 2nd reconcile: creates the secret and reaches Ready.
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+
+	secretName := "rotation-due-user-credentials"
+	var origSecret corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: "default"}, &origSecret); err != nil {
+		t.Fatalf("failed to get secret: %v", err)
+	}
+	origPassword := string(origSecret.Data["password"])
+	if origPassword == "" {
+		t.Fatal("expected an initial password to be set")
+	}
+
+	// Age the password past the 30-day rotation window.
+	var stored databasesv1alpha1.DatabaseUser
+	if err := r.Get(ctx, key, &stored); err != nil {
+		t.Fatalf("failed to get user: %v", err)
+	}
+	stale := metav1.NewTime(time.Now().Add(-31 * 24 * time.Hour))
+	stored.Status.PasswordUpdatedAt = &stale
+	if err := r.Status().Update(ctx, &stored); err != nil {
+		t.Fatalf("failed to age PasswordUpdatedAt: %v", err)
+	}
+
+	// 3rd reconcile: rotation is due, fast path must be skipped.
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("rotation reconcile: %v", err)
+	}
+
+	var rotatedSecret corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: "default"}, &rotatedSecret); err != nil {
+		t.Fatalf("failed to get rotated secret: %v", err)
+	}
+	if string(rotatedSecret.Data["password"]) == origPassword {
+		t.Error("expected password to change after rotation")
+	}
+
+	var rotatedUser databasesv1alpha1.DatabaseUser
+	if err := r.Get(ctx, key, &rotatedUser); err != nil {
+		t.Fatalf("failed to get user: %v", err)
+	}
+	if rotatedUser.Status.PasswordUpdatedAt == nil || !rotatedUser.Status.PasswordUpdatedAt.After(stale.Time) {
+		t.Error("expected PasswordUpdatedAt to bump after rotation")
+	}
+}
+
+func TestDatabaseUserReconciler_SetStatus_PendingSincePersistedAndTimesOut(t *testing.T) {
+	ctx := context.Background()
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "pending-user", Namespace: "default"},
+	}
+	r := newTestReconciler(user)
+	key := types.NamespacedName{Name: "pending-user", Namespace: "default"}
+
+	var fetched databasesv1alpha1.DatabaseUser
+	if err := r.Get(ctx, key, &fetched); err != nil {
+		t.Fatalf("failed to get user: %v", err)
+	}
+	if _, err := r.setStatus(ctx, &fetched, &statusUpdate{Phase: "Pending", Message: "waiting for Database"}); err != nil {
+		t.Fatalf("setStatus: %v", err)
+	}
+
+	var afterFirst databasesv1alpha1.DatabaseUser
+	if err := r.Get(ctx, key, &afterFirst); err != nil {
+		t.Fatalf("failed to get user: %v", err)
+	}
+	if afterFirst.Status.PendingSince == nil {
+		t.Fatal("expected PendingSince to be persisted to the API server")
+	}
+	if afterFirst.Status.Phase != "Pending" {
+		t.Fatalf("expected Pending, got %s", afterFirst.Status.Phase)
+	}
+
+	stale := metav1.NewTime(time.Now().Add(-(PendingTimeout + time.Minute)))
+	patch := client.MergeFrom(afterFirst.DeepCopy())
+	afterFirst.Status.PendingSince = &stale
+	if err := r.Status().Patch(ctx, &afterFirst, patch); err != nil {
+		t.Fatalf("failed to age PendingSince: %v", err)
+	}
+
+	if _, err := r.setStatus(ctx, &afterFirst, &statusUpdate{Phase: "Pending", Message: "still waiting"}); err != nil {
+		t.Fatalf("setStatus: %v", err)
+	}
+
+	var afterTimeout databasesv1alpha1.DatabaseUser
+	if err := r.Get(ctx, key, &afterTimeout); err != nil {
+		t.Fatalf("failed to get user: %v", err)
+	}
+	if afterTimeout.Status.Phase != "Failed" {
+		t.Errorf("expected timeout to flip phase to Failed, got %s", afterTimeout.Status.Phase)
+	}
+	if afterTimeout.Status.PendingSince != nil {
+		t.Error("expected PendingSince to be cleared after timeout->Failed transition")
+	}
+}
+
+func TestDatabaseUserReconciler_SetStatus_PendingSinceClearsOnReady(t *testing.T) {
+	ctx := context.Background()
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "pending-to-ready-user", Namespace: "default"},
+	}
+	r := newTestReconciler(user)
+	key := types.NamespacedName{Name: "pending-to-ready-user", Namespace: "default"}
+
+	var fetched databasesv1alpha1.DatabaseUser
+	if err := r.Get(ctx, key, &fetched); err != nil {
+		t.Fatalf("failed to get user: %v", err)
+	}
+	if _, err := r.setStatus(ctx, &fetched, &statusUpdate{Phase: "Pending", Message: "waiting"}); err != nil {
+		t.Fatalf("setStatus: %v", err)
+	}
+
+	var afterPending databasesv1alpha1.DatabaseUser
+	if err := r.Get(ctx, key, &afterPending); err != nil {
+		t.Fatalf("failed to get user: %v", err)
+	}
+	if afterPending.Status.PendingSince == nil {
+		t.Fatal("expected PendingSince to be set while Pending")
+	}
+
+	if _, err := r.setStatus(ctx, &afterPending, &statusUpdate{Phase: "Ready", Message: "ok"}); err != nil {
+		t.Fatalf("setStatus: %v", err)
+	}
+
+	var afterReady databasesv1alpha1.DatabaseUser
+	if err := r.Get(ctx, key, &afterReady); err != nil {
+		t.Fatalf("failed to get user: %v", err)
+	}
+	if afterReady.Status.PendingSince != nil {
+		t.Error("expected PendingSince to be nil once phase is Ready")
+	}
+}
+
+// mockPGClientPerDBFailure fails ApplyPrivileges for exactly one database name,
+// so a top-level reconcile can be exercised with a mixed Ready/Failed
+// per-database outcome.
+type mockPGClientPerDBFailure struct {
+	*postgres.MockClient
+	failDatabase string
+}
+
+func (m *mockPGClientPerDBFailure) ApplyPrivileges(ctx context.Context, username, database, preset string, additionalGrants []postgres.TableGrant) error {
+	if database == m.failDatabase {
+		return fmt.Errorf("permission denied for database %s", database)
+	}
+	return nil
+}
+
+func TestDatabaseUserReconciler_ReconcileUser_PerDatabaseFailureSetsTopLevelFailed(t *testing.T) {
+	ctx := context.Background()
+
+	clusterSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster-creds", Namespace: "default"},
+		Data:       map[string][]byte{"username": []byte("postgres"), "password": []byte("pw")},
+	}
+	cluster := &databasesv1alpha1.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster1"},
+		Spec: databasesv1alpha1.DBClusterSpec{
+			Endpoint: "localhost",
+			Port:     5432,
+			CredentialsSecretRef: &databasesv1alpha1.SecretReference{
+				Name:      "cluster-creds",
+				Namespace: "default",
+			},
+		},
+	}
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "perdb-fail-user", Namespace: "default"},
+		Spec: databasesv1alpha1.DatabaseUserSpec{
+			Databases: []databasesv1alpha1.DatabaseAccess{
+				{Name: "db1"}, {Name: "db2"},
+			},
+			Privileges: "readonly",
+		},
+	}
+	databases := []*databasesv1alpha1.Database{
+		{ObjectMeta: metav1.ObjectMeta{Name: "db1"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "appdb"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "db2"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "faildb"}},
+	}
+
+	mockPG := &mockPGClientPerDBFailure{MockClient: postgres.NewMockClient(), failDatabase: "faildb"}
+	r := newTestReconcilerWithCache(&singleClientCache{pgClient: mockPG}, clusterSecret, user)
+
+	var fetchedUser databasesv1alpha1.DatabaseUser
+	if err := r.Get(ctx, types.NamespacedName{Name: "perdb-fail-user", Namespace: "default"}, &fetchedUser); err != nil {
+		t.Fatalf("failed to get user: %v", err)
+	}
+
+	_, err := r.reconcileUser(ctx, &fetchedUser, databases, cluster)
+	if err == nil {
+		t.Fatal("expected error when a per-database privilege apply fails")
+	}
+	if !strings.Contains(err.Error(), "faildb") {
+		t.Errorf("error should name the failing database, got: %v", err)
+	}
+
+	var afterFailure databasesv1alpha1.DatabaseUser
+	if err := r.Get(ctx, types.NamespacedName{Name: "perdb-fail-user", Namespace: "default"}, &afterFailure); err != nil {
+		t.Fatalf("failed to get user: %v", err)
+	}
+	if afterFailure.Status.Phase != "Failed" {
+		t.Errorf("expected top-level Phase=Failed, got %s", afterFailure.Status.Phase)
+	}
+	if !strings.Contains(afterFailure.Status.Message, "faildb") {
+		t.Errorf("expected status message to name the failing database, got %q", afterFailure.Status.Message)
 	}
 }

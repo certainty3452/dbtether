@@ -2,14 +2,21 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	dbtether "github.com/certainty3452/dbtether/api/v1alpha1"
 )
@@ -357,6 +364,23 @@ func TestBuildEnvVars_Storage(t *testing.T) {
 			expectType:  "azure",
 			expectCount: 8, // base vars + Azure vars
 		},
+		{
+			name: "S3 storage with credentialsSecretRef",
+			storage: &dbtether.BackupStorage{
+				Spec: dbtether.BackupStorageSpec{
+					S3: &dbtether.S3StorageConfig{
+						Bucket: "test-bucket",
+						Region: "us-east-1",
+					},
+					CredentialsSecretRef: &dbtether.SecretReference{
+						Name:      "s3-creds",
+						Namespace: "default",
+					},
+				},
+			},
+			expectType:  "s3",
+			expectCount: 10, // base vars + S3 vars + AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
+		},
 	}
 
 	for _, tt := range tests {
@@ -374,6 +398,28 @@ func TestBuildEnvVars_Storage(t *testing.T) {
 
 			assert.Equal(t, tt.expectType, storageType)
 			assert.GreaterOrEqual(t, len(env), 5) // At least base vars
+
+			if tt.storage.Spec.CredentialsSecretRef != nil {
+				var hasAccessKey, hasSecretKey bool
+				for _, e := range env {
+					if e.Name == "AWS_ACCESS_KEY_ID" {
+						hasAccessKey = true
+						require.NotNil(t, e.ValueFrom)
+						require.NotNil(t, e.ValueFrom.SecretKeyRef)
+						assert.Equal(t, tt.storage.Spec.CredentialsSecretRef.Name, e.ValueFrom.SecretKeyRef.Name)
+						assert.Equal(t, "AWS_ACCESS_KEY_ID", e.ValueFrom.SecretKeyRef.Key)
+					}
+					if e.Name == "AWS_SECRET_ACCESS_KEY" {
+						hasSecretKey = true
+						require.NotNil(t, e.ValueFrom)
+						require.NotNil(t, e.ValueFrom.SecretKeyRef)
+						assert.Equal(t, tt.storage.Spec.CredentialsSecretRef.Name, e.ValueFrom.SecretKeyRef.Name)
+						assert.Equal(t, "AWS_SECRET_ACCESS_KEY", e.ValueFrom.SecretKeyRef.Key)
+					}
+				}
+				assert.True(t, hasAccessKey, "expected AWS_ACCESS_KEY_ID env var")
+				assert.True(t, hasSecretKey, "expected AWS_SECRET_ACCESS_KEY env var")
+			}
 		})
 	}
 }
@@ -461,13 +507,13 @@ func newFakeRestoreReconciler(objs ...runtime.Object) *RestoreReconciler {
 	scheme := runtime.NewScheme()
 	_ = dbtether.AddToScheme(scheme)
 
-	client := fake.NewClientBuilder().
+	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithRuntimeObjects(objs...).
 		Build()
 
 	return &RestoreReconciler{
-		Client: client,
+		Client: fakeClient,
 		Scheme: scheme,
 	}
 }
@@ -849,6 +895,114 @@ func TestJobToRestoreMapping(t *testing.T) {
 			assert.Equal(t, tt.expectedName, restoreName)
 			assert.Equal(t, tt.expectedNamespace, restoreNamespace)
 		})
+	}
+}
+
+func newRestoreTestScheme() *runtime.Scheme {
+	scheme := runtime.NewScheme()
+	_ = dbtether.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	return scheme
+}
+
+func TestRestoreReconciler_EnsureFinalizer_UpdateError(t *testing.T) {
+	restore := &dbtether.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-restore", Namespace: "default"},
+		Spec: dbtether.RestoreSpec{
+			Source: dbtether.RestoreSource{
+				Path:       "some/path.sql.gz",
+				StorageRef: &dbtether.StorageReference{Name: "my-storage"},
+			},
+			Target: dbtether.RestoreTarget{
+				DatabaseRef: dbtether.DatabaseReference{Name: "my-database"},
+			},
+		},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				return errors.New("simulated update conflict")
+			},
+		}).
+		Build()
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether"}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-restore", Namespace: "default"}}
+	if _, err := r.Reconcile(context.Background(), req); err == nil {
+		t.Fatal("expected error when finalizer Update fails")
+	}
+}
+
+func TestRestoreReconciler_AdoptsExistingJob(t *testing.T) {
+	restore := &dbtether.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "my-restore",
+			Namespace:  "app-ns",
+			Finalizers: []string{restoreFinalizer},
+		},
+		Spec: dbtether.RestoreSpec{
+			Source: dbtether.RestoreSource{
+				Path:       "cluster/db/20260120-140000.sql.gz",
+				StorageRef: &dbtether.StorageReference{Name: "my-storage"},
+			},
+			Target: dbtether.RestoreTarget{
+				DatabaseRef: dbtether.DatabaseReference{Name: "my-database"},
+			},
+		},
+	}
+
+	existingJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "restore-my-restore-existing1",
+			Namespace: "dbtether",
+			Labels: map[string]string{
+				LabelRestoreName:      "my-restore",
+				LabelRestoreNamespace: "app-ns",
+			},
+		},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, existingJob).
+		WithStatusSubresource(&dbtether.Restore{}).
+		Build()
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether"}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var jobs batchv1.JobList
+	if err := r.List(context.Background(), &jobs, client.InNamespace("dbtether")); err != nil {
+		t.Fatalf("failed to list jobs: %v", err)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf("expected exactly 1 job (the existing one), got %d", len(jobs.Items))
+	}
+	if jobs.Items[0].Name != existingJob.Name {
+		t.Errorf("expected existing job to survive unchanged, got %q", jobs.Items[0].Name)
+	}
+
+	var updatedRestore dbtether.Restore
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updatedRestore); err != nil {
+		t.Fatalf("failed to get restore: %v", err)
+	}
+	if updatedRestore.Status.JobName != existingJob.Name {
+		t.Errorf("expected Status.JobName to be adopted as %q, got %q", existingJob.Name, updatedRestore.Status.JobName)
+	}
+	if updatedRestore.Status.Phase != "Running" {
+		t.Errorf("expected Phase=Running after adoption, got %q", updatedRestore.Status.Phase)
 	}
 }
 

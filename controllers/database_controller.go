@@ -119,8 +119,9 @@ func (r *DatabaseReconciler) reconcileDatabase(ctx context.Context, db *database
 			"To enable tracking, change PostgreSQL owner: ALTER DATABASE <name> OWNER TO <operator_user>",
 			"database", r.getDatabaseName(db))
 	}
-	// Update ownership tracked status
-	db.Status.OwnershipTracked = &ownershipTracked
+	if err := r.persistOwnershipTracked(ctx, db, ownershipTracked); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	if err := r.ensureExtensions(ctx, db, pgClient); err != nil {
 		return r.setStatus(ctx, db, "Failed", fmt.Sprintf("failed to create extensions: %s", err.Error()))
@@ -190,7 +191,9 @@ func (r *DatabaseReconciler) handleDeletion(ctx context.Context, db *databasesv1
 
 	if db.Spec.DeletionPolicy == "Delete" {
 		if err := r.dropDatabaseIfPossible(ctx, db); err != nil {
-			logger.Error(err, "failed to drop database during deletion")
+			// Keep the finalizer and requeue: the CR must not disappear while the
+			// external database still exists (e.g. Postgres unreachable at Exec).
+			return ctrl.Result{}, err
 		}
 	} else {
 		// Retain: clear ownership so database can be re-adopted
@@ -283,6 +286,9 @@ func (r *DatabaseReconciler) setStatus(ctx context.Context, db *databasesv1alpha
 		} else if now.Sub(db.Status.PendingSince.Time) > PendingTimeout {
 			phase = "Failed"
 			message = fmt.Sprintf("timeout: %s (pending for over 10 minutes)", message)
+			// Transitioning out of Pending — reset the clock so a later Pending
+			// episode starts fresh instead of re-timing-out immediately.
+			db.Status.PendingSince = nil
 		}
 	} else {
 		db.Status.PendingSince = nil
@@ -304,6 +310,18 @@ func (r *DatabaseReconciler) setStatusWithRequeue(ctx context.Context, db *datab
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: after}, nil
+}
+
+// persistOwnershipTracked patches the status subresource directly: the
+// warn-once guard depends on OwnershipTracked surviving across reconciles,
+// not just living on the in-memory object for this pass.
+func (r *DatabaseReconciler) persistOwnershipTracked(ctx context.Context, db *databasesv1alpha1.Database, tracked bool) error {
+	if db.Status.OwnershipTracked != nil && *db.Status.OwnershipTracked == tracked {
+		return nil
+	}
+	patch := client.MergeFrom(db.DeepCopy())
+	db.Status.OwnershipTracked = &tracked
+	return r.Status().Patch(ctx, db, patch)
 }
 
 func (r *DatabaseReconciler) SetupWithManager(mgr ctrl.Manager) error {

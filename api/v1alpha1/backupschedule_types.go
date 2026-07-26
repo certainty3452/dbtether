@@ -5,6 +5,7 @@ import (
 )
 
 // RetentionPolicy defines how long to keep backups
+// +kubebuilder:validation:XValidation:rule="(has(self.keepLast) && self.keepLast > 0) || (has(self.keepDaily) && self.keepDaily > 0) || (has(self.keepWeekly) && self.keepWeekly > 0) || (has(self.keepMonthly) && self.keepMonthly > 0)",message="at least one of keepLast, keepDaily, keepWeekly, or keepMonthly must be set to a positive value; an empty or all-zero retention policy would delete every backup"
 type RetentionPolicy struct {
 	// Keep the last N backups regardless of age
 	// +optional

@@ -62,7 +62,7 @@ jobs:
         run: |
           go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.20.1 object:headerFile="hack/boilerplate.go.txt" paths="./..."
           go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.20.1 rbac:roleName=manager-role crd paths="./..." output:crd:artifacts:config=config/crd/bases
-          git diff --exit-code config/crd/bases/ api/v1alpha1/zz_generated.deepcopy.go
+          git diff --exit-code config/crd/bases/ config/rbac/role.yaml api/v1alpha1/zz_generated.deepcopy.go
 
   chart:
     runs-on: ubuntu-latest

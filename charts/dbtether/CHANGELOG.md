@@ -2,6 +2,17 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.6.4] - 2026-07-26
+
+### Fixed
+- An empty retention policy no longer deletes every backup — it is now rejected outright
+- Backups no longer fail permanently when a dependency is briefly unavailable
+- Restores work with static S3 credentials and can no longer run twice in parallel
+- `deletionPolicy: Delete` retries until the database/user is actually dropped, instead of silently leaving it behind; deletion can now stay pending while the cluster is unreachable or the role still owns objects elsewhere
+- Password rotation never fired after initial setup; it does now
+- Failed privilege grants are surfaced and retried instead of reported as Ready
+- From-source RBAC manifests were missing required permissions (Helm installs unaffected)
+
 ## [0.6.3] - 2026-05-20
 
 ### Fixed

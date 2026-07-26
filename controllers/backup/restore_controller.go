@@ -59,8 +59,8 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Ensure finalizer
-	if result, done := r.ensureFinalizer(ctx, &restore); done {
-		return result, nil
+	if result, done, err := r.ensureFinalizer(ctx, &restore); done {
+		return result, err
 	}
 
 	specHash := r.computeSpecHash(&restore)
@@ -80,15 +80,15 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return r.createRestoreJob(ctx, &restore, specHash, logger)
 }
 
-func (r *RestoreReconciler) ensureFinalizer(ctx context.Context, restore *databasesv1alpha1.Restore) (ctrl.Result, bool) {
+func (r *RestoreReconciler) ensureFinalizer(ctx context.Context, restore *databasesv1alpha1.Restore) (result ctrl.Result, done bool, err error) {
 	if controllerutil.ContainsFinalizer(restore, restoreFinalizer) {
-		return ctrl.Result{}, false
+		return ctrl.Result{}, false, nil
 	}
 	controllerutil.AddFinalizer(restore, restoreFinalizer)
 	if err := r.Update(ctx, restore); err != nil {
-		return ctrl.Result{}, true
+		return ctrl.Result{}, true, err
 	}
-	return ctrl.Result{Requeue: true}, true
+	return ctrl.Result{Requeue: true}, true, nil
 }
 
 func (r *RestoreReconciler) isAlreadyProcessed(restore *databasesv1alpha1.Restore, specHash string, logger logr.Logger) bool {
@@ -112,6 +112,18 @@ func (r *RestoreReconciler) createRestoreJob(
 	sourcePath, storageRef, err := r.resolveSource(ctx, restore)
 	if err != nil {
 		return r.updateStatus(ctx, restore, "Failed", fmt.Sprintf("failed to resolve source: %v", err), specHash)
+	}
+
+	// Adopt an already-created job: the job name embeds a fresh runID, so a status
+	// patch that fails after Create would otherwise spawn a second concurrent pg_restore.
+	existingJob, err := r.findExistingJob(ctx, restore)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if existingJob != nil {
+		logger.V(1).Info("restore job already exists, using existing", "job", existingJob.Name)
+		runID := r.extractRunIDFromJobName(existingJob.Name, restore.Name)
+		return r.updateStatusWithJob(ctx, restore, "Running", "restore job running", specHash, existingJob.Name, runID, sourcePath)
 	}
 
 	// Get target database
@@ -381,6 +393,8 @@ func (r *RestoreReconciler) buildEnvVars(
 		if storage.Spec.S3.Endpoint != "" {
 			env = append(env, corev1.EnvVar{Name: "S3_ENDPOINT", Value: storage.Spec.S3.Endpoint})
 		}
+
+		env = append(env, storageCredentialsEnv(storage)...)
 	}
 
 	if storage.Spec.GCS != nil {
@@ -608,4 +622,28 @@ func (r *RestoreReconciler) jobEventHandler() handler.EventHandler {
 			},
 		}}
 	})
+}
+
+func (r *RestoreReconciler) findExistingJob(ctx context.Context, restore *databasesv1alpha1.Restore) (*batchv1.Job, error) {
+	var jobs batchv1.JobList
+	if err := r.List(ctx, &jobs, client.InNamespace(r.Namespace), client.MatchingLabels{
+		LabelRestoreName:      restore.Name,
+		LabelRestoreNamespace: restore.Namespace,
+	}); err != nil {
+		return nil, err
+	}
+
+	if len(jobs.Items) == 0 {
+		return nil, nil
+	}
+
+	return &jobs.Items[0], nil
+}
+
+func (r *RestoreReconciler) extractRunIDFromJobName(jobName, restoreName string) string {
+	prefix := fmt.Sprintf("restore-%s-", restoreName)
+	if len(jobName) > len(prefix) {
+		return jobName[len(prefix):]
+	}
+	return ""
 }

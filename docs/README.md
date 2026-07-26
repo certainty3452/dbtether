@@ -10,14 +10,15 @@
 | [BackupStorage](crds/backupstorage.md) | Cluster | Storage destination for backups (S3, GCS, Azure) |
 | [Backup](crds/backup.md) | Namespaced | One-time database backup operation |
 | [BackupSchedule](crds/backupschedule.md) | Namespaced | Scheduled backups with retention policy |
+| [Restore](crds/restore.md) | Namespaced | Restore a database from a backup |
 
 ## Quick Start
 
 ### 1. Install the operator
 
 ```bash
-helm install postgres-db-operator ./charts/postgres-db-operator \
-  -n postgres-db-operator \
+helm install dbtether ./charts/dbtether \
+  -n dbtether \
   --create-namespace
 ```
 
@@ -28,7 +29,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: my-cluster-credentials
-  namespace: postgres-db-operator
+  namespace: dbtether
 type: Opaque
 stringData:
   username: postgres_admin
@@ -47,7 +48,7 @@ spec:
   port: 5432
   credentialsSecretRef:
     name: my-cluster-credentials
-    namespace: postgres-db-operator
+    namespace: dbtether
 ```
 
 ### 4. Create a database
@@ -127,7 +128,3 @@ kubectl get database -A
 ## Roadmap
 
 See [ROADMAP.md](../ROADMAP.md) for full roadmap.
-
-**Next up:**
-- [ ] Restore — restore from backup with conflict handling
-- [ ] Multi-database user access

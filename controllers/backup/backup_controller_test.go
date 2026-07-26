@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -856,9 +858,15 @@ func TestBackupReconciler_ResourceNotFound(t *testing.T) {
 				},
 			}
 
-			_, err := r.Reconcile(context.Background(), req)
+			result, err := r.Reconcile(context.Background(), req)
 			if err != nil {
 				t.Fatalf(errUnexpectedError, err)
+			}
+
+			// Missing/not-ready dependencies are transient under GitOps ordering:
+			// the backup stays Pending and requeues rather than failing terminally.
+			if result.RequeueAfter == 0 {
+				t.Error("expected requeue while dependency is not ready")
 			}
 
 			var backup databasesv1alpha1.Backup
@@ -866,8 +874,8 @@ func TestBackupReconciler_ResourceNotFound(t *testing.T) {
 				t.Fatalf(errFailedToGet, err)
 			}
 
-			if backup.Status.Phase != "Failed" {
-				t.Errorf(errExpectedPhase, "Failed", backup.Status.Phase)
+			if backup.Status.Phase != "Pending" {
+				t.Errorf(errExpectedPhase, "Pending", backup.Status.Phase)
 			}
 			if backup.Status.Message != tt.expectedErrMsg {
 				t.Errorf("expected message %q, got %q", tt.expectedErrMsg, backup.Status.Message)
@@ -896,9 +904,14 @@ func TestBackupReconciler_NotReady(t *testing.T) {
 		},
 	}
 
-	_, err := r.Reconcile(context.Background(), req)
+	result, err := r.Reconcile(context.Background(), req)
 	if err != nil {
 		t.Fatalf(errUnexpectedError, err)
+	}
+
+	// Not-ready dependency: Pending + requeue, not terminal Failed.
+	if result.RequeueAfter == 0 {
+		t.Error("expected requeue while dependency is not ready")
 	}
 
 	var updatedBackup databasesv1alpha1.Backup
@@ -906,8 +919,8 @@ func TestBackupReconciler_NotReady(t *testing.T) {
 		t.Fatalf(errFailedToGet, err)
 	}
 
-	if updatedBackup.Status.Phase != "Failed" {
-		t.Errorf(errExpectedPhase, "Failed", updatedBackup.Status.Phase)
+	if updatedBackup.Status.Phase != "Pending" {
+		t.Errorf(errExpectedPhase, "Pending", updatedBackup.Status.Phase)
 	}
 }
 
@@ -2159,6 +2172,79 @@ func TestJobToBackupMapping(t *testing.T) {
 	}
 }
 
+func TestBackupReconciler_EnsureFinalizer_UpdateError(t *testing.T) {
+	backup := newTestBackup(testBackupName, testNamespace) // no finalizer yet
+
+	scheme := newTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(backup).
+		WithStatusSubresource(&databasesv1alpha1.Backup{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				return errors.New("simulated update conflict")
+			},
+		}).
+		Build()
+
+	r := &BackupReconciler{
+		Client:    fakeClient,
+		Scheme:    scheme,
+		Namespace: testOperatorNS,
+		Image:     testImage,
+	}
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      testBackupName,
+			Namespace: testNamespace,
+		},
+	}
+
+	if _, err := r.Reconcile(context.Background(), req); err == nil {
+		t.Fatal("expected error when finalizer Update fails")
+	}
+}
+
+func TestBackupReconciler_StorageCredentialsSecretRef(t *testing.T) {
+	backup := newTestBackup(testBackupName, testNamespace)
+	backup.Finalizers = []string{backupFinalizer}
+	db := newTestDatabase(testDBName, testNamespace, testClusterName)
+	cluster := newTestCluster(testClusterName)
+
+	storage := newTestStorage(testStorageName)
+	storage.Spec.CredentialsSecretRef = &databasesv1alpha1.SecretReference{
+		Name:      "s3-creds",
+		Namespace: testOperatorNS,
+	}
+	secret := newTestSecret(testSecretName, "dbtether")
+
+	r := newTestReconciler(backup, db, cluster, storage, secret)
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      testBackupName,
+			Namespace: testNamespace,
+		},
+	}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf(errUnexpectedError, err)
+	}
+
+	var jobs batchv1.JobList
+	if err := r.List(context.Background(), &jobs, client.InNamespace("dbtether")); err != nil {
+		t.Fatalf(errFailedToListJobs, err)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf(errExpectedOneJob, len(jobs.Items))
+	}
+
+	env := jobs.Items[0].Spec.Template.Spec.Containers[0].Env
+	assertSecretKeyEnv(t, env, "AWS_ACCESS_KEY_ID", "s3-creds")
+	assertSecretKeyEnv(t, env, "AWS_SECRET_ACCESS_KEY", "s3-creds")
+}
+
 func TestBackupLabelConstants(t *testing.T) {
 	expected := map[string]string{
 		"dbtether.io/backup":           LabelBackupName,
@@ -2171,4 +2257,24 @@ func TestBackupLabelConstants(t *testing.T) {
 			t.Errorf("label constant mismatch: expected %q, got %q", want, got)
 		}
 	}
+}
+
+func assertSecretKeyEnv(t *testing.T, env []corev1.EnvVar, name, secretName string) {
+	t.Helper()
+	for _, e := range env {
+		if e.Name != name {
+			continue
+		}
+		if e.ValueFrom == nil || e.ValueFrom.SecretKeyRef == nil {
+			t.Fatalf("%s should come from a secretKeyRef", name)
+		}
+		if e.ValueFrom.SecretKeyRef.Name != secretName {
+			t.Errorf("%s secret name = %q, want %q", name, e.ValueFrom.SecretKeyRef.Name, secretName)
+		}
+		if e.ValueFrom.SecretKeyRef.Key != name {
+			t.Errorf("%s secret key = %q, want %q", name, e.ValueFrom.SecretKeyRef.Key, name)
+		}
+		return
+	}
+	t.Errorf("expected %s env var in backup job", name)
 }

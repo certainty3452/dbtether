@@ -123,6 +123,13 @@ spec:
                       each week)
                     type: integer
                 type: object
+                x-kubernetes-validations:
+                - message: at least one of keepLast, keepDaily, keepWeekly, or keepMonthly
+                    must be set to a positive value; an empty or all-zero retention
+                    policy would delete every backup
+                  rule: (has(self.keepLast) && self.keepLast > 0) || (has(self.keepDaily)
+                    && self.keepDaily > 0) || (has(self.keepWeekly) && self.keepWeekly
+                    > 0) || (has(self.keepMonthly) && self.keepMonthly > 0)
               schedule:
                 description: Cron schedule in standard cron format (e.g., "0 2 * *
                   *" for 2 AM daily)

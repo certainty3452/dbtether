@@ -55,6 +55,16 @@ func (m *RetentionManager) ApplyRetention(
 		return nil, nil
 	}
 
+	// A policy with no active rule would produce an empty keepSet, marking every
+	// backup for deletion. Admission validation should reject this, but old objects
+	// can predate the CEL rule, so guard here too rather than trust the CRD alone.
+	if !HasActiveRule(policy) {
+		m.Log.Warnw("retention policy has no active rule; nothing will be deleted",
+			"prefix", prefix,
+		)
+		return nil, nil
+	}
+
 	// List backup files, optionally filtered by filename pattern
 	files, err := m.listBackupFiles(ctx, storageClient, prefix, filenameFilter)
 	if err != nil {
@@ -271,4 +281,13 @@ func parseTimestampFromKey(key string) (time.Time, error) {
 	}
 
 	return time.Parse("20060102-150405", matches[1])
+}
+
+// HasActiveRule reports whether the policy would keep anything; without an
+// active rule retention must delete nothing rather than everything.
+func HasActiveRule(policy *dbtether.RetentionPolicy) bool {
+	return (policy.KeepLast != nil && *policy.KeepLast > 0) ||
+		(policy.KeepDaily != nil && *policy.KeepDaily > 0) ||
+		(policy.KeepWeekly != nil && *policy.KeepWeekly > 0) ||
+		(policy.KeepMonthly != nil && *policy.KeepMonthly > 0)
 }

@@ -186,7 +186,7 @@ See full documentation in [docs/](docs/README.md):
 **DatabaseUser:**
 - `spec.database.name` - Name of Database (for single database)
 - `spec.databases[]` - List of databases (for multi-database access)
-- `spec.privileges` - `readonly`, `readwrite`, or `admin` (required)
+- `spec.privileges` - `readonly` (default), `readwrite`, `admin`, or `owner`
 - `spec.username` - PostgreSQL username (defaults to metadata.name)
 - `spec.password.length` - Password length (default 16, range 12-64)
 - `spec.secretGeneration` - `primary` (default) or `perDatabase`

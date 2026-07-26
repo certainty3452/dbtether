@@ -1,12 +1,40 @@
 package controllers
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
+	"github.com/certainty3452/dbtether/pkg/postgres"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
+
+func newDatabaseTestReconciler(pgCache postgres.ClientCacheInterface, objs ...client.Object) *DatabaseReconciler {
+	scheme := runtime.NewScheme()
+	_ = databasesv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objs...).
+		WithStatusSubresource(&databasesv1alpha1.Database{}).
+		Build()
+
+	return &DatabaseReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		PGClientCache: pgCache,
+	}
+}
 
 const annotationForceAdopt = "dbtether.io/force-adopt"
 
@@ -239,4 +267,196 @@ func TestDatabaseReconciler_OwnershipTrackedStatus(t *testing.T) {
 
 func boolPtr(b bool) *bool {
 	return &b
+}
+
+func TestDatabaseReconciler_DeletionPolicyDelete_DropFailureKeepsFinalizer(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster-creds", Namespace: "default"},
+		Data:       map[string][]byte{"username": []byte("postgres"), "password": []byte("pw")},
+	}
+	cluster := &databasesv1alpha1.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
+		Spec: databasesv1alpha1.DBClusterSpec{
+			Endpoint: "localhost",
+			Port:     5432,
+			CredentialsSecretRef: &databasesv1alpha1.SecretReference{
+				Name:      "cluster-creds",
+				Namespace: "default",
+			},
+		},
+	}
+	db := &databasesv1alpha1.Database{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "drop-fail-db",
+			Namespace:         "default",
+			Finalizers:        []string{FinalizerName},
+			DeletionTimestamp: &now,
+		},
+		Spec: databasesv1alpha1.DatabaseSpec{
+			ClusterRef:     databasesv1alpha1.ClusterReference{Name: "test-cluster"},
+			DeletionPolicy: "Delete",
+		},
+	}
+
+	pgCache := postgres.NewMockClientCache()
+	pgCache.DefaultMock.ShouldFail = true
+	pgCache.DefaultMock.FailError = errors.New("postgres unreachable")
+
+	r := newDatabaseTestReconciler(pgCache, secret, cluster, db)
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "drop-fail-db", Namespace: "default"}}
+	if _, err := r.Reconcile(ctx, req); err == nil {
+		t.Fatal("expected error when database drop fails")
+	}
+
+	var updated databasesv1alpha1.Database
+	if err := r.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatalf("failed to get database: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(&updated, FinalizerName) {
+		t.Error("finalizer should still be present after a failed drop")
+	}
+}
+
+func TestDatabaseReconciler_DeletionPolicyDelete_ClusterNotFoundRemovesFinalizer(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+
+	db := &databasesv1alpha1.Database{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "orphan-cluster-db",
+			Namespace:         "default",
+			Finalizers:        []string{FinalizerName},
+			DeletionTimestamp: &now,
+		},
+		Spec: databasesv1alpha1.DatabaseSpec{
+			ClusterRef:     databasesv1alpha1.ClusterReference{Name: "gone-cluster"},
+			DeletionPolicy: "Delete",
+		},
+	}
+
+	r := newDatabaseTestReconciler(postgres.NewMockClientCache(), db)
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "orphan-cluster-db", Namespace: "default"}}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var updated databasesv1alpha1.Database
+	err := r.Get(ctx, req.NamespacedName, &updated)
+	if err == nil && controllerutil.ContainsFinalizer(&updated, FinalizerName) {
+		t.Error("finalizer should be removed when the DBCluster CR is gone")
+	}
+}
+
+func TestDatabaseReconciler_PersistOwnershipTracked(t *testing.T) {
+	ctx := context.Background()
+	db := &databasesv1alpha1.Database{
+		ObjectMeta: metav1.ObjectMeta{Name: "ownership-db", Namespace: "default"},
+	}
+	r := newDatabaseTestReconciler(nil, db)
+	key := types.NamespacedName{Name: "ownership-db", Namespace: "default"}
+
+	var fetched databasesv1alpha1.Database
+	if err := r.Get(ctx, key, &fetched); err != nil {
+		t.Fatalf("failed to get database: %v", err)
+	}
+	if err := r.persistOwnershipTracked(ctx, &fetched, false); err != nil {
+		t.Fatalf("persistOwnershipTracked: %v", err)
+	}
+
+	var after databasesv1alpha1.Database
+	if err := r.Get(ctx, key, &after); err != nil {
+		t.Fatalf("failed to get database: %v", err)
+	}
+	if after.Status.OwnershipTracked == nil || *after.Status.OwnershipTracked {
+		t.Fatal("expected OwnershipTracked=false to be persisted to the API server")
+	}
+}
+
+func TestDatabaseReconciler_SetStatus_PendingSincePersistedAndTimesOut(t *testing.T) {
+	ctx := context.Background()
+	db := &databasesv1alpha1.Database{
+		ObjectMeta: metav1.ObjectMeta{Name: "pending-db", Namespace: "default"},
+	}
+	r := newDatabaseTestReconciler(nil, db)
+	key := types.NamespacedName{Name: "pending-db", Namespace: "default"}
+
+	var fetched databasesv1alpha1.Database
+	if err := r.Get(ctx, key, &fetched); err != nil {
+		t.Fatalf("failed to get database: %v", err)
+	}
+	if _, err := r.setStatus(ctx, &fetched, "Pending", "waiting for DBCluster"); err != nil {
+		t.Fatalf("setStatus: %v", err)
+	}
+
+	var afterFirst databasesv1alpha1.Database
+	if err := r.Get(ctx, key, &afterFirst); err != nil {
+		t.Fatalf("failed to get database: %v", err)
+	}
+	if afterFirst.Status.PendingSince == nil {
+		t.Fatal("expected PendingSince to be persisted to the API server")
+	}
+
+	stale := metav1.NewTime(time.Now().Add(-(PendingTimeout + time.Minute)))
+	patch := client.MergeFrom(afterFirst.DeepCopy())
+	afterFirst.Status.PendingSince = &stale
+	if err := r.Status().Patch(ctx, &afterFirst, patch); err != nil {
+		t.Fatalf("failed to age PendingSince: %v", err)
+	}
+
+	if _, err := r.setStatus(ctx, &afterFirst, "Pending", "still waiting"); err != nil {
+		t.Fatalf("setStatus: %v", err)
+	}
+
+	var afterTimeout databasesv1alpha1.Database
+	if err := r.Get(ctx, key, &afterTimeout); err != nil {
+		t.Fatalf("failed to get database: %v", err)
+	}
+	if afterTimeout.Status.Phase != "Failed" {
+		t.Errorf("expected timeout to flip phase to Failed, got %s", afterTimeout.Status.Phase)
+	}
+	if afterTimeout.Status.PendingSince != nil {
+		t.Error("expected PendingSince to be cleared after timeout->Failed transition")
+	}
+}
+
+func TestDatabaseReconciler_SetStatus_PendingSinceClearsOnReady(t *testing.T) {
+	ctx := context.Background()
+	db := &databasesv1alpha1.Database{
+		ObjectMeta: metav1.ObjectMeta{Name: "pending-to-ready-db", Namespace: "default"},
+	}
+	r := newDatabaseTestReconciler(nil, db)
+	key := types.NamespacedName{Name: "pending-to-ready-db", Namespace: "default"}
+
+	var fetched databasesv1alpha1.Database
+	if err := r.Get(ctx, key, &fetched); err != nil {
+		t.Fatalf("failed to get database: %v", err)
+	}
+	if _, err := r.setStatus(ctx, &fetched, "Pending", "waiting"); err != nil {
+		t.Fatalf("setStatus: %v", err)
+	}
+
+	var afterPending databasesv1alpha1.Database
+	if err := r.Get(ctx, key, &afterPending); err != nil {
+		t.Fatalf("failed to get database: %v", err)
+	}
+	if afterPending.Status.PendingSince == nil {
+		t.Fatal("expected PendingSince to be set while Pending")
+	}
+
+	if _, err := r.setStatus(ctx, &afterPending, "Ready", "database is ready"); err != nil {
+		t.Fatalf("setStatus: %v", err)
+	}
+
+	var afterReady databasesv1alpha1.Database
+	if err := r.Get(ctx, key, &afterReady); err != nil {
+		t.Fatalf("failed to get database: %v", err)
+	}
+	if afterReady.Status.PendingSince != nil {
+		t.Error("expected PendingSince to be nil once phase is Ready")
+	}
 }

@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -8,7 +9,11 @@ import (
 	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	dbtether "github.com/certainty3452/dbtether/api/v1alpha1"
 )
@@ -547,6 +552,80 @@ func TestCleanupBackupCRDs_NoKeepLast(t *testing.T) {
 		}
 
 		assert.Equal(t, 0, keepCount, "policy %d should have keepCount=0", i)
+	}
+}
+
+func TestCleanupBackupCRDs_NoActiveRule(t *testing.T) {
+	tests := []struct {
+		name          string
+		policy        *dbtether.RetentionPolicy
+		wantRemaining int
+	}{
+		{
+			name:          "empty policy deletes nothing",
+			policy:        &dbtether.RetentionPolicy{},
+			wantRemaining: 3,
+		},
+		{
+			name: "all-zero policy deletes nothing",
+			policy: &dbtether.RetentionPolicy{
+				KeepLast:    intPtr(0),
+				KeepDaily:   intPtr(0),
+				KeepWeekly:  intPtr(0),
+				KeepMonthly: intPtr(0),
+			},
+			wantRemaining: 3,
+		},
+		{
+			name:          "one positive rule still works",
+			policy:        &dbtether.RetentionPolicy{KeepLast: intPtr(1)},
+			wantRemaining: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, dbtether.AddToScheme(scheme))
+
+			schedule := &dbtether.BackupSchedule{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "legacy-schedule",
+					Namespace: "default",
+				},
+				Spec: dbtether.BackupScheduleSpec{
+					Retention: tt.policy,
+				},
+			}
+
+			now := time.Now()
+			objs := make([]runtime.Object, 0, 4)
+			objs = append(objs, schedule)
+			for i, name := range []string{backupName1, backupName2, backupName3} {
+				objs = append(objs, &dbtether.Backup{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              name,
+						Namespace:         "default",
+						Labels:            map[string]string{LabelScheduleName: schedule.Name},
+						CreationTimestamp: metav1.NewTime(now.Add(-time.Duration(i+1) * time.Hour)),
+					},
+					Status: dbtether.BackupStatus{Phase: "Completed"},
+				})
+			}
+
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithRuntimeObjects(objs...).
+				Build()
+			r := &BackupScheduleReconciler{Client: fakeClient, Scheme: scheme}
+
+			logger, _ := zap.NewDevelopment()
+			r.cleanupBackupCRDs(context.Background(), schedule, logger.Sugar())
+
+			var backups dbtether.BackupList
+			require.NoError(t, fakeClient.List(context.Background(), &backups, client.InNamespace("default")))
+			assert.Len(t, backups.Items, tt.wantRemaining)
+		})
 	}
 }
 

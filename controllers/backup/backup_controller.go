@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -90,6 +91,9 @@ func (r *BackupReconciler) maxConcurrent() int {
 // +kubebuilder:rbac:groups=dbtether.io,resources=dbclusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
 func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -105,8 +109,8 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// Ensure finalizer
-	if result, done := r.ensureFinalizer(ctx, &backup); done {
-		return result, nil
+	if result, done, err := r.ensureFinalizer(ctx, &backup); done {
+		return result, err
 	}
 
 	specHash := r.computeSpecHash(&backup)
@@ -126,15 +130,15 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	return r.createBackupJobIfAllowed(ctx, &backup, specHash, logger)
 }
 
-func (r *BackupReconciler) ensureFinalizer(ctx context.Context, backup *databasesv1alpha1.Backup) (ctrl.Result, bool) {
+func (r *BackupReconciler) ensureFinalizer(ctx context.Context, backup *databasesv1alpha1.Backup) (result ctrl.Result, done bool, err error) {
 	if controllerutil.ContainsFinalizer(backup, backupFinalizer) {
-		return ctrl.Result{}, false
+		return ctrl.Result{}, false, nil
 	}
 	controllerutil.AddFinalizer(backup, backupFinalizer)
 	if err := r.Update(ctx, backup); err != nil {
-		return ctrl.Result{}, true
+		return ctrl.Result{}, true, err
 	}
-	return ctrl.Result{Requeue: true}, true
+	return ctrl.Result{Requeue: true}, true, nil
 }
 
 func (r *BackupReconciler) isAlreadyProcessed(backup *databasesv1alpha1.Backup, specHash string, logger logr.Logger) bool {
@@ -167,7 +171,12 @@ func (r *BackupReconciler) createBackupJobIfAllowed(ctx context.Context, backup 
 	// Get all required resources for job creation
 	db, cluster, storage, err := r.getResources(ctx, backup)
 	if err != nil {
-		return r.updateStatus(ctx, backup, "Failed", err.Error(), specHash)
+		// Dependencies may simply not be applied/ready yet under GitOps ordering;
+		// keep the backup pending and retry rather than burning it as terminally Failed.
+		if isDependencyNotReady(err) {
+			return r.updateStatus(ctx, backup, "Pending", err.Error(), specHash)
+		}
+		return ctrl.Result{}, err
 	}
 
 	// Check throttling
@@ -342,39 +351,39 @@ func (r *BackupReconciler) getResources(ctx context.Context, backup *databasesv1
 		Namespace: backup.Namespace,
 	}, &db); err != nil {
 		if errors.IsNotFound(err) {
-			return nil, nil, nil, fmt.Errorf("database %s not found", backup.Spec.DatabaseRef.Name)
+			return nil, nil, nil, newDependencyNotReady("database %s not found", backup.Spec.DatabaseRef.Name)
 		}
 		return nil, nil, nil, err
 	}
 
 	if db.Status.Phase != "Ready" {
-		return nil, nil, nil, fmt.Errorf("database %s is not ready (phase: %s)", backup.Spec.DatabaseRef.Name, db.Status.Phase)
+		return nil, nil, nil, newDependencyNotReady("database %s is not ready (phase: %s)", backup.Spec.DatabaseRef.Name, db.Status.Phase)
 	}
 
 	// Get DBCluster
 	var cluster databasesv1alpha1.DBCluster
 	if err := r.Get(ctx, types.NamespacedName{Name: db.Spec.ClusterRef.Name}, &cluster); err != nil {
 		if errors.IsNotFound(err) {
-			return nil, nil, nil, fmt.Errorf("cluster %s not found", db.Spec.ClusterRef.Name)
+			return nil, nil, nil, newDependencyNotReady("cluster %s not found", db.Spec.ClusterRef.Name)
 		}
 		return nil, nil, nil, err
 	}
 
 	if cluster.Status.Phase != "Connected" {
-		return nil, nil, nil, fmt.Errorf("cluster %s is not connected", db.Spec.ClusterRef.Name)
+		return nil, nil, nil, newDependencyNotReady("cluster %s is not connected", db.Spec.ClusterRef.Name)
 	}
 
 	// Get BackupStorage
 	var storage databasesv1alpha1.BackupStorage
 	if err := r.Get(ctx, types.NamespacedName{Name: backup.Spec.StorageRef.Name}, &storage); err != nil {
 		if errors.IsNotFound(err) {
-			return nil, nil, nil, fmt.Errorf("backup storage %s not found", backup.Spec.StorageRef.Name)
+			return nil, nil, nil, newDependencyNotReady("backup storage %s not found", backup.Spec.StorageRef.Name)
 		}
 		return nil, nil, nil, err
 	}
 
 	if storage.Status.Phase != "Ready" {
-		return nil, nil, nil, fmt.Errorf("backup storage %s is not ready (phase: %s)", backup.Spec.StorageRef.Name, storage.Status.Phase)
+		return nil, nil, nil, newDependencyNotReady("backup storage %s is not ready (phase: %s)", backup.Spec.StorageRef.Name, storage.Status.Phase)
 	}
 
 	return &db, &cluster, &storage, nil
@@ -548,30 +557,7 @@ func (r *BackupReconciler) getStorageEnv(storage *databasesv1alpha1.BackupStorag
 			env = append(env, corev1.EnvVar{Name: "S3_ENDPOINT", Value: storage.Spec.S3.Endpoint})
 		}
 
-		// Add credentials if specified
-		if storage.Spec.CredentialsSecretRef != nil {
-			env = append(env,
-				corev1.EnvVar{
-					Name: "AWS_ACCESS_KEY_ID",
-					ValueFrom: &corev1.EnvVarSource{
-						SecretKeyRef: &corev1.SecretKeySelector{
-							LocalObjectReference: corev1.LocalObjectReference{Name: storage.Spec.CredentialsSecretRef.Name},
-							Key:                  "AWS_ACCESS_KEY_ID",
-						},
-					},
-				},
-				corev1.EnvVar{
-					Name: "AWS_SECRET_ACCESS_KEY",
-					ValueFrom: &corev1.EnvVarSource{
-						SecretKeyRef: &corev1.SecretKeySelector{
-							LocalObjectReference: corev1.LocalObjectReference{Name: storage.Spec.CredentialsSecretRef.Name},
-							Key:                  "AWS_SECRET_ACCESS_KEY",
-						},
-					},
-				},
-			)
-		}
-		// If no credentials, IRSA/Pod Identity will be used
+		env = append(env, storageCredentialsEnv(storage)...)
 	}
 
 	// GCS and Azure support will be added in future versions
@@ -946,4 +932,50 @@ func (r *BackupReconciler) jobEventHandler() handler.EventHandler {
 			},
 		}}
 	})
+}
+
+// dependencyNotReadyError distinguishes a missing/not-ready reference from other
+// errors: under GitOps the referencing object can reconcile before its
+// dependencies exist, so this class of error must requeue rather than fail terminally.
+type dependencyNotReadyError struct {
+	msg string
+}
+
+func (e *dependencyNotReadyError) Error() string { return e.msg }
+
+func newDependencyNotReady(format string, args ...any) error {
+	return &dependencyNotReadyError{msg: fmt.Sprintf(format, args...)}
+}
+
+func isDependencyNotReady(err error) bool {
+	var d *dependencyNotReadyError
+	return stderrors.As(err, &d)
+}
+
+// storageCredentialsEnv is shared by backup and restore jobs; returns nil when
+// unset so IRSA/Pod Identity applies instead.
+func storageCredentialsEnv(storage *databasesv1alpha1.BackupStorage) []corev1.EnvVar {
+	if storage.Spec.CredentialsSecretRef == nil {
+		return nil
+	}
+	return []corev1.EnvVar{
+		{
+			Name: "AWS_ACCESS_KEY_ID",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: storage.Spec.CredentialsSecretRef.Name},
+					Key:                  "AWS_ACCESS_KEY_ID",
+				},
+			},
+		},
+		{
+			Name: "AWS_SECRET_ACCESS_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: storage.Spec.CredentialsSecretRef.Name},
+					Key:                  "AWS_SECRET_ACCESS_KEY",
+				},
+			},
+		},
+	}
 }
