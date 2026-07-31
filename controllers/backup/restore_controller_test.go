@@ -13,12 +13,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	dbtether "github.com/certainty3452/dbtether/api/v1alpha1"
+	"github.com/certainty3452/dbtether/controllers"
+	"github.com/certainty3452/dbtether/pkg/postgres"
 )
 
 func TestRestoreSpec_Validation(t *testing.T) {
@@ -101,7 +104,7 @@ func TestRestoreSpec_Validation(t *testing.T) {
 }
 
 func TestRestoreStatus_Phases(t *testing.T) {
-	phases := []string{"Pending", "Running", "Completed", "Failed"}
+	phases := []string{"Pending", "Running", "Granting", "Completed", "Failed"}
 
 	for _, phase := range phases {
 		t.Run(phase, func(t *testing.T) {
@@ -1015,4 +1018,664 @@ func TestRestoreLabelConstants(t *testing.T) {
 	for want, got := range expected {
 		assert.Equal(t, want, got, "label constant mismatch")
 	}
+}
+
+// recordedApplyPrivilegesCall captures one invocation of ApplyPrivileges so
+// tests can assert exactly what regrantDatabaseUsers sent to Postgres.
+type recordedApplyPrivilegesCall struct {
+	Username, Database, Preset string
+	AdditionalGrants           []postgres.TableGrant
+}
+
+// recordingPGClient wraps postgres.MockClient (which doesn't track
+// ApplyPrivileges calls) to record invocations without touching the shared mock.
+type recordingPGClient struct {
+	*postgres.MockClient
+	calls     []recordedApplyPrivilegesCall
+	applyErr  error            // blanket failure for every call, unless overridden below
+	failUsers map[string]error // per-username override, for exercising partial-failure rounds
+}
+
+func (m *recordingPGClient) ApplyPrivileges(ctx context.Context, username, database, preset string, additionalGrants []postgres.TableGrant) error {
+	m.calls = append(m.calls, recordedApplyPrivilegesCall{
+		Username:         username,
+		Database:         database,
+		Preset:           preset,
+		AdditionalGrants: additionalGrants,
+	})
+	if err, ok := m.failUsers[username]; ok {
+		return err
+	}
+	return m.applyErr
+}
+
+// singleClientCache is a minimal ClientCacheInterface that always returns the
+// same client and counts how many times a connection was requested.
+type singleClientCache struct {
+	pgClient postgres.ClientInterface
+	getCalls int
+}
+
+func (c *singleClientCache) Get(_ context.Context, _ string, _ postgres.Config) (postgres.ClientInterface, error) {
+	c.getCalls++
+	return c.pgClient, nil
+}
+func (c *singleClientCache) Remove(_ string) {}
+func (c *singleClientCache) Close()          {}
+
+// indexDatabaseUserRefsForTest reimplements the controllers package's unexported
+// indexer, which can't be imported here, so the fake client can be built
+// WithIndex the same way the real manager wires it up via RegisterIndexers.
+func indexDatabaseUserRefsForTest(obj client.Object) []string {
+	user, ok := obj.(*dbtether.DatabaseUser)
+	if !ok {
+		return nil
+	}
+	accesses := user.Spec.GetDatabases()
+	keys := make([]string, 0, len(accesses))
+	for _, access := range accesses {
+		ns := access.Namespace
+		if ns == "" {
+			ns = user.Namespace
+		}
+		keys = append(keys, controllers.DatabaseUserDatabaseRefKey(ns, access.Name))
+	}
+	return keys
+}
+
+// newRegrantFixture builds a Restore whose Job has already succeeded, plus
+// the target Database/DBCluster/credentials Secret it points at. Restore
+// lives in "app-ns"; the restore Job lives in the operator namespace "dbtether".
+func newRegrantFixture() (restore *dbtether.Restore, job *batchv1.Job, db *dbtether.Database, cluster *dbtether.DBCluster, secret *corev1.Secret) {
+	restore = &dbtether.Restore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "my-restore",
+			Namespace:  "app-ns",
+			Finalizers: []string{restoreFinalizer},
+		},
+		Spec: dbtether.RestoreSpec{
+			Source: dbtether.RestoreSource{
+				Path:       "cluster1/my-database/20260120-140000.sql.gz",
+				StorageRef: &dbtether.StorageReference{Name: "my-storage"},
+			},
+			Target: dbtether.RestoreTarget{
+				DatabaseRef: dbtether.DatabaseReference{Name: "my-database"},
+			},
+		},
+		Status: dbtether.RestoreStatus{
+			Phase:   "Running",
+			JobName: "restore-my-restore-run1",
+		},
+	}
+
+	job = &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "restore-my-restore-run1",
+			Namespace: "dbtether",
+		},
+		Status: batchv1.JobStatus{Succeeded: 1},
+	}
+
+	db = &dbtether.Database{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-database", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseSpec{
+			ClusterRef: dbtether.ClusterReference{Name: "cluster1"},
+		},
+		Status: dbtether.DatabaseStatus{
+			Phase:        "Ready",
+			DatabaseName: "my_database_pg",
+		},
+	}
+
+	cluster = &dbtether.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster1"},
+		Spec: dbtether.DBClusterSpec{
+			Endpoint: "localhost",
+			Port:     5432,
+			CredentialsSecretRef: &dbtether.SecretReference{
+				Name:      "cluster-creds",
+				Namespace: "app-ns",
+			},
+		},
+	}
+
+	secret = &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster-creds", Namespace: "app-ns"},
+		Data: map[string][]byte{
+			"username": []byte("postgres"),
+			"password": []byte("pw"),
+		},
+	}
+
+	return restore, job, db, cluster, secret
+}
+
+func TestRestoreReconciler_RegrantsGrantsOnSuccess(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+
+	user := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "readwrite"},
+			AdditionalGrants: []dbtether.TableGrant{
+				{Tables: []string{"orders"}, Privileges: []string{"SELECT"}},
+			},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, user).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient()}
+	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	require.Len(t, pg.calls, 1)
+	assert.Equal(t, "app_user", pg.calls[0].Username)
+	assert.Equal(t, "my_database_pg", pg.calls[0].Database)
+	assert.Equal(t, "readwrite", pg.calls[0].Preset)
+	assert.Equal(t, []postgres.TableGrant{
+		{Tables: []string{"orders"}, Privileges: []postgres.TablePrivilege{"SELECT"}},
+	}, pg.calls[0].AdditionalGrants)
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Completed", updated.Status.Phase)
+}
+
+func TestRestoreReconciler_RegrantFailureKeepsGranting(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+
+	user := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, user).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient(), applyErr: errors.New("permission denied for database my_database_pg")}
+	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	result, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err, "grant retries are paced via RequeueAfter, not a returned error")
+	assert.Equal(t, grantRetryDelay, result.RequeueAfter)
+
+	require.Len(t, pg.calls, 1, "ApplyPrivileges should still have been attempted")
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Granting", updated.Status.Phase, "phase must not advance to Completed when re-granting fails")
+	assert.Equal(t, "restore succeeded, retrying grants: failed to re-apply privileges for user app_user: permission denied for database my_database_pg", updated.Status.Message)
+	assert.Equal(t, updated.Status.SpecHash, r.computeSpecHash(&updated),
+		"Granting must carry the spec hash so a retry past the job's TTL resumes instead of failing")
+}
+
+func TestRestoreReconciler_RegrantSkipsUsersWithoutRole(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+
+	user := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Pending"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, user).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient()}
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	assert.Empty(t, pg.calls, "the role does not exist yet, so the user's own reconcile is what creates and grants it")
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Completed", updated.Status.Phase)
+}
+
+func TestRestoreReconciler_RegrantSkipsPgConnectionWhenNoUsers(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient()}
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, cache.getCalls, "no DatabaseUser references the target DB, so no PG connection should be requested")
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Completed", updated.Status.Phase)
+}
+
+func TestRestoreReconciler_GrantingSurvivesJobGC(t *testing.T) {
+	restore, _, db, cluster, secret := newRegrantFixture()
+	restore.Status.Phase = "Granting"
+	restore.Status.SpecHash = (&RestoreReconciler{}).computeSpecHash(restore)
+	// Job intentionally left out of the fake client even though Status.JobName
+	// still references it - simulates the Job having been GC'd by its TTL.
+
+	user := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "readonly"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, db, cluster, secret, user).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient()}
+	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err, "a GC'd Job must not resurrect as a Failed restore once grants are already in flight")
+
+	require.Len(t, pg.calls, 1, "regrant must still run even though the Job is gone")
+	assert.Equal(t, "app_user", pg.calls[0].Username)
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Completed", updated.Status.Phase)
+}
+
+func TestRestoreReconciler_JobDeletedWhileRunning_Failed(t *testing.T) {
+	restore, _, db, cluster, secret := newRegrantFixture()
+	// restore.Status.Phase is "Running" from the fixture. Job intentionally
+	// left out of the fake client.
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, db, cluster, secret).
+		WithStatusSubresource(&dbtether.Restore{}).
+		Build()
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether"}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Failed", updated.Status.Phase)
+	assert.Equal(t, "restore job was deleted", updated.Status.Message)
+}
+
+func TestRestoreReconciler_DatabaseDeletedDuringGranting_CompletesWithWarning(t *testing.T) {
+	restore, _, _, _, _ := newRegrantFixture()
+	restore.Status.Phase = "Granting"
+	restore.Status.SpecHash = (&RestoreReconciler{}).computeSpecHash(restore)
+	// Target Database intentionally left out of the fake client.
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore).
+		WithStatusSubresource(&dbtether.Restore{}).
+		Build()
+
+	recorder := record.NewFakeRecorder(10)
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", Recorder: recorder}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Completed", updated.Status.Phase)
+	assert.Contains(t, updated.Status.Message, "grants not re-applied")
+
+	select {
+	case event := <-recorder.Events:
+		assert.Contains(t, event, corev1.EventTypeWarning)
+		assert.Contains(t, event, EventReasonRestoreGrantsSkipped)
+	default:
+		t.Fatal("expected a Warning event to be recorded")
+	}
+}
+
+func TestRestoreReconciler_ClusterDeletedDuringGranting_CompletesWithWarning(t *testing.T) {
+	restore, _, db, _, _ := newRegrantFixture()
+	restore.Status.Phase = "Granting"
+	restore.Status.SpecHash = (&RestoreReconciler{}).computeSpecHash(restore)
+	// DBCluster (and its secret) intentionally left out of the fake client.
+
+	user := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, db, user).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	recorder := record.NewFakeRecorder(10)
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", Recorder: recorder}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Completed", updated.Status.Phase)
+	assert.Contains(t, updated.Status.Message, "grants not re-applied")
+
+	select {
+	case event := <-recorder.Events:
+		assert.Contains(t, event, corev1.EventTypeWarning)
+		assert.Contains(t, event, EventReasonRestoreGrantsSkipped)
+	default:
+		t.Fatal("expected a Warning event to be recorded")
+	}
+}
+
+func TestRestoreReconciler_RegrantsForFailedUser(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+
+	user := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "readwrite"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Failed"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, user).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient()}
+	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	require.Len(t, pg.calls, 1, "the role exists, so regrant must run regardless of the DatabaseUser's own CR phase")
+	assert.Equal(t, "app_user", pg.calls[0].Username)
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Completed", updated.Status.Phase)
+}
+
+func TestRestoreReconciler_TransientRegrantErrorChargesOneAttemptPerRetry(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+
+	user := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	statusPatches := 0
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, user).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				if subResourceName == "status" {
+					statusPatches++
+				}
+				return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+			},
+		}).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient(), applyErr: errors.New("permission denied for database my_database_pg")}
+	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+
+	result, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err, "grant retries are paced via RequeueAfter, not a returned error")
+	assert.Equal(t, grantRetryDelay, result.RequeueAfter)
+
+	var afterFirst dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &afterFirst))
+	require.Equal(t, "Granting", afterFirst.Status.Phase)
+	require.Equal(t, int32(1), afterFirst.Status.GrantAttempts)
+	patchesAfterFirst := statusPatches
+
+	result, err = r.Reconcile(context.Background(), req)
+	require.NoError(t, err, "grant retries are paced via RequeueAfter, not a returned error")
+	assert.Equal(t, grantRetryDelay, result.RequeueAfter)
+
+	var afterSecond dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &afterSecond))
+	assert.Equal(t, "Granting", afterSecond.Status.Phase, "phase must stay Granting across retries so a retry can outlive the Job's TTL")
+	assert.Equal(t, afterFirst.Status.Message, afterSecond.Status.Message, "the retry message is deterministic for the same underlying error")
+	assert.Equal(t, int32(2), afterSecond.Status.GrantAttempts, "each retry spends one attempt from the bounded budget")
+
+	assert.Equal(t, patchesAfterFirst+1, statusPatches,
+		"the retry budget must be persisted, so an unchanged message still costs exactly one status patch per round")
+}
+
+func TestRestoreReconciler_RegrantPartialFailureServesHealthyUsers(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+
+	healthyUser := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "healthy-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "readonly"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+	brokenUser := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "broken-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "readwrite"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, healthyUser, brokenUser).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{
+		MockClient: postgres.NewMockClient(),
+		failUsers: map[string]error{
+			"broken_user": errors.New("permission denied for database my_database_pg"),
+		},
+	}
+	require.NoError(t, pg.CreateUser(context.Background(), "healthy_user", "pw"))
+	require.NoError(t, pg.CreateUser(context.Background(), "broken_user", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	result, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err, "grant retries are paced via RequeueAfter, not a returned error")
+	assert.Equal(t, grantRetryDelay, result.RequeueAfter)
+
+	require.Len(t, pg.calls, 2, "both users must be attempted in the same round even though one of them fails")
+	attempted := make(map[string]bool, len(pg.calls))
+	for _, call := range pg.calls {
+		attempted[call.Username] = true
+	}
+	assert.True(t, attempted["healthy_user"], "the healthy user must still be served")
+	assert.True(t, attempted["broken_user"])
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Granting", updated.Status.Phase)
+	assert.Equal(t, int32(1), updated.Status.GrantAttempts)
+}
+
+func TestRestoreReconciler_RegrantAttemptsExhausted_CompletesWithWarning(t *testing.T) {
+	restore, _, db, cluster, secret := newRegrantFixture()
+	restore.Status.Phase = "Granting"
+	restore.Status.GrantAttempts = grantAttemptLimit - 1 // this round's failure is the one that hits the limit
+	restore.Status.SpecHash = (&RestoreReconciler{}).computeSpecHash(restore)
+
+	user := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "broken-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, db, cluster, secret, user).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient(), applyErr: errors.New("permission denied for database my_database_pg")}
+	require.NoError(t, pg.CreateUser(context.Background(), "broken_user", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	recorder := record.NewFakeRecorder(10)
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache, Recorder: recorder}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err, "the attempt budget is exhausted, so the round completes instead of erroring for another retry")
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Completed", updated.Status.Phase)
+	assert.Contains(t, updated.Status.Message, "restore completed; grants not re-applied for:")
+	assert.Contains(t, updated.Status.Message, "broken_user")
+
+	select {
+	case event := <-recorder.Events:
+		assert.Contains(t, event, corev1.EventTypeWarning)
+		assert.Contains(t, event, EventReasonRestoreGrantsSkipped)
+		assert.Contains(t, event, "retries exhausted for broken_user")
+	default:
+		t.Fatal("expected a Warning event to be recorded")
+	}
+}
+
+func TestRestoreReconciler_JobSuccessResetsStaleGrantAttempts(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+	// Leftover count from an earlier Granting round.
+	restore.Status.GrantAttempts = 3
+
+	user := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "broken-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, user).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient(), applyErr: errors.New("permission denied for database my_database_pg")}
+	require.NoError(t, pg.CreateUser(context.Background(), "broken_user", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	result, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err, "the fresh round still has one failing user, but retries are paced via RequeueAfter, not a returned error")
+	assert.Equal(t, grantRetryDelay, result.RequeueAfter)
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Granting", updated.Status.Phase)
+	assert.Equal(t, int32(1), updated.Status.GrantAttempts,
+		"entering Granting from the Job's success must reset the stale counter to 0 before this round's failure charges attempt 1, not carry the stale 3 forward to 4")
 }

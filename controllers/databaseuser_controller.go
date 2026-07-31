@@ -187,10 +187,7 @@ func (r *DatabaseUserReconciler) validateAndFetchDatabases(ctx context.Context, 
 }
 
 func (r *DatabaseUserReconciler) getUsername(user *databasesv1alpha1.DatabaseUser) string {
-	if user.Spec.Username != "" {
-		return user.Spec.Username
-	}
-	return strings.ReplaceAll(user.Name, "-", "_")
+	return UsernameForUser(user)
 }
 
 func (r *DatabaseUserReconciler) getDatabaseNameFromSpec(db *databasesv1alpha1.Database) string {
@@ -606,7 +603,7 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 	}
 	baseStatus := statusUpdate{ClusterName: cluster.Name, Username: username}
 
-	pgClient, err := r.getPostgresClient(ctx, cluster)
+	pgClient, err := GetPostgresClient(ctx, r.Client, r.PGClientCache, cluster)
 	if err != nil {
 		baseStatus.Phase = "Failed"
 		baseStatus.Message = fmt.Sprintf("connection error: %s", err.Error())
@@ -687,19 +684,18 @@ func (r *DatabaseUserReconciler) applyPerDatabasePrivileges(ctx context.Context,
 
 	dbStatuses := make([]databasesv1alpha1.DatabaseAccessStatus, len(databases))
 	dbAccesses := user.Spec.GetDatabases()
-	additionalGrants := translateAdditionalGrants(user.Spec.AdditionalGrants)
 
 	for i, db := range databases {
 		dbName := r.getDatabaseNameFromSpec(db)
-		privileges := privilegesForDatabase(dbAccesses[i].Privileges, user.Spec.Privileges)
+		grants := ResolveUserGrants(user, dbAccesses[i])
 
 		status := databasesv1alpha1.DatabaseAccessStatus{
 			Name:         dbAccesses[i].Name,
 			Namespace:    dbAccesses[i].Namespace,
 			DatabaseName: dbName,
-			Privileges:   privileges,
+			Privileges:   grants.Privileges,
 		}
-		if err := pgClient.ApplyPrivileges(ctx, username, dbName, privileges, additionalGrants); err != nil {
+		if err := pgClient.ApplyPrivileges(ctx, username, dbName, grants.Privileges, grants.AdditionalGrants); err != nil {
 			status.Phase = "Failed"
 			status.Message = err.Error()
 		} else {
@@ -711,28 +707,6 @@ func (r *DatabaseUserReconciler) applyPerDatabasePrivileges(ctx context.Context,
 		dbStatuses[i] = status
 	}
 	return dbStatuses
-}
-
-func translateAdditionalGrants(grants []databasesv1alpha1.TableGrant) []postgres.TableGrant {
-	out := make([]postgres.TableGrant, len(grants))
-	for j, g := range grants {
-		privs := make([]postgres.TablePrivilege, len(g.Privileges))
-		for k, p := range g.Privileges {
-			privs[k] = postgres.TablePrivilege(p)
-		}
-		out[j] = postgres.TableGrant{Tables: g.Tables, Privileges: privs}
-	}
-	return out
-}
-
-func privilegesForDatabase(perDB, fallback string) string {
-	if perDB != "" {
-		return perDB
-	}
-	if fallback != "" {
-		return fallback
-	}
-	return "readonly"
 }
 
 func (r *DatabaseUserReconciler) syncRuntimeParams(ctx context.Context, pgClient postgres.ClientInterface,
@@ -1271,7 +1245,7 @@ func (r *DatabaseUserReconciler) dropUserFromPostgres(ctx context.Context, user 
 		return err
 	}
 
-	pgClient, err := r.getPostgresClient(ctx, &cluster)
+	pgClient, err := GetPostgresClient(ctx, r.Client, r.PGClientCache, &cluster)
 	if err != nil {
 		return fmt.Errorf("failed to get postgres client for cleanup: %w", err)
 	}
@@ -1383,30 +1357,6 @@ func (r *DatabaseUserReconciler) reassignOwnershipForRemovedDatabases(ctx contex
 			}
 		}
 	}
-}
-
-func (r *DatabaseUserReconciler) getPostgresClient(ctx context.Context, cluster *databasesv1alpha1.DBCluster) (postgres.ClientInterface, error) {
-	var secret corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      cluster.Spec.CredentialsSecretRef.Name,
-		Namespace: cluster.Spec.CredentialsSecretRef.Namespace,
-	}, &secret); err != nil {
-		return nil, fmt.Errorf("failed to get credentials secret: %w", err)
-	}
-
-	username := string(secret.Data["username"])
-	password := string(secret.Data["password"])
-	if username == "" || password == "" {
-		return nil, fmt.Errorf("credentials secret must contain 'username' and 'password' keys")
-	}
-
-	return r.PGClientCache.Get(ctx, cluster.Name, postgres.Config{
-		Host:     cluster.Spec.Endpoint,
-		Port:     cluster.Spec.Port,
-		Username: username,
-		Password: password,
-		Database: "postgres",
-	})
 }
 
 // statusUpdate contains all parameters for updating DatabaseUser status

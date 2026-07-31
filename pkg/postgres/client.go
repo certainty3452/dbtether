@@ -115,24 +115,30 @@ func NewClientCache() *ClientCache {
 
 func (c *ClientCache) Get(ctx context.Context, clusterName string, config Config) (ClientInterface, error) {
 	c.mu.RLock()
-	client, ok := c.clients[clusterName]
+	cached, ok := c.clients[clusterName]
 	c.mu.RUnlock()
 
 	if ok {
-		if err := client.Ping(ctx); err == nil {
-			return client, nil
+		if err := cached.Ping(ctx); err == nil {
+			return cached, nil
 		}
 		c.Remove(clusterName)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Re-check under the write lock: a concurrent Get on a cold cache would
+	// otherwise store its own pool over ours and leak the loser's connections.
+	if cached, ok := c.clients[clusterName]; ok {
+		return cached, nil
 	}
 
 	client, err := NewClient(ctx, config)
 	if err != nil {
 		return nil, err
 	}
-
-	c.mu.Lock()
 	c.clients[clusterName] = client
-	c.mu.Unlock()
 
 	return client, nil
 }

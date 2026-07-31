@@ -2,6 +2,19 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.7.0] - 2026-07-31
+
+### Breaking
+- A restore target in another namespace is now rejected
+
+### Added
+- Restores bring back database user access before reporting completion
+
+### Fixed
+- Users lost access to a database after it was restored from a backup
+- A restore could get stuck forever when user access could not be restored; it now completes with a warning
+- Rare connection leak on first-time connections to a cluster
+
 ## [0.6.4] - 2026-07-26
 
 ### Fixed

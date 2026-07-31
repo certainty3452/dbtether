@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -98,7 +97,7 @@ func (r *DatabaseReconciler) getReadyCluster(ctx context.Context, db *databasesv
 }
 
 func (r *DatabaseReconciler) reconcileDatabase(ctx context.Context, db *databasesv1alpha1.Database, cluster *databasesv1alpha1.DBCluster) (ctrl.Result, error) {
-	pgClient, err := r.getPostgresClient(ctx, cluster)
+	pgClient, err := GetPostgresClient(ctx, r.Client, r.PGClientCache, cluster)
 	if err != nil {
 		return r.setStatusWithRequeue(ctx, db, "Failed", fmt.Sprintf("connection error: %s", err.Error()), 60*time.Second)
 	}
@@ -219,7 +218,7 @@ func (r *DatabaseReconciler) dropDatabaseIfPossible(ctx context.Context, db *dat
 		return err
 	}
 
-	pgClient, err := r.getPostgresClient(ctx, &cluster)
+	pgClient, err := GetPostgresClient(ctx, r.Client, r.PGClientCache, &cluster)
 	if err != nil {
 		return fmt.Errorf("failed to get postgres client: %w", err)
 	}
@@ -241,7 +240,7 @@ func (r *DatabaseReconciler) clearDatabaseOwnerIfPossible(ctx context.Context, d
 		return err
 	}
 
-	pgClient, err := r.getPostgresClient(ctx, &cluster)
+	pgClient, err := GetPostgresClient(ctx, r.Client, r.PGClientCache, &cluster)
 	if err != nil {
 		return fmt.Errorf("failed to get postgres client: %w", err)
 	}
@@ -249,30 +248,6 @@ func (r *DatabaseReconciler) clearDatabaseOwnerIfPossible(ctx context.Context, d
 	dbName := r.getDatabaseName(db)
 	logger.Info("clearing database ownership for re-adoption", "database", dbName)
 	return pgClient.ClearDatabaseOwner(ctx, dbName)
-}
-
-func (r *DatabaseReconciler) getPostgresClient(ctx context.Context, cluster *databasesv1alpha1.DBCluster) (postgres.ClientInterface, error) {
-	var secret corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      cluster.Spec.CredentialsSecretRef.Name,
-		Namespace: cluster.Spec.CredentialsSecretRef.Namespace,
-	}, &secret); err != nil {
-		return nil, fmt.Errorf("failed to get credentials secret: %w", err)
-	}
-
-	username := string(secret.Data["username"])
-	password := string(secret.Data["password"])
-	if username == "" || password == "" {
-		return nil, fmt.Errorf("credentials secret must contain 'username' and 'password' keys")
-	}
-
-	return r.PGClientCache.Get(ctx, cluster.Name, postgres.Config{
-		Host:     cluster.Spec.Endpoint,
-		Port:     cluster.Spec.Port,
-		Username: username,
-		Password: password,
-		Database: "postgres",
-	})
 }
 
 func (r *DatabaseReconciler) setStatus(ctx context.Context, db *databasesv1alpha1.Database, phase, message string) (ctrl.Result, error) {

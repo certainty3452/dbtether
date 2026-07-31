@@ -60,6 +60,7 @@ type RestoreSpec struct {
 
 	// Target database to restore into
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:XValidation:rule="!has(self.databaseRef.__namespace__) || self.databaseRef.__namespace__ == ''",message="target database must be in the Restore's namespace"
 	Target RestoreTarget `json:"target"`
 
 	// How to handle conflicts with existing data
@@ -78,8 +79,10 @@ type RestoreSpec struct {
 
 // RestoreStatus defines the observed state of Restore
 type RestoreStatus struct {
-	// Current phase of the restore operation
-	// +kubebuilder:validation:Enum=Pending;Running;Completed;Failed
+	// Current phase of the restore operation.
+	// Granting means the data landed but the target's DatabaseUsers do not hold
+	// their grants yet — the restore is not usable by them until Completed.
+	// +kubebuilder:validation:Enum=Pending;Running;Granting;Completed;Failed
 	Phase string `json:"phase,omitempty"`
 
 	// Human-readable message about the current status
@@ -99,6 +102,11 @@ type RestoreStatus struct {
 
 	// RunID is a unique identifier for this restore run
 	RunID string `json:"runId,omitempty"`
+
+	// Number of failed grant re-apply rounds retried so far.
+	// Reset when Granting is entered after a successful restore Job.
+	// +optional
+	GrantAttempts int32 `json:"grantAttempts,omitempty"`
 
 	StartedAt   *metav1.Time `json:"startedAt,omitempty"`
 	CompletedAt *metav1.Time `json:"completedAt,omitempty"`

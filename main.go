@@ -87,8 +87,17 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		os.Exit(1)
 	}
 
-	setupMainControllers(mgr)
-	setupBackupControllers(mgr, operatorNamespace)
+	// Before any controller: the cache locks its index set once started, and the
+	// Restore controller lists DatabaseUsers by indexed field.
+	if err := controllers.RegisterIndexers(context.Background(), mgr); err != nil {
+		setupLog.Error(err, "unable to register field indexers")
+		os.Exit(1)
+	}
+
+	pgClientCache := postgres.NewClientCache()
+
+	setupMainControllers(mgr, pgClientCache)
+	setupBackupControllers(mgr, operatorNamespace, pgClientCache)
 	setupHealthChecks(mgr)
 
 	setupLog.Info("starting manager")
@@ -98,9 +107,7 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 	}
 }
 
-func setupMainControllers(mgr ctrl.Manager) {
-	pgClientCache := postgres.NewClientCache()
-
+func setupMainControllers(mgr ctrl.Manager, pgClientCache postgres.ClientCacheInterface) {
 	if err := (&controllers.DBClusterReconciler{
 		Client:        mgr.GetClient(),
 		Scheme:        mgr.GetScheme(),
@@ -129,7 +136,7 @@ func setupMainControllers(mgr ctrl.Manager) {
 	}
 }
 
-func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string) {
+func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string, pgClientCache postgres.ClientCacheInterface) {
 	if err := (&backup.BackupStorageReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -181,12 +188,14 @@ func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string) {
 	}
 
 	if err := (&backup.RestoreReconciler{
-		Client:       mgr.GetClient(),
-		Scheme:       mgr.GetScheme(),
-		Image:        operatorImage,
-		Namespace:    operatorNamespace,
-		SSLMode:      operatorSSLMode,
-		PodResources: cfg.Backup.Resources.ToK8sResources(),
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		Recorder:      mgr.GetEventRecorderFor("restore-controller"),
+		Image:         operatorImage,
+		Namespace:     operatorNamespace,
+		SSLMode:       operatorSSLMode,
+		PodResources:  cfg.Backup.Resources.ToK8sResources(),
+		PGClientCache: pgClientCache,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, errUnableToCreateController, "controller", "Restore")
 		os.Exit(1)

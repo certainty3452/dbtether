@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -15,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -22,9 +25,25 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
+	"github.com/certainty3452/dbtether/controllers"
+	"github.com/certainty3452/dbtether/pkg/postgres"
 )
 
 const restoreFinalizer = "dbtether.io/restore-job"
+
+// regrantTimeout bounds the grant re-apply step, which is one sequential set of
+// PG round-trips per DatabaseUser of the target database.
+const regrantTimeout = 5 * time.Minute
+
+// grantAttemptLimit caps the rounds spent on DatabaseUsers whose grants keep
+// failing (e.g. additionalGrants naming a table an older dump never had), so one
+// permanently broken user cannot pin a finished restore in Granting forever.
+const grantAttemptLimit = 5
+
+// grantRetryDelay paces regrant rounds with a fixed delay: workqueue backoff
+// starts at ~5ms and would burn the whole attempt budget in under a second on
+// a transient outage (e.g. a PG restart) that a later round would survive.
+const grantRetryDelay = 30 * time.Second
 
 // Label keys for restore resources
 const (
@@ -32,18 +51,28 @@ const (
 	LabelRestoreNamespace = "dbtether.io/restore-namespace"
 )
 
+// Event reason constants for restore operations
+const EventReasonRestoreGrantsSkipped = "RestoreGrantsSkipped"
+
 type RestoreReconciler struct {
 	client.Client
-	Scheme       *runtime.Scheme
-	Image        string
-	Namespace    string
-	SSLMode      string // propagated into Job env so it matches operator's posture
-	PodResources corev1.ResourceRequirements
+	Scheme        *runtime.Scheme
+	Recorder      record.EventRecorder
+	Image         string
+	Namespace     string
+	SSLMode       string // propagated into Job env so it matches operator's posture
+	PodResources  corev1.ResourceRequirements
+	PGClientCache postgres.ClientCacheInterface
 }
 
 // +kubebuilder:rbac:groups=dbtether.io,resources=restores,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=dbtether.io,resources=restores/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=dbtether.io,resources=restores/finalizers,verbs=update
+// +kubebuilder:rbac:groups=dbtether.io,resources=databases,verbs=get;list;watch
+// +kubebuilder:rbac:groups=dbtether.io,resources=databaseusers,verbs=get;list;watch
+// +kubebuilder:rbac:groups=dbtether.io,resources=dbclusters,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -71,6 +100,13 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	logger.V(1).Info("reconciling restore", "target", restore.Spec.Target.DatabaseRef.Name)
+
+	// The data already landed, so the Job is irrelevant from here on — and its TTL
+	// may well have collected it. Looking it up would report NotFound and bury a
+	// successful restore under a "job was deleted" failure.
+	if restore.Status.Phase == "Granting" && restore.Status.SpecHash == specHash {
+		return r.finishGranting(ctx, &restore, specHash)
+	}
 
 	// If Job already created, just check its status
 	if restore.Status.JobName != "" {
@@ -438,12 +474,13 @@ func (r *RestoreReconciler) evaluateJobStatus(ctx context.Context, restore *data
 	logger := log.FromContext(ctx)
 
 	if job.Status.Succeeded > 0 {
-		duration := ""
-		if restore.Status.StartedAt != nil {
-			duration = time.Since(restore.Status.StartedAt.Time).Round(time.Second).String()
+		// Completed gates downstream automation, so it must mean "usable by the
+		// database's registered users" — hold the phase until grants are back.
+		// Persisting Granting first is what lets a retry outlive the Job's TTL.
+		if _, err := r.updateStatus(ctx, restore, "Granting", "restore succeeded, applying grants", specHash); err != nil {
+			return ctrl.Result{}, err
 		}
-		logger.Info("restore completed successfully", "duration", duration)
-		return r.updateStatusCompleted(ctx, restore, specHash, duration)
+		return r.finishGranting(ctx, restore, specHash)
 	}
 
 	if job.Status.Failed > 0 {
@@ -530,6 +567,12 @@ func (r *RestoreReconciler) updateStatus(
 		restore.Status.StartedAt = &now
 	}
 
+	// Granting is only entered from a fresh Job success, so the grant attempt
+	// budget starts over here rather than carrying over from an earlier run.
+	if phase == "Granting" {
+		restore.Status.GrantAttempts = 0
+	}
+
 	if err := r.Status().Patch(ctx, restore, patch); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -568,14 +611,14 @@ func (r *RestoreReconciler) updateStatusWithJob(
 func (r *RestoreReconciler) updateStatusCompleted(
 	ctx context.Context,
 	restore *databasesv1alpha1.Restore,
-	specHash, duration string,
+	specHash, message string,
 ) (ctrl.Result, error) {
 	patch := client.MergeFrom(restore.DeepCopy())
 
 	restore.Status.Phase = "Completed"
-	restore.Status.Message = "restore completed successfully"
+	restore.Status.Message = message
 	restore.Status.SpecHash = specHash
-	restore.Status.Duration = duration
+	restore.Status.Duration = restoreDuration(restore)
 	restore.Status.ObservedGeneration = restore.Generation
 
 	now := metav1.Now()
@@ -646,4 +689,233 @@ func (r *RestoreReconciler) extractRunIDFromJobName(jobName, restoreName string)
 		return jobName[len(prefix):]
 	}
 	return ""
+}
+
+func (r *RestoreReconciler) finishGranting(ctx context.Context, restore *databasesv1alpha1.Restore, specHash string) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	grantCtx, cancel := context.WithTimeout(ctx, regrantTimeout)
+	defer cancel()
+
+	failures, err := r.regrantDatabaseUsers(grantCtx, restore)
+	if err != nil {
+		// There is nothing left to grant on, so retrying can only spin — and the data
+		// itself did land, which is what Completed reports.
+		if reason, ok := unrecoverableRegrantReason(err); ok {
+			logger.Error(err, "completing restore without re-applying grants", "reason", reason)
+			r.recordGrantsSkipped(restore, reason)
+			return r.updateStatusCompleted(ctx, restore, specHash,
+				fmt.Sprintf("restore completed; grants not re-applied: %s", reason))
+		}
+
+		// The whole regrant step never got off the ground, so no attempt is charged.
+		logger.Error(err, "failed to re-apply grants after restore")
+		if statusErr := r.patchGrantingProgress(ctx, restore, restore.Status.GrantAttempts,
+			fmt.Sprintf("restore succeeded, retrying grants: %v", err)); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{}, err
+	}
+
+	if len(failures) > 0 {
+		return r.handleUserGrantFailures(ctx, restore, specHash, failures)
+	}
+
+	logger.Info("restore completed successfully", "duration", restoreDuration(restore))
+	return r.updateStatusCompleted(ctx, restore, specHash, "restore completed successfully")
+}
+
+// handleUserGrantFailures retries the full user set — ApplyPrivileges is idempotent,
+// so users that already succeeded are cheap to redo — until the attempt budget is
+// spent, then completes with the offenders named.
+func (r *RestoreReconciler) handleUserGrantFailures(
+	ctx context.Context,
+	restore *databasesv1alpha1.Restore,
+	specHash string,
+	failures []userGrantFailure,
+) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	attempts := restore.Status.GrantAttempts + 1
+	err := joinGrantFailures(failures)
+	users := failedGrantUsers(failures)
+
+	if attempts >= grantAttemptLimit {
+		logger.Error(err, "giving up on re-applying grants after restore", "attempts", attempts, "users", users)
+		r.recordGrantsSkipped(restore, fmt.Sprintf("retries exhausted for %s", users))
+		return r.updateStatusCompleted(ctx, restore, specHash,
+			fmt.Sprintf("restore completed; grants not re-applied for: %s", users))
+	}
+
+	logger.Error(err, "failed to re-apply grants for some users after restore", "attempts", attempts, "users", users)
+	if statusErr := r.patchGrantingProgress(ctx, restore, attempts,
+		fmt.Sprintf("restore succeeded, retrying grants: %v", err)); statusErr != nil {
+		return ctrl.Result{}, statusErr
+	}
+	// nil error: a real error would drive workqueue backoff, defeating grantRetryDelay above.
+	return ctrl.Result{RequeueAfter: grantRetryDelay}, nil
+}
+
+// patchGrantingProgress keeps the phase at Granting while grants are retried and
+// persists the attempt budget so it survives operator restarts. It stays silent when
+// nothing changed so a wedged cluster can't churn the API server.
+func (r *RestoreReconciler) patchGrantingProgress(
+	ctx context.Context,
+	restore *databasesv1alpha1.Restore,
+	attempts int32,
+	message string,
+) error {
+	if restore.Status.Phase == "Granting" && restore.Status.Message == message && restore.Status.GrantAttempts == attempts {
+		return nil
+	}
+
+	patch := client.MergeFrom(restore.DeepCopy())
+	restore.Status.Phase = "Granting"
+	restore.Status.Message = message
+	restore.Status.GrantAttempts = attempts
+
+	return r.Status().Patch(ctx, restore, patch)
+}
+
+func (r *RestoreReconciler) recordGrantsSkipped(restore *databasesv1alpha1.Restore, reason string) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Event(restore, corev1.EventTypeWarning, EventReasonRestoreGrantsSkipped,
+		fmt.Sprintf("Restore completed but grants were not re-applied: %s", reason))
+}
+
+// pg_restore imports as the cluster admin with --no-owner --no-acl, and
+// onConflict=drop recreates the database — both wipe existing grants.
+// A returned error means the step could not run at all; per-user failures come
+// back in the slice instead, so one unservable user does not starve the rest.
+func (r *RestoreReconciler) regrantDatabaseUsers(
+	ctx context.Context,
+	restore *databasesv1alpha1.Restore,
+) (failures []userGrantFailure, err error) {
+	logger := log.FromContext(ctx)
+
+	var db databasesv1alpha1.Database
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      restore.Spec.Target.DatabaseRef.Name,
+		Namespace: restore.Namespace,
+	}, &db); err != nil {
+		if errors.IsNotFound(err) {
+			return nil, newUnrecoverableRegrant(err, "target database %s no longer exists", restore.Spec.Target.DatabaseRef.Name)
+		}
+		return nil, fmt.Errorf("failed to get target database %s: %w", restore.Spec.Target.DatabaseRef.Name, err)
+	}
+
+	var users databasesv1alpha1.DatabaseUserList
+	if err := r.List(ctx, &users, client.MatchingFields{
+		controllers.DatabaseUserDatabaseRefIndex: controllers.DatabaseUserDatabaseRefKey(db.Namespace, db.Name),
+	}); err != nil {
+		return nil, fmt.Errorf("failed to list database users: %w", err)
+	}
+	if len(users.Items) == 0 {
+		return nil, nil
+	}
+
+	var cluster databasesv1alpha1.DBCluster
+	if err := r.Get(ctx, types.NamespacedName{Name: db.Spec.ClusterRef.Name}, &cluster); err != nil {
+		if errors.IsNotFound(err) {
+			return nil, newUnrecoverableRegrant(err, "cluster %s no longer exists", db.Spec.ClusterRef.Name)
+		}
+		return nil, fmt.Errorf("failed to get cluster %s: %w", db.Spec.ClusterRef.Name, err)
+	}
+
+	pgClient, err := controllers.GetPostgresClient(ctx, r.Client, r.PGClientCache, &cluster)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to cluster %s: %w", cluster.Name, err)
+	}
+
+	for i := range users.Items {
+		user := &users.Items[i]
+
+		grants, ok := controllers.ResolveUserGrantsForDatabase(user, db.Namespace, db.Name)
+		if !ok {
+			continue
+		}
+
+		// The role decides, not the CR phase: a Failed user can still own a live
+		// role whose grants the restore just wiped, and a freshly Ready one may not
+		// be visible in this controller's cache yet.
+		exists, err := pgClient.UserExists(ctx, grants.Username)
+		if err != nil {
+			failures = append(failures, userGrantFailure{
+				username: grants.Username,
+				err:      fmt.Errorf("failed to check role %s: %w", grants.Username, err),
+			})
+			continue
+		}
+		if !exists {
+			logger.Info("role not yet created; user's own reconcile will grant",
+				"user", user.Name, "namespace", user.Namespace, "role", grants.Username)
+			continue
+		}
+
+		if err := pgClient.ApplyPrivileges(ctx, grants.Username, db.Status.DatabaseName, grants.Privileges, grants.AdditionalGrants); err != nil {
+			failures = append(failures, userGrantFailure{
+				username: grants.Username,
+				err:      fmt.Errorf("failed to re-apply privileges for user %s: %w", grants.Username, err),
+			})
+			continue
+		}
+		logger.Info("re-applied grants after restore",
+			"user", grants.Username, "database", db.Status.DatabaseName, "privileges", grants.Privileges)
+	}
+
+	return failures, nil
+}
+
+type userGrantFailure struct {
+	username string
+	err      error
+}
+
+// joinGrantFailures flattens the round's failures onto one line, because the result
+// ends up in status.message where newlines are unreadable.
+func joinGrantFailures(failures []userGrantFailure) error {
+	messages := make([]string, 0, len(failures))
+	for _, failure := range failures {
+		messages = append(messages, failure.err.Error())
+	}
+	return stderrors.New(strings.Join(messages, "; "))
+}
+
+func failedGrantUsers(failures []userGrantFailure) string {
+	names := make([]string, 0, len(failures))
+	for _, failure := range failures {
+		names = append(names, failure.username)
+	}
+	return strings.Join(names, ", ")
+}
+
+// unrecoverableRegrantError marks a regrant failure that no amount of retrying can
+// fix, so the restore completes with the reason recorded instead of spinning.
+type unrecoverableRegrantError struct {
+	reason string
+	err    error
+}
+
+func (e *unrecoverableRegrantError) Error() string { return e.reason + ": " + e.err.Error() }
+func (e *unrecoverableRegrantError) Unwrap() error { return e.err }
+
+func newUnrecoverableRegrant(err error, format string, args ...any) error {
+	return &unrecoverableRegrantError{reason: fmt.Sprintf(format, args...), err: err}
+}
+
+func unrecoverableRegrantReason(err error) (string, bool) {
+	var u *unrecoverableRegrantError
+	if stderrors.As(err, &u) {
+		return u.reason, true
+	}
+	return "", false
+}
+
+func restoreDuration(restore *databasesv1alpha1.Restore) string {
+	if restore.Status.StartedAt == nil {
+		return ""
+	}
+	return time.Since(restore.Status.StartedAt.Time).Round(time.Second).String()
 }

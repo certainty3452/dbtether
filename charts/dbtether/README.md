@@ -136,7 +136,7 @@ spec:
 |-----------|-------------|---------|
 | `replicaCount` | Number of operator replicas | `1` |
 | `image.repository` | Operator image | `ghcr.io/certainty3452/dbtether` |
-| `image.tag` | Image tag | `0.6.4` |
+| `image.tag` | Image tag | `0.7.0` |
 | `resources.requests.cpu` | CPU request | `100m` |
 | `resources.requests.memory` | Memory request | `128Mi` |
 | `resources.limits.cpu` | CPU limit | `500m` |

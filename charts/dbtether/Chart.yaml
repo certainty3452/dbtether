@@ -2,8 +2,8 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.6.4
-appVersion: "0.6.4"
+version: 0.7.0
+appVersion: "0.7.0"
 home: https://github.com/certainty3452/dbtether
 # icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
@@ -158,8 +158,16 @@ annotations:
             name: orders-db-restored
         onConflict: drop
   artifacthub.io/changes: |
+    - kind: changed
+      description: "Breaking: a restore target in another namespace is now rejected"
+    - kind: added
+      description: "Restores bring back database user access before reporting completion"
     - kind: fixed
-      description: "An empty retention policy no longer deletes every backup; it is now rejected outright"
+      description: "Users lost access to a database after it was restored from a backup"
+    - kind: fixed
+      description: "A restore could get stuck forever when user access could not be restored; it now completes with a warning"
+    - kind: fixed
+      description: "Rare connection leak on first-time connections to a cluster"
     - kind: fixed
       description: "Backups no longer fail permanently when a dependency is briefly unavailable"
     - kind: fixed

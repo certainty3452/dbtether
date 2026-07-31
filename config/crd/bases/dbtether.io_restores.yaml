@@ -133,6 +133,10 @@ spec:
                 required:
                 - databaseRef
                 type: object
+                x-kubernetes-validations:
+                - message: target database must be in the Restore's namespace
+                  rule: '!has(self.databaseRef.__namespace__) || self.databaseRef.__namespace__
+                    == '''''
               ttlAfterCompletion:
                 description: Auto-delete after completion
                 type: string
@@ -149,6 +153,12 @@ spec:
               duration:
                 description: Duration of the restore operation
                 type: string
+              grantAttempts:
+                description: |-
+                  Number of failed grant re-apply rounds retried so far.
+                  Reset when Granting is entered after a successful restore Job.
+                format: int32
+                type: integer
               jobName:
                 description: Name of the Job created for this restore
                 type: string
@@ -159,10 +169,14 @@ spec:
                 format: int64
                 type: integer
               phase:
-                description: Current phase of the restore operation
+                description: |-
+                  Current phase of the restore operation.
+                  Granting means the data landed but the target's DatabaseUsers do not hold
+                  their grants yet — the restore is not usable by them until Completed.
                 enum:
                 - Pending
                 - Running
+                - Granting
                 - Completed
                 - Failed
                 type: string
