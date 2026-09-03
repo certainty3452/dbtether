@@ -34,7 +34,7 @@ spec:
 | `target.databaseRef.name` | string | ✅ | — | Name of the Database to restore into |
 | `target.databaseRef.namespace` | string | ❌ | same as Restore | Namespace of the target Database |
 | `onConflict` | enum | ❌ | `fail` | What to do if the target database is not empty: `fail`, `drop`, `overwrite` |
-| `ttlAfterCompletion` | duration | ❌ | — | Auto-delete the Restore CRD after completion |
+| `ttlAfterCompletion` | duration | ❌ | `1h` | How long Kubernetes keeps the finished restore Job |
 
 ### source
 
@@ -50,6 +50,8 @@ source:
     name: orders-backup-20260120
     namespace: my-team  # optional, defaults to Restore's namespace
 ```
+
+Resolves `status.path` on the referenced `Backup`. While that Backup is `Pending` or `Running`, the Restore waits in `Pending` instead of guessing at a result, and retries automatically once the Backup finishes. If the Backup is `Failed`, or `Completed` with no `status.path`, the Restore fails.
 
 #### Mode B: latest from database
 
@@ -90,7 +92,7 @@ Behavior when the target database already exists or contains data.
 
 ### ttlAfterCompletion
 
-Same semantics as on `Backup`. **Use with caution under GitOps** — if the Restore manifest lives in Git, ArgoCD will recreate it after TTL deletion, which can trigger another restore.
+Sets `ttlSecondsAfterFinished` on the Kubernetes Job that runs the restore. Same semantics as on [`Backup`](backup.md#ttlaftercompletion): Kubernetes deletes the Job and its pods that long after the Job finishes; the Restore resource and its status are untouched.
 
 ## Status
 
@@ -213,7 +215,7 @@ spec:
   onConflict: fail
 ```
 
-### One-shot restore with TTL cleanup
+### Short Job Retention
 
 ```yaml
 apiVersion: dbtether.io/v1alpha1
@@ -230,7 +232,7 @@ spec:
     databaseRef:
       name: orders-db-scratch
   onConflict: drop
-  ttlAfterCompletion: 1h
+  ttlAfterCompletion: 1h  # Keep the finished Job for 1 hour
 ```
 
 ## Troubleshooting

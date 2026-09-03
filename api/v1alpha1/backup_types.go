@@ -19,7 +19,12 @@ type BackupSpec struct {
 	// +optional
 	FilenameTemplate string `json:"filenameTemplate,omitempty"`
 
-	// Auto-delete after completion. Use with caution in GitOps environments!
+	// Opaque value that only feeds the spec hash; change it to run the backup again
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	Trigger string `json:"trigger,omitempty"`
+
+	// TTL of the Kubernetes Job after it finishes. Defaults to 1 hour
 	// +optional
 	TTLAfterCompletion *metav1.Duration `json:"ttlAfterCompletion,omitempty"`
 
@@ -70,7 +75,7 @@ type BackupStatus struct {
 	// Name of the Job created for this backup
 	JobName string `json:"jobName,omitempty"`
 
-	// Full path to the backup file
+	// Full path to the backup file produced by the current run
 	Path string `json:"path,omitempty"`
 
 	// Size of the backup file (human-readable)
@@ -112,6 +117,7 @@ type BackupStatus struct {
 // +kubebuilder:printcolumn:name="Size",type=string,JSONPath=`.status.size`
 // +kubebuilder:printcolumn:name="Duration",type=string,JSONPath=`.status.duration`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:printcolumn:name="Observed",type=integer,JSONPath=`.status.observedGeneration`,priority=1
 
 type Backup struct {
 	metav1.TypeMeta   `json:",inline"`

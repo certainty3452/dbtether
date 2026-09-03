@@ -72,7 +72,7 @@ type RestoreSpec struct {
 	// +optional
 	OnConflict string `json:"onConflict,omitempty"`
 
-	// Auto-delete after completion
+	// TTL of the Kubernetes Job after it finishes. Defaults to 1 hour
 	// +optional
 	TTLAfterCompletion *metav1.Duration `json:"ttlAfterCompletion,omitempty"`
 }

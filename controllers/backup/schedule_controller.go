@@ -95,7 +95,7 @@ func (r *BackupScheduleReconciler) ensureScheduleFinalizer(ctx context.Context, 
 	if err := r.Patch(ctx, schedule, patch); err != nil {
 		return &ctrl.Result{}, err
 	}
-	return &ctrl.Result{Requeue: true}, nil
+	return &ctrl.Result{RequeueAfter: finalizerRequeueDelay}, nil
 }
 
 func (r *BackupScheduleReconciler) parseCronSchedule(cronExpr string) (cron.Schedule, error) {

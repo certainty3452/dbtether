@@ -138,7 +138,8 @@ spec:
                   rule: '!has(self.databaseRef.__namespace__) || self.databaseRef.__namespace__
                     == '''''
               ttlAfterCompletion:
-                description: Auto-delete after completion
+                description: TTL of the Kubernetes Job after it finishes. Defaults
+                  to 1 hour
                 type: string
             required:
             - source

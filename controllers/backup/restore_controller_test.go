@@ -306,6 +306,29 @@ func TestLatestFromSource_Fields(t *testing.T) {
 	})
 }
 
+func TestBuildRestoreJob_TTLFromSpec(t *testing.T) {
+	r := &RestoreReconciler{Namespace: "dbtether", Image: "dbtether:test"}
+
+	ttl := metav1.Duration{Duration: 2 * time.Hour}
+	restore := &dbtether.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-restore", Namespace: "app-ns"},
+		Spec:       dbtether.RestoreSpec{TTLAfterCompletion: &ttl},
+	}
+	db := &dbtether.Database{Status: dbtether.DatabaseStatus{DatabaseName: "mydb"}}
+	cluster := &dbtether.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster-a"},
+		Spec:       dbtether.DBClusterSpec{Endpoint: "localhost", Port: 5432},
+	}
+	storage := &dbtether.BackupStorage{
+		Spec: dbtether.BackupStorageSpec{S3: &dbtether.S3StorageConfig{Bucket: "b", Region: "us-east-1"}},
+	}
+
+	job, err := r.buildRestoreJob(restore, db, cluster, storage, "path/to.sql.gz", "run1")
+	require.NoError(t, err)
+	require.NotNil(t, job.Spec.TTLSecondsAfterFinished)
+	assert.Equal(t, int32(7200), *job.Spec.TTLSecondsAfterFinished)
+}
+
 func TestBuildEnvVars_Storage(t *testing.T) {
 	r := &RestoreReconciler{}
 
@@ -582,16 +605,16 @@ func TestResolveSource_BackupRef_NotFound(t *testing.T) {
 	assert.Contains(t, err.Error(), "backup not found")
 }
 
-func TestResolveSource_BackupRef_NotCompleted(t *testing.T) {
+func TestResolveSource_BackupRef_Failed(t *testing.T) {
 	ctx := context.Background()
 
 	backup := &dbtether.Backup{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "running-backup",
+			Name:      "failed-backup",
 			Namespace: "default",
 		},
 		Status: dbtether.BackupStatus{
-			Phase: "Running",
+			Phase: "Failed",
 		},
 	}
 
@@ -604,7 +627,7 @@ func TestResolveSource_BackupRef_NotCompleted(t *testing.T) {
 		},
 		Spec: dbtether.RestoreSpec{
 			Source: dbtether.RestoreSource{
-				BackupRef: &dbtether.BackupReference{Name: "running-backup"},
+				BackupRef: &dbtether.BackupReference{Name: "failed-backup"},
 			},
 		},
 	}
@@ -612,6 +635,43 @@ func TestResolveSource_BackupRef_NotCompleted(t *testing.T) {
 	_, _, err := r.resolveSource(ctx, restore)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "backup is not completed")
+	assert.False(t, isDependencyNotReady(err))
+}
+
+func TestResolveSource_BackupRef_NotReadyYet(t *testing.T) {
+	for _, phase := range []string{"", "Pending", "Running"} {
+		t.Run(phase, func(t *testing.T) {
+			ctx := context.Background()
+
+			backup := &dbtether.Backup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "in-progress-backup",
+					Namespace: "default",
+				},
+				Status: dbtether.BackupStatus{
+					Phase: phase,
+				},
+			}
+
+			r := newFakeRestoreReconciler(backup)
+
+			restore := &dbtether.Restore{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-restore",
+					Namespace: "default",
+				},
+				Spec: dbtether.RestoreSpec{
+					Source: dbtether.RestoreSource{
+						BackupRef: &dbtether.BackupReference{Name: "in-progress-backup"},
+					},
+				},
+			}
+
+			_, _, err := r.resolveSource(ctx, restore)
+			require.Error(t, err)
+			assert.True(t, isDependencyNotReady(err), "expected a dependencyNotReady error, got %v", err)
+		})
+	}
 }
 
 func TestResolveSource_LatestFrom(t *testing.T) {
@@ -1006,6 +1066,77 @@ func TestRestoreReconciler_AdoptsExistingJob(t *testing.T) {
 	}
 	if updatedRestore.Status.Phase != "Running" {
 		t.Errorf("expected Phase=Running after adoption, got %q", updatedRestore.Status.Phase)
+	}
+}
+
+// TestRestoreReconciler_BackupRefNotReady covers a Restore whose referenced Backup hasn't produced a usable
+// result yet: still Running (wait Pending, no Job started) or Failed (the Restore fails too).
+func TestRestoreReconciler_BackupRefNotReady(t *testing.T) {
+	tests := []struct {
+		name          string
+		backupPhase   string
+		expectedPhase string
+		expectNoJob   bool
+	}{
+		{name: "running backup waits pending", backupPhase: "Running", expectedPhase: "Pending", expectNoJob: true},
+		{name: "failed backup fails", backupPhase: "Failed", expectedPhase: "Failed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			restore := &dbtether.Restore{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "my-restore",
+					Namespace:  "app-ns",
+					Finalizers: []string{restoreFinalizer},
+				},
+				Spec: dbtether.RestoreSpec{
+					Source: dbtether.RestoreSource{
+						BackupRef: &dbtether.BackupReference{Name: "referenced-backup"},
+					},
+					Target: dbtether.RestoreTarget{
+						DatabaseRef: dbtether.DatabaseReference{Name: "my-database"},
+					},
+				},
+			}
+
+			backup := &dbtether.Backup{
+				ObjectMeta: metav1.ObjectMeta{Name: "referenced-backup", Namespace: "app-ns"},
+				Status:     dbtether.BackupStatus{Phase: tt.backupPhase},
+			}
+
+			scheme := newRestoreTestScheme()
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(restore, backup).
+				WithStatusSubresource(&dbtether.Restore{}).
+				Build()
+
+			r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether"}
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+			if _, err := r.Reconcile(context.Background(), req); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			var updated dbtether.Restore
+			if err := r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated); err != nil {
+				t.Fatalf("failed to get restore: %v", err)
+			}
+			if updated.Status.Phase != tt.expectedPhase {
+				t.Errorf("expected Phase=%s for a %s Backup, got %q", tt.expectedPhase, tt.backupPhase, updated.Status.Phase)
+			}
+
+			if tt.expectNoJob {
+				var jobs batchv1.JobList
+				if err := r.List(context.Background(), &jobs, client.InNamespace("dbtether")); err != nil {
+					t.Fatalf("failed to list jobs: %v", err)
+				}
+				if len(jobs.Items) != 0 {
+					t.Errorf("expected no Job while waiting on the Backup, got %d", len(jobs.Items))
+				}
+			}
+		})
 	}
 }
 

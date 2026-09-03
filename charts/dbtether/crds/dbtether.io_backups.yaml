@@ -32,6 +32,10 @@ spec:
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
+    - jsonPath: .status.observedGeneration
+      name: Observed
+      priority: 1
+      type: integer
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -107,9 +111,14 @@ spec:
                 required:
                 - name
                 type: object
+              trigger:
+                description: Opaque value that only feeds the spec hash; change it
+                  to run the backup again
+                maxLength: 253
+                type: string
               ttlAfterCompletion:
-                description: Auto-delete after completion. Use with caution in GitOps
-                  environments!
+                description: TTL of the Kubernetes Job after it finishes. Defaults
+                  to 1 hour
                 type: string
             required:
             - databaseRef
@@ -149,7 +158,8 @@ spec:
                 format: int64
                 type: integer
               path:
-                description: Full path to the backup file
+                description: Full path to the backup file produced by the current
+                  run
                 type: string
               phase:
                 enum:

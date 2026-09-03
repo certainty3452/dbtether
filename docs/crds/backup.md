@@ -21,7 +21,7 @@ spec:
   storageRef:
     name: production-backups
   filenameTemplate: "{{ .Timestamp }}-{{ .RunID }}.sql.gz"
-  ttlAfterCompletion: 24h  # Optional: auto-delete completed backup
+  ttlAfterCompletion: 24h  # Optional: how long to keep the finished Job
 ```
 
 ## Spec
@@ -32,7 +32,8 @@ spec:
 | `databaseRef.namespace` | string | ❌ | same as Backup | Namespace of the Database |
 | `storageRef.name` | string | ✅ | — | Name of the BackupStorage resource |
 | `filenameTemplate` | string | ❌ | `{{ .Timestamp }}.sql.gz` | Backup filename template |
-| `ttlAfterCompletion` | duration | ❌ | — | Auto-delete Backup CRD after completion |
+| `trigger` | string | ❌ | — | Opaque value that only feeds the spec hash; change it to run the backup again |
+| `ttlAfterCompletion` | duration | ❌ | `1h` | How long Kubernetes keeps the finished backup Job |
 | `jobConfig` | object | ❌ | — | Kubernetes Job configuration |
 
 ### jobConfig
@@ -86,20 +87,45 @@ Template for the backup filename.
 
 ## ttlAfterCompletion
 
-**⚠️ Use with caution in GitOps environments!**
-
-When set, the Backup CRD will be automatically deleted after the specified duration from completion.
+Sets `ttlSecondsAfterFinished` on the Kubernetes Job that runs the backup. Kubernetes deletes the Job and its pods that long after the Job finishes; the Backup resource and its status are untouched, and the uploaded backup file stays in storage.
 
 | Value | Behavior |
 |-------|----------|
-| Not set | Backup CRD is retained indefinitely |
-| `1h` | Deleted 1 hour after completion |
-| `24h` | Deleted 24 hours after completion |
+| Not set | Job is deleted 1 hour after it finishes |
+| `1h` | Job is deleted 1 hour after it finishes |
+| `24h` | Job is deleted 24 hours after it finishes |
 
-**Warning for ArgoCD/GitOps:** If the Backup manifest is in your Git repo and TTL deletes the resource, ArgoCD will recreate it, potentially triggering another backup. Consider:
-- Using `specHash` (automatic) for idempotency
-- Storing Backup manifests outside ArgoCD app
-- Using BackupSchedule instead for recurring backups
+Raise it when you need more time to inspect Job logs after a run. Failed Jobs are kept on their own schedule; see `jobConfig.ttlSecondsAfterFailed`, which defaults to 12 hours.
+
+## trigger
+
+An opaque string that only feeds the spec hash. Change it to run the backup again from the same manifest; the operator gives it no other meaning.
+
+Use it when one Backup manifest lives in git and must run before every deployment:
+
+```yaml
+apiVersion: dbtether.io/v1alpha1
+kind: Backup
+metadata:
+  name: orders-pre-deploy
+  namespace: orders-team
+spec:
+  databaseRef:
+    name: orders-db
+  storageRef:
+    name: production-backups
+  filenameTemplate: pre-deploy.sql.gz  # stable name: every run overwrites the same object
+  trigger: "v4.6.1"                    # the image tag being deployed
+```
+
+| Event | What the operator does |
+|-------|------------------------|
+| Manifest re-applied, `trigger` unchanged | Nothing, however often it is synced |
+| `trigger` changed after the last run finished | A new run starts |
+| `trigger` changed while a run is active | The active run finishes first, then a new run starts; runs never overlap |
+| `trigger` set back to an earlier value | A new run; any change counts, not the value itself |
+
+The operator writes `status.observedGeneration` when a run starts, not when it finishes. A health check must require both `observedGeneration == metadata.generation` and `phase == Completed`; `observedGeneration` alone turns true while the run is still `Running`.
 
 ## Status
 
@@ -110,12 +136,12 @@ When set, the Backup CRD will be automatically deleted after the specified durat
 | `specHash` | string | Hash of spec (prevents re-runs on same config) |
 | `jobName` | string | Name of the Kubernetes Job |
 | `runId` | string | Unique run identifier |
-| `path` | string | Full path to the backup file in storage |
+| `path` | string | Full path to the backup file produced by the current run |
 | `size` | string | Backup file size (human-readable, e.g., `15.2 MiB`) |
 | `duration` | string | Time taken to complete backup (e.g., `12s`) |
 | `startedAt` | time | When backup started |
 | `completedAt` | time | When backup completed |
-| `observedGeneration` | int64 | Which spec version has been processed |
+| `observedGeneration` | int64 | The spec generation the current run started with |
 | `failureReason` | string | Machine-readable failure reason (e.g., `BackoffLimitExceeded`) |
 | `failureMessage` | string | Detailed failure message |
 | `failedAttempts` | int | Number of failed Job attempts |
@@ -137,7 +163,7 @@ When set, the Backup CRD will be automatically deleted after the specified durat
 3. **Create Job:** Controller creates a Kubernetes Job with name `backup-<name>-<runID>`
 4. **Execute pg_dump:** Job runs `pg_dump` → compresses → uploads to storage
 5. **Update Status:** Controller updates Backup status with path, size, duration
-6. **Optional Cleanup:** If TTL set, Backup CRD auto-deletes after completion
+6. **Job Cleanup:** Kubernetes deletes the finished Job once `ttlAfterCompletion` elapses
 
 ### Idempotency
 
@@ -145,7 +171,9 @@ The controller computes a `specHash` of your spec. If you apply the same Backup 
 - Same spec → no new backup (idempotent)
 - Changed spec → new backup runs
 
-This prevents accidental duplicate backups in GitOps workflows.
+This prevents accidental duplicate backups in GitOps workflows. Any field of the spec counts, so re-applying an unchanged manifest is free no matter how often your GitOps tool syncs it.
+
+To re-run on purpose from an unchanged manifest, change [`trigger`](#trigger).
 
 ### Throttling
 
@@ -207,7 +235,7 @@ spec:
   filenameTemplate: "pre-migration-{{ .Timestamp }}-{{ .RunID }}.sql.gz"
 ```
 
-### Temporary Backup with TTL
+### Short Job Retention
 
 ```yaml
 apiVersion: dbtether.io/v1alpha1
@@ -220,7 +248,7 @@ spec:
     name: test-db
   storageRef:
     name: dev-backups
-  ttlAfterCompletion: 1h  # Auto-delete after 1 hour
+  ttlAfterCompletion: 1h  # Keep the finished Job for 1 hour
 ```
 
 ### Cross-namespace Database Reference
@@ -299,13 +327,6 @@ When uploading to S3, the operator adds metadata tags (best-effort):
    ```bash
    kubectl logs -n dbtether deployment/dbtether -f
    ```
-
-### Phase: Failed, message: "Job already exists"
-
-This can happen on race conditions. The controller will:
-1. Find existing Job by labels
-2. Update Backup status from Job status
-3. Resolve automatically on next reconcile
 
 ### Phase: Failed, message: "backup throttled"
 

@@ -124,7 +124,7 @@ func (r *RestoreReconciler) ensureFinalizer(ctx context.Context, restore *databa
 	if err := r.Update(ctx, restore); err != nil {
 		return ctrl.Result{}, true, err
 	}
-	return ctrl.Result{Requeue: true}, true, nil
+	return ctrl.Result{RequeueAfter: finalizerRequeueDelay}, true, nil
 }
 
 func (r *RestoreReconciler) isAlreadyProcessed(restore *databasesv1alpha1.Restore, specHash string, logger logr.Logger) bool {
@@ -147,6 +147,9 @@ func (r *RestoreReconciler) createRestoreJob(
 	// Resolve source path
 	sourcePath, storageRef, err := r.resolveSource(ctx, restore)
 	if err != nil {
+		if isDependencyNotReady(err) {
+			return r.updateStatus(ctx, restore, "Pending", fmt.Sprintf("waiting for source: %v", err), specHash)
+		}
 		return r.updateStatus(ctx, restore, "Failed", fmt.Sprintf("failed to resolve source: %v", err), specHash)
 	}
 
@@ -250,7 +253,10 @@ func (r *RestoreReconciler) resolveFromBackupRef(
 		return "", "", fmt.Errorf("backup not found: %w", err)
 	}
 
-	if backup.Status.Phase != "Completed" {
+	switch backup.Status.Phase {
+	case "", "Pending", "Running":
+		return "", "", newDependencyNotReady("backup %s is not completed yet (phase: %s)", ref.Name, backup.Status.Phase)
+	case "Failed":
 		return "", "", fmt.Errorf("backup is not completed (phase: %s)", backup.Status.Phase)
 	}
 
@@ -331,7 +337,10 @@ func (r *RestoreReconciler) buildRestoreJob(
 	env := r.buildEnvVars(db, cluster, storage, sourcePath, restore.Spec.OnConflict)
 
 	backoffLimit := int32(0)
-	ttlSeconds := int32(3600) // 1 hour
+	ttlSeconds := int32(3600)
+	if restore.Spec.TTLAfterCompletion != nil {
+		ttlSeconds = int32(restore.Spec.TTLAfterCompletion.Seconds())
+	}
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{

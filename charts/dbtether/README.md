@@ -16,6 +16,16 @@ A Kubernetes operator for managing PostgreSQL databases in external clusters (AW
 helm upgrade -i dbtether oci://ghcr.io/certainty3452/charts/dbtether -n dbtether --create-namespace
 ```
 
+## Upgrading
+
+Helm installs the CRDs from `crds/` once and never upgrades them on subsequent `helm upgrade` runs (this is a Helm limitation, not specific to this chart). Before upgrading, apply the new chart version's CRDs directly:
+
+```bash
+helm show crds oci://ghcr.io/certainty3452/charts/dbtether --version <chart version> | kubectl apply --server-side --force-conflicts -f -
+```
+
+kubectl 1.27 and newer rejects an unknown field, older clients drop it silently; `--force-conflicts` is needed because the CRD fields are owned by Helm.
+
 ## CRDs Overview
 
 | CRD | Description |
@@ -136,7 +146,7 @@ spec:
 |-----------|-------------|---------|
 | `replicaCount` | Number of operator replicas | `1` |
 | `image.repository` | Operator image | `ghcr.io/certainty3452/dbtether` |
-| `image.tag` | Image tag | `0.7.0` |
+| `image.tag` | Image tag | `0.8.0` |
 | `resources.requests.cpu` | CPU request | `100m` |
 | `resources.requests.memory` | Memory request | `128Mi` |
 | `resources.limits.cpu` | CPU limit | `500m` |

@@ -74,5 +74,5 @@ spec:
     databaseRef:
       name: dev-database
   onConflict: drop
-  ttlAfterCompletion: 1h  # Auto-delete Restore CRD after 1 hour
+  ttlAfterCompletion: 1h  # Keep the finished restore Job for 1 hour (Job TTL, not CR deletion)
 

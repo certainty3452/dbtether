@@ -35,6 +35,10 @@ const (
 	DefaultMaxConcurrentJobsPerCluster = 3
 	// RequeueDelayWhenThrottled is how long to wait before retrying when job limit is reached
 	RequeueDelayWhenThrottled = 30 * time.Second
+	// finalizerRequeueDelay backstops the watch event from the finalizer Update in case it lags.
+	finalizerRequeueDelay = 1 * time.Second
+	// rerunRequeueDelay starts a pending re-run without relying on our own status patch to enqueue one.
+	rerunRequeueDelay = 1 * time.Second
 )
 
 // Label keys for backup resources
@@ -42,6 +46,7 @@ const (
 	LabelBackupName      = "dbtether.io/backup"
 	LabelBackupNamespace = "dbtether.io/backup-namespace"
 	LabelCluster         = "dbtether.io/cluster"
+	LabelSpecHash        = "dbtether.io/spec-hash"
 )
 
 type BackupReconciler struct {
@@ -103,28 +108,29 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Handle deletion - cleanup Job via finalizer
 	if !backup.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, &backup)
 	}
 
-	// Ensure finalizer
 	if result, done, err := r.ensureFinalizer(ctx, &backup); done {
 		return result, err
 	}
 
 	specHash := r.computeSpecHash(&backup)
 
-	// Skip if already processed
-	if r.isAlreadyProcessed(&backup, specHash, logger) {
+	alreadyProcessed, err := r.isAlreadyProcessed(ctx, &backup, specHash, logger)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if alreadyProcessed {
 		return ctrl.Result{}, nil
 	}
 
 	logger.V(1).Info("reconciling backup", "database", backup.Spec.DatabaseRef.Name)
 
-	// If Job already created, just check its status
-	if backup.Status.JobName != "" {
-		return r.checkJobStatus(ctx, &backup, specHash)
+	// Status tracks exactly one run, so a run in flight has to finish before the next one starts.
+	if backup.Status.Phase == "Running" {
+		return r.checkJobStatus(ctx, &backup, backup.Status.SpecHash)
 	}
 
 	return r.createBackupJobIfAllowed(ctx, &backup, specHash, logger)
@@ -138,75 +144,95 @@ func (r *BackupReconciler) ensureFinalizer(ctx context.Context, backup *database
 	if err := r.Update(ctx, backup); err != nil {
 		return ctrl.Result{}, true, err
 	}
-	return ctrl.Result{Requeue: true}, true, nil
+	return ctrl.Result{RequeueAfter: finalizerRequeueDelay}, true, nil
 }
 
-func (r *BackupReconciler) isAlreadyProcessed(backup *databasesv1alpha1.Backup, specHash string, logger logr.Logger) bool {
+func (r *BackupReconciler) isAlreadyProcessed(ctx context.Context, backup *databasesv1alpha1.Backup, specHash string, logger logr.Logger) (bool, error) {
 	if backup.Status.Phase == "" || backup.Status.SpecHash != specHash {
-		return false
+		return false, nil
 	}
-	if backup.Status.Phase == "Completed" || backup.Status.Phase == "Failed" {
-		logger.V(1).Info("backup already processed", "phase", backup.Status.Phase)
-		return true
+	if !runFinished(backup) {
+		return false, nil
 	}
-	return false
+	logger.V(1).Info("backup already processed", "phase", backup.Status.Phase)
+
+	// A no-op spec edit (same hash) still bumps Generation; catch observedGeneration up or a health check keyed on it stays Progressing forever.
+	if backup.Generation != backup.Status.ObservedGeneration {
+		patch := client.MergeFrom(backup.DeepCopy())
+		backup.Status.ObservedGeneration = backup.Generation
+		if err := r.Status().Patch(ctx, backup, patch); err != nil {
+			return true, err
+		}
+	}
+
+	return true, nil
+}
+
+func runFinished(backup *databasesv1alpha1.Backup) bool {
+	return backup.Status.Phase == "Completed" || backup.Status.Phase == "Failed"
 }
 
 func (r *BackupReconciler) createBackupJobIfAllowed(ctx context.Context, backup *databasesv1alpha1.Backup, specHash string, logger logr.Logger) (ctrl.Result, error) {
-	// FIRST: Check if job already exists by labels (prevents race condition with duplicate jobs)
-	existingJob, err := r.findExistingJob(ctx, backup)
+	// Checked by labels first to avoid a duplicate Job on a race with another reconcile.
+	existingJob, err := r.findExistingJob(ctx, backup, specHash)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if existingJob != nil {
-		// Job already exists - update status and evaluate
 		logger.V(1).Info("job already exists, using existing", "job", existingJob.Name)
-		runID := r.extractRunIDFromJobName(existingJob.Name, backup.Name)
-		if _, err := r.updateStatusWithJobAndRunID(ctx, backup, "Running", "backup job running", specHash, existingJob.Name, runID); err != nil {
-			return ctrl.Result{}, err
-		}
-		return r.evaluateJobStatus(ctx, backup, existingJob, specHash)
+		return r.adoptExistingJob(ctx, backup, existingJob, specHash)
 	}
 
-	// Get all required resources for job creation
 	db, cluster, storage, err := r.getResources(ctx, backup)
 	if err != nil {
-		// Dependencies may simply not be applied/ready yet under GitOps ordering;
-		// keep the backup pending and retry rather than burning it as terminally Failed.
+		// GitOps applies manifests out of order, so a missing dependency retries instead of failing terminally.
 		if isDependencyNotReady(err) {
-			return r.updateStatus(ctx, backup, "Pending", err.Error(), specHash)
+			return r.markPending(ctx, backup, specHash, err.Error())
 		}
 		return ctrl.Result{}, err
 	}
 
-	// Check throttling
 	if result, throttled := r.checkThrottling(ctx, backup, cluster.Name, specHash, logger); throttled {
 		return result, nil
 	}
 
-	// Generate RunID for this backup run (only if no existing job)
 	runID := generateRunID()
 
-	// Create Job
-	job, err := r.createBackupJob(ctx, backup, db, cluster, storage, runID)
+	job, err := r.createBackupJob(ctx, backup, db, cluster, storage, runID, specHash)
 	if err != nil {
 		return r.handleJobCreationError(ctx, backup, specHash, err, logger)
 	}
 
 	logger.Info("backup job created", "job", job.Name, "runId", runID)
 
-	// Emit start event
 	if r.Recorder != nil {
 		eventMessage := fmt.Sprintf("Started backup job %s for database %s",
 			job.Name, backup.Spec.DatabaseRef.Name)
 		r.Recorder.Event(backup, corev1.EventTypeNormal, EventReasonBackupStarted, eventMessage)
 	}
 
-	return r.updateStatusWithJobAndRunID(ctx, backup, "Running", "backup job started", specHash, job.Name, runID)
+	return r.startRun(ctx, backup, "backup job started", specHash, job.Name, runID, backup.Generation)
 }
 
-// findExistingJob looks for an existing job by backup labels
-func (r *BackupReconciler) findExistingJob(ctx context.Context, backup *databasesv1alpha1.Backup) (*batchv1.Job, error) {
+// adoptExistingJob keeps the run's own spec hash/generation so an older spec's job cannot claim the current generation.
+func (r *BackupReconciler) adoptExistingJob(ctx context.Context, backup *databasesv1alpha1.Backup,
+	job *batchv1.Job, specHash string) (ctrl.Result, error) {
+
+	runHash := job.Labels[LabelSpecHash]
+	generation := backup.Status.ObservedGeneration
+	if runHash == "" || runHash == specHash {
+		runHash = specHash
+		generation = backup.Generation
+	}
+
+	if _, err := r.startRun(ctx, backup, "backup job running", runHash, job.Name, runIDFromJob(job), generation); err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.evaluateJobStatus(ctx, backup, job)
+}
+
+// findExistingJob returns this spec's unfinished job, else any other unfinished one; a finished job never re-reports its result.
+func (r *BackupReconciler) findExistingJob(ctx context.Context, backup *databasesv1alpha1.Backup, specHash string) (*batchv1.Job, error) {
 	var jobs batchv1.JobList
 	if err := r.List(ctx, &jobs, client.InNamespace(r.Namespace), client.MatchingLabels{
 		LabelBackupName:      backup.Name,
@@ -215,18 +241,39 @@ func (r *BackupReconciler) findExistingJob(ctx context.Context, backup *database
 		return nil, err
 	}
 
-	if len(jobs.Items) == 0 {
-		return nil, nil
+	var active *batchv1.Job
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if jobFinished(job) {
+			continue
+		}
+		if job.Labels[LabelSpecHash] == specHash {
+			return job, nil
+		}
+		if active == nil {
+			active = job
+		}
 	}
 
-	return &jobs.Items[0], nil
+	return active, nil
 }
 
-// extractRunIDFromJobName extracts RunID from job name format: backup-{backupName}-{runID}
-func (r *BackupReconciler) extractRunIDFromJobName(jobName, backupName string) string {
-	prefix := fmt.Sprintf("backup-%s-", backupName)
-	if len(jobName) > len(prefix) {
-		return jobName[len(prefix):]
+func jobFinished(job *batchv1.Job) bool {
+	if job.Status.Succeeded > 0 {
+		return true
+	}
+	_, failed := isJobFailed(job)
+	return failed
+}
+
+// runIDFromJob reads the run id the job itself carries; a job created elsewhere may have none.
+func runIDFromJob(job *batchv1.Job) string {
+	for i := range job.Spec.Template.Spec.Containers {
+		for _, env := range job.Spec.Template.Spec.Containers[i].Env {
+			if env.Name == "RUN_ID" {
+				return env.Value
+			}
+		}
 	}
 	return ""
 }
@@ -241,7 +288,7 @@ func (r *BackupReconciler) checkThrottling(ctx context.Context, backup *database
 	if activeJobs >= maxConcurrent {
 		logger.Info("throttling: too many concurrent backup jobs for cluster",
 			"cluster", clusterName, "active", activeJobs, "max", maxConcurrent)
-		result, _ := r.updateStatus(ctx, backup, "Pending", fmt.Sprintf("waiting for other backups to complete (active: %d/%d)", activeJobs, maxConcurrent), specHash)
+		result, _ := r.markPending(ctx, backup, specHash, fmt.Sprintf("waiting for other backups to complete (active: %d/%d)", activeJobs, maxConcurrent))
 		return result, true
 	}
 	return ctrl.Result{}, false
@@ -249,13 +296,23 @@ func (r *BackupReconciler) checkThrottling(ctx context.Context, backup *database
 
 func (r *BackupReconciler) handleJobCreationError(ctx context.Context, backup *databasesv1alpha1.Backup, specHash string, err error, logger logr.Logger) (ctrl.Result, error) {
 	if errors.IsAlreadyExists(err) {
-		logger.V(1).Info("job already exists, checking status")
-		return r.findJobByLabels(ctx, backup, specHash)
+		// No status write: the next reconcile's findExistingJob adopts it by labels.
+		logger.V(1).Info("job already exists, adopting on next reconcile")
+		return ctrl.Result{RequeueAfter: rerunRequeueDelay}, nil
+	}
+	if errors.IsInvalid(err) {
+		logger.Error(err, "backup job spec rejected by the API server")
+		return r.markFailed(ctx, backup, specHash, "InvalidJobSpec", err.Error())
 	}
 	logger.Error(err, "failed to create backup job")
-	return r.updateStatus(ctx, backup, "Failed", fmt.Sprintf("failed to create job: %s", err.Error()), specHash)
+	// Job creation failure says nothing about the backup itself; the returned error drives controller-runtime's backoff.
+	if _, statusErr := r.markPending(ctx, backup, specHash, fmt.Sprintf("failed to create job: %s", err.Error())); statusErr != nil {
+		return ctrl.Result{}, statusErr
+	}
+	return ctrl.Result{}, err
 }
 
+// computeSpecHash: a changed output re-runs every Backup in the fleet after an upgrade; see TestComputeSpecHash_Golden.
 func (r *BackupReconciler) computeSpecHash(backup *databasesv1alpha1.Backup) string {
 	data, _ := json.Marshal(backup.Spec) //nolint:errcheck // hash doesn't need to be perfect
 	hash := sha256.Sum256(data)
@@ -333,8 +390,7 @@ func (r *BackupReconciler) countActiveJobsForCluster(ctx context.Context, cluste
 
 	active := 0
 	for i := range jobs.Items {
-		job := &jobs.Items[i]
-		if job.Status.Succeeded == 0 && job.Status.Failed == 0 {
+		if !jobFinished(&jobs.Items[i]) {
 			active++
 		}
 	}
@@ -391,7 +447,8 @@ func (r *BackupReconciler) getResources(ctx context.Context, backup *databasesv1
 
 //nolint:funlen // Job creation requires many fields - splitting would reduce readability
 func (r *BackupReconciler) createBackupJob(ctx context.Context, backup *databasesv1alpha1.Backup,
-	db *databasesv1alpha1.Database, cluster *databasesv1alpha1.DBCluster, storage *databasesv1alpha1.BackupStorage, runID string) (*batchv1.Job, error) {
+	db *databasesv1alpha1.Database, cluster *databasesv1alpha1.DBCluster, storage *databasesv1alpha1.BackupStorage,
+	runID, specHash string) (*batchv1.Job, error) {
 
 	jobName := fmt.Sprintf("backup-%s-%s", backup.Name, runID)
 
@@ -447,23 +504,23 @@ func (r *BackupReconciler) createBackupJob(ctx context.Context, backup *database
 		LabelBackupName:      backup.Name,
 		LabelBackupNamespace: backup.Namespace,
 		LabelCluster:         cluster.Name,
+		LabelSpecHash:        specHash,
 	}
 
-	// Build job labels: required + Helm values (backup.jobLabels)
+	// Required labels are applied last so a user-supplied Helm value cannot override them.
 	jobLabels := make(map[string]string)
-	for k, v := range requiredLabels {
-		jobLabels[k] = v
-	}
 	for k, v := range r.JobLabels {
 		jobLabels[k] = v
 	}
-
-	// Build pod labels: required + Helm values (backup.podLabels)
-	podLabels := make(map[string]string)
 	for k, v := range requiredLabels {
+		jobLabels[k] = v
+	}
+
+	podLabels := make(map[string]string)
+	for k, v := range r.PodLabels {
 		podLabels[k] = v
 	}
-	for k, v := range r.PodLabels {
+	for k, v := range requiredLabels {
 		podLabels[k] = v
 	}
 
@@ -568,24 +625,20 @@ func (r *BackupReconciler) getStorageEnv(storage *databasesv1alpha1.BackupStorag
 func (r *BackupReconciler) checkJobStatus(ctx context.Context, backup *databasesv1alpha1.Backup,
 	specHash string) (ctrl.Result, error) {
 
-	// Find job by name or labels
+	// Reconcile only calls this with Phase Running, which startRun always pairs with a JobName.
 	var job batchv1.Job
-	if backup.Status.JobName != "" {
-		if err := r.Get(ctx, types.NamespacedName{
-			Name:      backup.Status.JobName,
-			Namespace: r.Namespace,
-		}, &job); err != nil {
-			if errors.IsNotFound(err) {
-				// Job might have been cleaned by TTL, check by labels
-				return r.findJobByLabels(ctx, backup, specHash)
-			}
-			return ctrl.Result{}, err
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      backup.Status.JobName,
+		Namespace: r.Namespace,
+	}, &job); err != nil {
+		if errors.IsNotFound(err) {
+			// Job might have been cleaned by TTL, check by labels
+			return r.findJobByLabels(ctx, backup, specHash)
 		}
-	} else {
-		return r.findJobByLabels(ctx, backup, specHash)
+		return ctrl.Result{}, err
 	}
 
-	return r.evaluateJobStatus(ctx, backup, &job, specHash)
+	return r.evaluateJobStatus(ctx, backup, &job)
 }
 
 func (r *BackupReconciler) findJobByLabels(ctx context.Context, backup *databasesv1alpha1.Backup,
@@ -595,50 +648,42 @@ func (r *BackupReconciler) findJobByLabels(ctx context.Context, backup *database
 	if err := r.List(ctx, &jobs, client.InNamespace(r.Namespace), client.MatchingLabels{
 		LabelBackupName:      backup.Name,
 		LabelBackupNamespace: backup.Namespace,
+		LabelSpecHash:        specHash,
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	if len(jobs.Items) == 0 {
-		// Job may not be visible yet due to cache propagation right after creation.
-		// If backup was started recently, requeue instead of failing immediately.
+		// Cache propagation can lag right after creation; requeue instead of failing immediately.
 		if backup.Status.StartedAt != nil {
 			age := time.Since(backup.Status.StartedAt.Time)
 			if age < 90*time.Second {
 				return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 			}
 		}
-		return r.updateStatus(ctx, backup, "Failed", "backup job not found", specHash)
+		return r.updateStatusJobLost(ctx, backup)
 	}
 
 	// Use the most recent job
 	job := &jobs.Items[0]
 
-	// Update JobName in status if not set, then evaluate status
-	if backup.Status.JobName == "" {
-		// First update JobName, then evaluate - this handles race condition
-		if _, err := r.updateStatusWithJob(ctx, backup, "Running", "backup job running", specHash, job.Name); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
-
-	return r.evaluateJobStatus(ctx, backup, job, specHash)
+	return r.evaluateJobStatus(ctx, backup, job)
 }
 
 func (r *BackupReconciler) evaluateJobStatus(ctx context.Context, backup *databasesv1alpha1.Backup,
-	job *batchv1.Job, specHash string) (ctrl.Result, error) {
+	job *batchv1.Job) (ctrl.Result, error) {
 
 	if job.Status.Succeeded > 0 {
-		return r.updateStatusCompleted(ctx, backup, job, specHash)
+		return r.updateStatusCompleted(ctx, backup, job)
 	}
 
-	if _, failed := r.isJobFailed(job); failed {
+	if _, failed := isJobFailed(job); failed {
 		// Update Job TTL for failed jobs if TTLSecondsAfterFailed is configured
 		if err := r.updateFailedJobTTL(ctx, backup, job); err != nil {
 			log.FromContext(ctx).Error(err, "failed to update TTL for failed job")
 		}
 		failureInfo := r.getJobFailureInfo(job)
-		return r.updateStatusFailedWithInfo(ctx, backup, job, specHash, failureInfo)
+		return r.updateStatusFailedWithInfo(ctx, backup, job, failureInfo)
 	}
 
 	// Still running - track pod name while pod exists
@@ -662,9 +707,8 @@ type JobFailureInfo struct {
 	FailedAttempts int32  // Number of failed pod attempts
 }
 
-// isJobFailed checks if a Job has definitively failed by examining its conditions.
-// Returns structured failure info and whether the job has failed.
-func (r *BackupReconciler) isJobFailed(job *batchv1.Job) (string, bool) {
+// isJobFailed reports whether a Job has definitively failed, from its JobFailed condition.
+func isJobFailed(job *batchv1.Job) (string, bool) {
 	for _, c := range job.Status.Conditions {
 		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
 			reason := "backup job failed"
@@ -707,17 +751,15 @@ func (r *BackupReconciler) getJobFailureInfo(job *batchv1.Job) *JobFailureInfo {
 // updateStatusFailedWithInfo updates the Backup status to Failed with structured failure info
 // and emits a Kubernetes Event for visibility.
 func (r *BackupReconciler) updateStatusFailedWithInfo(ctx context.Context, backup *databasesv1alpha1.Backup,
-	job *batchv1.Job, specHash string, failureInfo *JobFailureInfo) (ctrl.Result, error) {
+	job *batchv1.Job, failureInfo *JobFailureInfo) (ctrl.Result, error) {
 
 	logger := log.FromContext(ctx)
 
 	patch := client.MergeFrom(backup.DeepCopy())
 
-	// Core status fields
+	// Core status fields; specHash and observedGeneration stay as recorded at run start
 	backup.Status.Phase = "Failed"
 	backup.Status.Message = fmt.Sprintf("backup job failed: %s", failureInfo.Reason)
-	backup.Status.SpecHash = specHash
-	backup.Status.ObservedGeneration = backup.Generation
 
 	// Detailed failure info
 	backup.Status.FailureReason = failureInfo.Reason
@@ -749,7 +791,35 @@ func (r *BackupReconciler) updateStatusFailedWithInfo(ctx context.Context, backu
 		"failedAttempts", failureInfo.FailedAttempts,
 		"lastPodName", backup.Status.LastPodName)
 
-	return ctrl.Result{}, nil
+	return r.rerunResult(backup), nil
+}
+
+// updateStatusJobLost ends a run whose Job vanished, keeping the stamps recorded at run start.
+func (r *BackupReconciler) updateStatusJobLost(ctx context.Context, backup *databasesv1alpha1.Backup) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	patch := client.MergeFrom(backup.DeepCopy())
+	now := metav1.Now()
+
+	backup.Status.Phase = "Failed"
+	backup.Status.Message = "backup job not found"
+	backup.Status.FailureReason = "JobNotFound"
+	backup.Status.FailureMessage = "the backup job disappeared before its result was recorded"
+	backup.Status.CompletedAt = &now
+
+	if err := r.Status().Patch(ctx, backup, patch); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if r.Recorder != nil {
+		r.Recorder.Event(backup, corev1.EventTypeWarning, EventReasonBackupFailed, backup.Status.FailureMessage)
+	}
+
+	logger.Info("backup failed",
+		"reason", backup.Status.FailureReason,
+		"message", backup.Status.FailureMessage)
+
+	return r.rerunResult(backup), nil
 }
 
 // getLastPodName tries to find the name of the last pod that ran for this job
@@ -780,65 +850,95 @@ func (r *BackupReconciler) getLastPodName(ctx context.Context, job *batchv1.Job)
 	return ""
 }
 
-func (r *BackupReconciler) updateStatus(ctx context.Context, backup *databasesv1alpha1.Backup,
-	phase, message, specHash string) (ctrl.Result, error) {
-
-	return r.updateStatusWithJob(ctx, backup, phase, message, specHash, backup.Status.JobName)
-}
-
-func (r *BackupReconciler) updateStatusWithJob(ctx context.Context, backup *databasesv1alpha1.Backup,
-	phase, message, specHash, jobName string) (ctrl.Result, error) {
-
-	return r.updateStatusWithJobAndRunID(ctx, backup, phase, message, specHash, jobName, backup.Status.RunID)
-}
-
-func (r *BackupReconciler) updateStatusWithJobAndRunID(ctx context.Context, backup *databasesv1alpha1.Backup,
-	phase, message, specHash, jobName, runID string) (ctrl.Result, error) {
+// startRun resets the whole status so a re-run never reports the earlier run's file or failure.
+func (r *BackupReconciler) startRun(ctx context.Context, backup *databasesv1alpha1.Backup,
+	message, specHash, jobName, runID string, generation int64) (ctrl.Result, error) {
 
 	patch := client.MergeFrom(backup.DeepCopy())
-	backup.Status.Phase = phase
-	backup.Status.Message = message
-	backup.Status.SpecHash = specHash
-	backup.Status.JobName = jobName
-	backup.Status.RunID = runID
-	backup.Status.ObservedGeneration = backup.Generation
-
 	now := metav1.Now()
-	if phase == "Running" && backup.Status.StartedAt == nil {
-		backup.Status.StartedAt = &now
-	}
-	if phase == "Completed" || phase == "Failed" {
-		backup.Status.CompletedAt = &now
+
+	backup.Status = databasesv1alpha1.BackupStatus{
+		Phase:              "Running",
+		Message:            message,
+		SpecHash:           specHash,
+		JobName:            jobName,
+		RunID:              runID,
+		StartedAt:          &now,
+		ObservedGeneration: generation,
 	}
 
 	if err := r.Status().Patch(ctx, backup, patch); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if phase == "Running" {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// markPending resets the status like startRun does, but without a Job.
+func (r *BackupReconciler) markPending(ctx context.Context, backup *databasesv1alpha1.Backup,
+	specHash, message string) (ctrl.Result, error) {
+
+	patch := client.MergeFrom(backup.DeepCopy())
+
+	backup.Status = databasesv1alpha1.BackupStatus{
+		Phase:              "Pending",
+		Message:            message,
+		SpecHash:           specHash,
+		ObservedGeneration: backup.Generation,
 	}
 
-	if phase == "Pending" {
-		return ctrl.Result{RequeueAfter: RequeueDelayWhenThrottled}, nil
+	if err := r.Status().Patch(ctx, backup, patch); err != nil {
+		return ctrl.Result{}, err
 	}
+
+	return ctrl.Result{RequeueAfter: RequeueDelayWhenThrottled}, nil
+}
+
+// markFailed ends the run terminally: retrying an unchanged spec the API server already rejected would only repeat the rejection.
+func (r *BackupReconciler) markFailed(ctx context.Context, backup *databasesv1alpha1.Backup,
+	specHash, reason, message string) (ctrl.Result, error) {
+
+	logger := log.FromContext(ctx)
+
+	patch := client.MergeFrom(backup.DeepCopy())
+	now := metav1.Now()
+
+	backup.Status = databasesv1alpha1.BackupStatus{
+		Phase:              "Failed",
+		Message:            fmt.Sprintf("failed to create job: %s", message),
+		SpecHash:           specHash,
+		ObservedGeneration: backup.Generation,
+		FailureReason:      reason,
+		FailureMessage:     message,
+		CompletedAt:        &now,
+	}
+
+	if err := r.Status().Patch(ctx, backup, patch); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if r.Recorder != nil {
+		r.Recorder.Event(backup, corev1.EventTypeWarning, EventReasonBackupFailed, backup.Status.FailureMessage)
+	}
+
+	logger.Info("backup failed",
+		"reason", backup.Status.FailureReason,
+		"message", backup.Status.FailureMessage)
 
 	return ctrl.Result{}, nil
 }
 
 // updateStatusCompleted handles completed job status update including job annotations
 func (r *BackupReconciler) updateStatusCompleted(ctx context.Context, backup *databasesv1alpha1.Backup,
-	job *batchv1.Job, specHash string) (ctrl.Result, error) {
+	job *batchv1.Job) (ctrl.Result, error) {
 
 	logger := log.FromContext(ctx)
 
 	patch := client.MergeFrom(backup.DeepCopy())
 
-	// Core status fields
+	// Core status fields; specHash and observedGeneration stay as recorded at run start
 	backup.Status.Phase = "Completed"
 	backup.Status.Message = "backup completed successfully"
-	backup.Status.SpecHash = specHash
-	backup.Status.ObservedGeneration = backup.Generation
 
 	now := metav1.Now()
 	backup.Status.CompletedAt = &now
@@ -872,7 +972,15 @@ func (r *BackupReconciler) updateStatusCompleted(ctx context.Context, backup *da
 		"size", backup.Status.Size,
 		"duration", backup.Status.Duration)
 
-	return ctrl.Result{}, nil
+	return r.rerunResult(backup), nil
+}
+
+// rerunResult requeues a fresh run when the spec changed while this run's Job was executing.
+func (r *BackupReconciler) rerunResult(backup *databasesv1alpha1.Backup) ctrl.Result {
+	if r.computeSpecHash(backup) != backup.Status.SpecHash {
+		return ctrl.Result{RequeueAfter: rerunRequeueDelay}
+	}
+	return ctrl.Result{}
 }
 
 // updateFailedJobTTL updates the TTL of a failed job to allow longer retention for debugging

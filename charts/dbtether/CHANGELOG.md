@@ -2,6 +2,21 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.8.0] - 2026-09-03
+
+### Added
+- Backups can be re-run on demand by changing `spec.trigger`, for backup-before-deploy from GitOps
+
+### Fixed
+- A changed backup spec never started a new run; a change during a run now waits for it
+- Restore from a backup that is still running waits for it instead of failing
+- Transient errors while creating the backup Job are retried; an invalid Job spec fails with reason `InvalidJobSpec`
+- Restore `ttlAfterCompletion` had no effect
+
+### Changed
+- `ttlAfterCompletion` is the TTL of the finished Job; the resource itself is never deleted (documentation)
+- The Backup CRD changed; apply the CRDs before `helm upgrade` (see README, Upgrading)
+
 ## [0.7.0] - 2026-07-31
 
 ### Breaking

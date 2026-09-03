@@ -2,8 +2,8 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.7.0
-appVersion: "0.7.0"
+version: 0.8.0
+appVersion: "0.8.0"
 home: https://github.com/certainty3452/dbtether
 # icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
@@ -127,6 +127,7 @@ annotations:
         storageRef:
           name: company-s3
         ttlAfterCompletion: 1h
+        trigger: "v1.2.3"
     - apiVersion: dbtether.io/v1alpha1
       kind: BackupSchedule
       metadata:
@@ -158,25 +159,17 @@ annotations:
             name: orders-db-restored
         onConflict: drop
   artifacthub.io/changes: |
-    - kind: changed
-      description: "Breaking: a restore target in another namespace is now rejected"
     - kind: added
-      description: "Restores bring back database user access before reporting completion"
+      description: "Backups can be re-run on demand by changing `spec.trigger`, for backup-before-deploy from GitOps"
     - kind: fixed
-      description: "Users lost access to a database after it was restored from a backup"
+      description: "A changed backup spec never started a new run; a change during a run now waits for it"
     - kind: fixed
-      description: "A restore could get stuck forever when user access could not be restored; it now completes with a warning"
+      description: "Restore from a backup that is still running waits for it instead of failing"
     - kind: fixed
-      description: "Rare connection leak on first-time connections to a cluster"
+      description: "Transient errors while creating the backup Job are retried; an invalid Job spec fails with reason `InvalidJobSpec`"
     - kind: fixed
-      description: "Backups no longer fail permanently when a dependency is briefly unavailable"
-    - kind: fixed
-      description: "Restores work with static S3 credentials and can no longer run twice in parallel"
-    - kind: fixed
-      description: "deletionPolicy: Delete retries until the database/user is actually dropped, instead of silently leaving it behind"
-    - kind: fixed
-      description: "Password rotation never fired after initial setup; it does now"
-    - kind: fixed
-      description: "Failed privilege grants are surfaced and retried instead of reported as Ready"
-    - kind: fixed
-      description: "From-source RBAC manifests were missing required permissions (Helm installs unaffected)"
+      description: "Restore `ttlAfterCompletion` had no effect"
+    - kind: changed
+      description: "`ttlAfterCompletion` is the TTL of the finished Job; the resource itself is never deleted (documentation)"
+    - kind: changed
+      description: "The Backup CRD changed; apply the CRDs before `helm upgrade` (see README, Upgrading)"

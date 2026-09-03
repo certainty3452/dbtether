@@ -204,6 +204,7 @@ See full documentation in [docs/](docs/README.md):
 - `spec.databaseRef.name` - Name of Database to backup (required)
 - `spec.storageRef.name` - Name of BackupStorage (required)
 - `spec.filenameTemplate` - Filename template (default: `{{ .Timestamp }}.sql.gz`)
+- `spec.trigger` - Opaque value that only feeds the spec hash; change it to run the backup again
 - `spec.ttlAfterCompletion` - Job auto-cleanup duration (default: 1h)
 
 **BackupSchedule:**
@@ -222,7 +223,7 @@ See full documentation in [docs/](docs/README.md):
 - `spec.source.storageRef.name` - BackupStorage for direct path
 - `spec.target.databaseRef.name` - Target Database to restore into (required)
 - `spec.onConflict` - `fail` (default), `drop`, or `overwrite`
-- `spec.ttlAfterCompletion` - Auto-cleanup duration
+- `spec.ttlAfterCompletion` - Job auto-cleanup duration (default: 1h)
 
 ## Required permissions and security implications
 
