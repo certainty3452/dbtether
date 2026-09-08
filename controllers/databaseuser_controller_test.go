@@ -2510,6 +2510,9 @@ func TestDatabaseUserReconciler_ReassignOwnershipForRemovedDatabases(t *testing.
 				MockClient:          postgres.NewMockClient(),
 				reassignedDatabases: make([]string, 0),
 			}
+			if err := mockPG.CreateUser(ctx, "test_user", "pwd"); err != nil {
+				t.Fatalf("CreateUser() error = %v", err)
+			}
 
 			user := &databasesv1alpha1.DatabaseUser{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-user", Namespace: "default"},
@@ -2520,6 +2523,15 @@ func TestDatabaseUserReconciler_ReassignOwnershipForRemovedDatabases(t *testing.
 
 			r := &DatabaseUserReconciler{}
 			r.reassignOwnershipForRemovedDatabases(ctx, mockPG, user, "test_user", tt.currentDBNames)
+
+			wantMembershipCalls := 0
+			if len(tt.expectReassign) > 0 {
+				wantMembershipCalls = 1
+			}
+			if mockPG.EnsureRoleMembershipCalls != wantMembershipCalls {
+				t.Errorf("EnsureRoleMembership called %d times, want %d",
+					mockPG.EnsureRoleMembershipCalls, wantMembershipCalls)
+			}
 
 			// Verify correct databases had ReassignOwnership called
 			if len(mockPG.reassignedDatabases) != len(tt.expectReassign) {

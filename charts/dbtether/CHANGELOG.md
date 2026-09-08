@@ -2,6 +2,16 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.8.1] - 2026-09-08
+
+### Fixed
+- `owner` users could not modify types, views or functions after a restore; ownership of tables, sequences, views, materialized views, types and routines in `public` is transferred now
+- Ownership transfer touched every table on each reconcile, taking locks for nothing; only objects not yet owned are altered, and a transfer blocked by a long transaction stops and resumes on the next reconcile instead of holding up every query on the table
+
+### Changed
+- The operator grants itself membership in an `owner` user's role before transferring ownership and before reassigning it on deletion
+- `DB_SSLMODE` applies to the operator's own connections as well as to backup and restore Jobs
+
 ## [0.8.0] - 2026-09-03
 
 ### Added

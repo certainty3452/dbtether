@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"os"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -41,5 +42,14 @@ func GetPostgresClient(
 		Username: username,
 		Password: password,
 		Database: "postgres",
+		SSLMode:  OperatorSSLMode(),
 	})
+}
+
+// The one reader of DB_SSLMODE: main.go configures the backup and restore Jobs from here too.
+func OperatorSSLMode() string {
+	if mode := os.Getenv("DB_SSLMODE"); mode != "" {
+		return mode
+	}
+	return "require"
 }

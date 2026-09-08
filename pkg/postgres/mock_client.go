@@ -18,10 +18,11 @@ type MockClient struct {
 	connLimits map[string]int                  // username -> connection limit
 
 	// Counters exposed for tests that assert no-op behaviour on steady state.
-	SetConnectionLimitCalls int
-	SetRoleParameterCalls   int
-	ResetRoleParameterCalls int
-	SetPasswordCalls        int
+	SetConnectionLimitCalls   int
+	SetRoleParameterCalls     int
+	ResetRoleParameterCalls   int
+	SetPasswordCalls          int
+	EnsureRoleMembershipCalls int
 
 	Version    string
 	ShouldFail bool
@@ -397,6 +398,20 @@ func (m *MockClient) VerifyDatabaseIsolation(ctx context.Context, username, allo
 func (m *MockClient) RevokePrivilegesInDatabase(ctx context.Context, username, database string) error {
 	if m.ShouldFail {
 		return m.FailError
+	}
+	return nil
+}
+
+func (m *MockClient) EnsureRoleMembership(ctx context.Context, username string) error {
+	if m.ShouldFail {
+		return m.FailError
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.EnsureRoleMembershipCalls++
+	// pg_has_role raises 42704 on a role that is gone, so callers must check first.
+	if _, exists := m.users[username]; !exists {
+		return fmt.Errorf("role %q does not exist", username)
 	}
 	return nil
 }

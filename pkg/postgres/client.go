@@ -48,6 +48,7 @@ type Config struct {
 	Username string
 	Password string
 	Database string
+	SSLMode  string
 }
 
 type Client struct {
@@ -87,6 +88,7 @@ type ClientInterface interface {
 	VerifyDatabaseIsolation(ctx context.Context, username, allowedDatabase string) ([]string, error)
 	RevokePrivilegesInDatabase(ctx context.Context, username, database string) error
 	ReassignOwnership(ctx context.Context, fromUser, database string) error
+	EnsureRoleMembership(ctx context.Context, username string) error
 }
 
 // Ensure Client implements ClientInterface
@@ -170,10 +172,13 @@ func NewClient(ctx context.Context, config Config) (*Client, error) {
 	if config.Port == 0 {
 		config.Port = 5432
 	}
+	if config.SSLMode == "" {
+		config.SSLMode = "require"
+	}
 
 	connString := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=require",
-		config.Host, config.Port, config.Username, config.Password, config.Database,
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		config.Host, config.Port, config.Username, config.Password, config.Database, config.SSLMode,
 	)
 
 	poolConfig, err := pgxpool.ParseConfig(connString)
@@ -390,8 +395,8 @@ func (c *Client) EnsureExtensions(ctx context.Context, dbName string, extensions
 
 func (c *Client) connectToDatabase(ctx context.Context, dbName string) (*pgx.Conn, error) {
 	connString := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=require",
-		c.config.Host, c.config.Port, c.config.Username, c.config.Password, dbName,
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		c.config.Host, c.config.Port, c.config.Username, c.config.Password, dbName, c.config.SSLMode,
 	)
 	conn, err := pgx.Connect(ctx, connString)
 	if err != nil {
@@ -410,6 +415,15 @@ func isDatabaseNotExistError(err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		return pgErr.Code == "3D000"
+	}
+	return false
+}
+
+// isLockNotAvailableError checks if error is PostgreSQL "lock not available" (SQLSTATE 55P03)
+func isLockNotAvailableError(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "55P03"
 	}
 	return false
 }
@@ -673,7 +687,7 @@ func (c *Client) ApplyPrivileges(ctx context.Context, username, database, preset
 			return err
 		}
 	case "owner":
-		if err := c.applyOwnerPrivileges(ctx, conn, quotedUser); err != nil {
+		if err := c.applyOwnerPrivileges(ctx, conn, username); err != nil {
 			return err
 		}
 	}
@@ -736,79 +750,174 @@ func (c *Client) applyAdminPrivileges(ctx context.Context, conn *pgx.Conn, quote
 	return nil
 }
 
-func (c *Client) applyOwnerPrivileges(ctx context.Context, conn *pgx.Conn, quotedUser string) error {
-	// First apply admin privileges (includes readwrite)
-	if err := c.applyAdminPrivileges(ctx, conn, quotedUser); err != nil {
+func (c *Client) applyOwnerPrivileges(ctx context.Context, conn *pgx.Conn, username string) error {
+	if err := c.applyAdminPrivileges(ctx, conn, pq.QuoteIdentifier(username)); err != nil {
 		return err
 	}
 
-	// Transfer ownership of all tables in public schema
-	if err := c.transferTableOwnership(ctx, conn, quotedUser); err != nil {
-		return fmt.Errorf("failed to transfer table ownership: %w", err)
+	// After the admin grants so a refused membership leaves the user degraded to admin instead of stripped of everything.
+	if err := ensureRoleMembership(ctx, conn, username); err != nil {
+		return err
 	}
 
-	// Transfer ownership of all sequences in public schema
-	if err := c.transferSequenceOwnership(ctx, conn, quotedUser); err != nil {
-		return fmt.Errorf("failed to transfer sequence ownership: %w", err)
+	statements, err := pendingOwnershipStatements(ctx, conn, username)
+	if err != nil {
+		return fmt.Errorf("failed to list objects to transfer to %s: %w", username, err)
 	}
 
-	return nil
+	return transferOwnership(ctx, conn, statements)
 }
 
-// transferTableOwnership changes the owner of all tables in public schema to the specified user
-func (c *Client) transferTableOwnership(ctx context.Context, conn *pgx.Conn, quotedUser string) error {
-	rows, err := conn.Query(ctx, `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`)
+type sqlExecutor interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+}
+
+type sqlQuerier interface {
+	sqlExecutor
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+type ownershipStatement struct {
+	object    string
+	statement string
+}
+
+const transferLockTimeout = `SET lock_timeout = '5s'`
+
+const ownershipCatalogQuery = `
+SELECT object, statement FROM (
+	SELECT
+		format('%I.%I', n.nspname, c.relname) AS object,
+		format('ALTER %s %I.%I OWNER TO %I',
+			CASE c.relkind
+				WHEN 'f' THEN 'FOREIGN TABLE'
+				WHEN 'S' THEN 'SEQUENCE'
+				WHEN 'v' THEN 'VIEW'
+				WHEN 'm' THEN 'MATERIALIZED VIEW'
+				ELSE 'TABLE'
+			END,
+			n.nspname, c.relname, $1::text) AS statement
+	FROM pg_class c
+	JOIN pg_namespace n ON n.oid = c.relnamespace
+	WHERE n.nspname = 'public'
+		AND c.relkind IN ('r', 'p', 'f', 'S', 'v', 'm')
+		AND pg_get_userbyid(c.relowner) <> $1::text
+		AND NOT EXISTS (
+			SELECT 1 FROM pg_depend d
+			WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+				AND (d.deptype = 'e' OR (c.relkind = 'S' AND d.deptype IN ('a', 'i'))))
+
+	UNION ALL
+
+	SELECT
+		format('%I.%I', n.nspname, t.typname),
+		format('ALTER %s %I.%I OWNER TO %I',
+			CASE t.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END,
+			n.nspname, t.typname, $1::text)
+	FROM pg_type t
+	JOIN pg_namespace n ON n.oid = t.typnamespace
+	WHERE n.nspname = 'public'
+		AND t.typtype IN ('e', 'd', 'r', 'c')
+		AND (t.typtype <> 'c' OR EXISTS (
+			SELECT 1 FROM pg_class rc WHERE rc.oid = t.typrelid AND rc.relkind = 'c'))
+		AND pg_get_userbyid(t.typowner) <> $1::text
+		AND NOT EXISTS (
+			SELECT 1 FROM pg_depend d
+			WHERE d.deptype = 'e'
+				AND ((d.classid = 'pg_type'::regclass AND d.objid = t.oid)
+					OR (d.classid = 'pg_class'::regclass AND d.objid = t.typrelid)))
+
+	UNION ALL
+
+	SELECT
+		routine.identity,
+		format('ALTER %s %s OWNER TO %I',
+			CASE p.prokind WHEN 'p' THEN 'PROCEDURE' WHEN 'a' THEN 'AGGREGATE' ELSE 'FUNCTION' END,
+			routine.identity, $1::text)
+	FROM pg_proc p
+	JOIN pg_namespace n ON n.oid = p.pronamespace
+	CROSS JOIN LATERAL (
+		SELECT format('%I.%I(%s)', n.nspname, p.proname, pg_get_function_identity_arguments(p.oid))
+	) AS routine(identity)
+	WHERE n.nspname = 'public'
+		AND p.prokind IN ('f', 'p', 'a')
+		AND pg_get_userbyid(p.proowner) <> $1::text
+		AND NOT EXISTS (
+			SELECT 1 FROM pg_depend d
+			WHERE d.deptype IN ('e', 'i') AND d.classid = 'pg_proc'::regclass AND d.objid = p.oid)
+) objects(object, statement)
+ORDER BY object`
+
+func pendingOwnershipStatements(ctx context.Context, conn *pgx.Conn, username string) ([]ownershipStatement, error) {
+	rows, err := conn.Query(ctx, ownershipCatalogQuery, username)
 	if err != nil {
-		return fmt.Errorf("failed to list tables: %w", err)
+		return nil, err
 	}
 	defer rows.Close()
 
-	var tables []string
+	var statements []ownershipStatement
 	for rows.Next() {
-		var tableName string
-		if err := rows.Scan(&tableName); err != nil {
-			return err
+		var statement ownershipStatement
+		if err := rows.Scan(&statement.object, &statement.statement); err != nil {
+			return nil, err
 		}
-		tables = append(tables, tableName)
+		statements = append(statements, statement)
 	}
-	rows.Close()
-
-	for _, table := range tables {
-		query := fmt.Sprintf("ALTER TABLE %s OWNER TO %s", pq.QuoteIdentifier(table), quotedUser)
-		if _, err := conn.Exec(ctx, query); err != nil {
-			return fmt.Errorf("failed to transfer ownership of table %s: %w", table, err)
-		}
-	}
-
-	return nil
+	return statements, rows.Err()
 }
 
-// transferSequenceOwnership changes the owner of all sequences in public schema to the specified user
-func (c *Client) transferSequenceOwnership(ctx context.Context, conn *pgx.Conn, quotedUser string) error {
-	rows, err := conn.Query(ctx, `SELECT sequencename FROM pg_sequences WHERE schemaname = 'public'`)
-	if err != nil {
-		return fmt.Errorf("failed to list sequences: %w", err)
+func transferOwnership(ctx context.Context, exec sqlExecutor, statements []ownershipStatement) error {
+	if len(statements) == 0 {
+		return nil
 	}
-	defer rows.Close()
 
-	var sequences []string
-	for rows.Next() {
-		var seqName string
-		if err := rows.Scan(&seqName); err != nil {
-			return err
+	// ALTER ... OWNER queues for ACCESS EXCLUSIVE, and everything arriving after it queues behind that — fail the object instead.
+	if _, err := exec.Exec(ctx, transferLockTimeout); err != nil {
+		return fmt.Errorf("failed to set the ownership transfer lock timeout: %w", err)
+	}
+
+	var failures []error
+	for _, statement := range statements {
+		_, err := exec.Exec(ctx, statement.statement)
+		if err == nil {
+			continue
 		}
-		sequences = append(sequences, seqName)
-	}
-	rows.Close()
-
-	for _, seq := range sequences {
-		query := fmt.Sprintf("ALTER SEQUENCE %s OWNER TO %s", pq.QuoteIdentifier(seq), quotedUser)
-		if _, err := conn.Exec(ctx, query); err != nil {
-			return fmt.Errorf("failed to transfer ownership of sequence %s: %w", seq, err)
+		failures = append(failures, fmt.Errorf("failed to transfer ownership of %s: %w", statement.object, err))
+		// A locked database locks every remaining object too; waiting out one timeout each blocks the whole controller.
+		if isLockNotAvailableError(err) {
+			break
 		}
 	}
+	if len(failures) == 0 {
+		return nil
+	}
+	return &ownershipTransferError{failures: failures}
+}
 
-	return nil
+const maxReportedTransferFailures = 10
+
+// Every failure ends up in status.databases[].message, which a schema-wide outage would otherwise fill.
+type ownershipTransferError struct {
+	failures []error
+}
+
+func (e *ownershipTransferError) Error() string {
+	reported := e.failures
+	if len(reported) > maxReportedTransferFailures {
+		reported = reported[:maxReportedTransferFailures]
+	}
+	messages := make([]string, 0, len(reported)+1)
+	for _, failure := range reported {
+		messages = append(messages, failure.Error())
+	}
+	if remaining := len(e.failures) - len(reported); remaining > 0 {
+		messages = append(messages, fmt.Sprintf("and %d more", remaining))
+	}
+	return strings.Join(messages, "; ")
+}
+
+func (e *ownershipTransferError) Unwrap() []error {
+	return e.failures
 }
 
 func (c *Client) applyTableGrant(ctx context.Context, conn *pgx.Conn, quotedUser string, grant TableGrant) error {
@@ -893,6 +1002,46 @@ func (c *Client) RevokePrivilegesInDatabase(ctx context.Context, username, datab
 	_, _ = c.pool.Exec(ctx, revokeConnect) // best-effort: may fail if not granted
 
 	return nil
+}
+
+// EnsureRoleMembership makes the operator's role a member of username so it can reassign what that role owns.
+func (c *Client) EnsureRoleMembership(ctx context.Context, username string) error {
+	return ensureRoleMembership(ctx, c.pool, username)
+}
+
+func ensureRoleMembership(ctx context.Context, db sqlQuerier, username string) error {
+	operator, inherited, err := roleMembership(ctx, db, username)
+	if err != nil {
+		return err
+	}
+	if inherited {
+		return nil
+	}
+
+	query := fmt.Sprintf("GRANT %s TO CURRENT_USER", pq.QuoteIdentifier(username))
+	if _, err := db.Exec(ctx, query); err != nil {
+		return fmt.Errorf("failed to grant role membership in %s: %w", username, err)
+	}
+
+	// The grant takes INHERIT from the grantee's rolinherit, so a NOINHERIT operator gets SET without USAGE and would re-grant forever.
+	if _, inherited, err = roleMembership(ctx, db, username); err != nil {
+		return err
+	}
+	if !inherited {
+		return fmt.Errorf("operator role %q does not inherit the privileges of roles it is a member of; "+
+			"%s must be granted to it WITH INHERIT TRUE", operator, username)
+	}
+	return nil
+}
+
+func roleMembership(ctx context.Context, db sqlQuerier, username string) (operator string, inherited bool, err error) {
+	err = db.QueryRow(ctx,
+		"SELECT current_user, pg_has_role(current_user, $1, 'USAGE')", username,
+	).Scan(&operator, &inherited)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to check role membership in %s: %w", username, err)
+	}
+	return operator, inherited, nil
 }
 
 // ReassignOwnership transfers all objects owned by fromUser to the current connection user (master).

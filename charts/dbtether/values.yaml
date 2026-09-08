@@ -11,7 +11,7 @@ image:
   repository: ghcr.io/certainty3452/dbtether
   pullPolicy: IfNotPresent
   # Automatically updated by release pipeline from git tag
-  tag: "0.8.0"
+  tag: "0.8.1"
 
 imagePullSecrets: []
 nameOverride: ""
@@ -147,7 +147,7 @@ backup:
 
 # Extra environment variables for the operator pod.
 # Used for credentialsFromEnv in DBCluster resources, and for tunables like
-# DB_SSLMODE that the operator propagates to backup/restore jobs.
+# DB_SSLMODE, which applies to the operator's own connections and to backup/restore jobs.
 extraEnv: []
 # Example:
 #   - name: DB_SSLMODE

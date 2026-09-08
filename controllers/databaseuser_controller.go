@@ -1253,6 +1253,13 @@ func (r *DatabaseUserReconciler) dropUserFromPostgres(ctx context.Context, user 
 	// Reassign ownership and revoke privileges from all databases. These are
 	// best-effort: if the role still owns objects, the DropUser below fails and
 	// gates finalizer removal, so a transient failure here is retried anyway.
+	if exists, err := pgClient.UserExists(ctx, username); err != nil {
+		logger.Error(err, "failed to check whether the role still exists", "username", username)
+	} else if exists {
+		if err := pgClient.EnsureRoleMembership(ctx, username); err != nil {
+			logger.Error(err, "failed to ensure role membership before reassigning ownership", "username", username)
+		}
+	}
 	for _, dbName := range databaseNames {
 		if err := pgClient.ReassignOwnership(ctx, username, dbName); err != nil {
 			logger.Error(err, "failed to reassign ownership", "database", dbName)
@@ -1342,19 +1349,26 @@ func (r *DatabaseUserReconciler) reassignOwnershipForRemovedDatabases(ctx contex
 		currentDBSet[db] = true
 	}
 
-	// Check previous databases from status
+	// Databases that were in status but are not in the current spec
+	removed := make([]string, 0, len(user.Status.Databases))
 	for _, dbStatus := range user.Status.Databases {
-		if dbStatus.DatabaseName == "" {
+		if dbStatus.DatabaseName == "" || currentDBSet[dbStatus.DatabaseName] {
 			continue
 		}
-		// If database was in status but not in current spec, reassign ownership
-		if !currentDBSet[dbStatus.DatabaseName] {
-			logger.Info("reassigning ownership for removed database", "database", dbStatus.DatabaseName, "username", username)
-			if err := pgClient.ReassignOwnership(ctx, username, dbStatus.DatabaseName); err != nil {
-				logger.Error(err, "failed to reassign ownership for removed database",
-					"database", dbStatus.DatabaseName)
-				// Continue anyway - best effort cleanup
-			}
+		removed = append(removed, dbStatus.DatabaseName)
+	}
+	if len(removed) == 0 {
+		return
+	}
+
+	if err := pgClient.EnsureRoleMembership(ctx, username); err != nil {
+		logger.Error(err, "failed to ensure role membership before reassigning ownership", "username", username)
+	}
+	for _, dbName := range removed {
+		logger.Info("reassigning ownership for removed database", "database", dbName, "username", username)
+		if err := pgClient.ReassignOwnership(ctx, username, dbName); err != nil {
+			logger.Error(err, "failed to reassign ownership for removed database", "database", dbName)
+			// Continue anyway - best effort cleanup
 		}
 	}
 }

@@ -3,6 +3,9 @@ version: "2"
 run:
   timeout: 5m
   modules-download-mode: readonly
+  build-tags:
+    - integration
+    - envtest
 
 linters:
   enable:
@@ -57,6 +60,12 @@ linters:
 
   exclusions:
     rules:
+      # Connection config travels by value through the client cache interface; a pointer there would alias a struct NewClient defaults in place.
+      - linters:
+          - gocritic
+        text: 'hugeParam: (config|_) is heavy'
+        path: '(pkg/postgres/(client|mock_client)\.go|controllers/(backup/restore|databaseuser)_controller_test\.go)$'
+
       - path: _test\.go
         linters:
           - funlen

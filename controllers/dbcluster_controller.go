@@ -58,6 +58,7 @@ func (r *DBClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		Username: username,
 		Password: password,
 		Database: "postgres",
+		SSLMode:  OperatorSSLMode(),
 	}
 
 	pgClient, err := r.PGClientCache.Get(ctx, cluster.Name, pgConfig)

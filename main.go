@@ -149,8 +149,7 @@ func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string, pgClient
 	if operatorImage == "" {
 		operatorImage = "certainty3452/dbtether:latest"
 	}
-	// Read once at setup; reconcilers reuse the cached value.
-	operatorSSLMode := os.Getenv("DB_SSLMODE")
+	operatorSSLMode := controllers.OperatorSSLMode()
 
 	// Load configuration from YAML file (mounted from ConfigMap at /etc/dbtether/config.yaml)
 	cfg := config.LoadOrDefault(config.DefaultConfigPath)

@@ -294,6 +294,9 @@ make test
 
 # Run only controller tests with envtest
 make test-envtest
+
+# Run the PostgreSQL integration tests; DBTETHER_TEST_DSN is a superuser DSN to a scratch server (PostgreSQL 16+), skipped when unset
+DBTETHER_TEST_DSN=postgres://postgres:it@localhost:55432/postgres?sslmode=disable go test ./pkg/postgres/ -tags=integration -count=1 -v
 ```
 
 **Requirements:** `setup-envtest` (installed automatically via `go run`)

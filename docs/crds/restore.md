@@ -267,4 +267,4 @@ JOB=$(kubectl get rst <name> -n <ns> -o jsonpath='{.status.jobName}')
 kubectl logs -n dbtether job/$JOB
 ```
 
-Common causes: schema-version mismatch, extension missing in target cluster, target user lacks `owner` privilege (set `privileges: owner` on the corresponding DatabaseUser).
+Common causes: schema-version mismatch, extension missing in target cluster, target user lacks `owner` privilege. Restored objects are created by the cluster admin. A DatabaseUser with `privileges: owner` owns the tables, sequences, views, types and routines in `public`; the restore runs that grant pass itself before it reports Completed.

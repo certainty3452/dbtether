@@ -2,8 +2,8 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.8.0
-appVersion: "0.8.0"
+version: 0.8.1
+appVersion: "0.8.1"
 home: https://github.com/certainty3452/dbtether
 # icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
@@ -159,17 +159,11 @@ annotations:
             name: orders-db-restored
         onConflict: drop
   artifacthub.io/changes: |
-    - kind: added
-      description: "Backups can be re-run on demand by changing `spec.trigger`, for backup-before-deploy from GitOps"
     - kind: fixed
-      description: "A changed backup spec never started a new run; a change during a run now waits for it"
+      description: "`owner` users could not modify types, views or functions after a restore; ownership of tables, sequences, views, materialized views, types and routines in `public` is transferred now"
     - kind: fixed
-      description: "Restore from a backup that is still running waits for it instead of failing"
-    - kind: fixed
-      description: "Transient errors while creating the backup Job are retried; an invalid Job spec fails with reason `InvalidJobSpec`"
-    - kind: fixed
-      description: "Restore `ttlAfterCompletion` had no effect"
+      description: "Ownership transfer touched every table on each reconcile, taking locks for nothing; only objects not yet owned are altered, and a transfer blocked by a long transaction stops and resumes on the next reconcile instead of holding up every query on the table"
     - kind: changed
-      description: "`ttlAfterCompletion` is the TTL of the finished Job; the resource itself is never deleted (documentation)"
+      description: "The operator grants itself membership in an `owner` user's role before transferring ownership and before reassigning it on deletion"
     - kind: changed
-      description: "The Backup CRD changed; apply the CRDs before `helm upgrade` (see README, Upgrading)"
+      description: "`DB_SSLMODE` applies to the operator's own connections as well as to backup and restore Jobs"

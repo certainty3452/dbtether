@@ -108,13 +108,16 @@ Preset privilege levels applied to the `public` schema:
 | `readonly` | `SELECT` on all tables, `USAGE` on schema |
 | `readwrite` | readonly + `INSERT`, `UPDATE`, `DELETE`, sequence usage |
 | `admin` | readwrite + `CREATE` on schema, `TRUNCATE`, `REFERENCES`, `TRIGGER` |
-| `owner` | admin + ownership of all tables/sequences (enables `ALTER TABLE`, constraints, full schema control) |
+| `owner` | admin + ownership of the objects in `public` (enables `ALTER TABLE`, constraints, `ALTER TYPE ... ADD VALUE`); the schema itself stays with the cluster admin |
 
 Can be set at spec level (default for all databases) or per-database.
 
 **Note on `owner` privilege:**
-- Transfers ownership of all existing tables and sequences to the user
-- Required for operations like `ALTER TABLE ... ADD CONSTRAINT`, schema modifications, or running `pg_restore`
+- Transfers ownership of the tables, sequences, views, materialized views, types and routines in `public` that the user does not already own; objects belonging to an extension are left with the extension owner
+- The operator grants itself membership in the user's role before transferring ownership and before reassigning it on deletion; that membership is permanent and goes away only with the role (`DROP ROLE`)
+- The multirange of a range type stays with its creator on PostgreSQL 16 and is dropped together with the range type
+- The `public` schema itself stays owned by the cluster admin; the user creates objects in it through the `CREATE` grant it gets from `admin`, and cannot `ALTER SCHEMA` or `DROP SCHEMA public`
+- Required for operations like `ALTER TABLE ... ADD CONSTRAINT`, `ALTER TYPE ... ADD VALUE`, or running `pg_restore`
 - On user deletion or when a database is removed from access list, ownership is automatically reassigned back to the master user
 
 ## additionalGrants
