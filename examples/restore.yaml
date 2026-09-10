@@ -35,7 +35,6 @@ spec:
   # How to handle existing data:
   # - fail: abort if database is not empty (default)
   # - drop: drop and recreate database before restore
-  # - overwrite: restore over existing data
   onConflict: fail
 
 ---

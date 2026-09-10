@@ -1,7 +1,10 @@
 package controllers
 
 import (
+	"fmt"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/types"
 
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
 	"github.com/certainty3452/dbtether/pkg/postgres"
@@ -34,6 +37,39 @@ func ResolveUserGrantsForDatabase(user *databasesv1alpha1.DatabaseUser, namespac
 		}
 	}
 	return UserGrants{}, false
+}
+
+func ValidateUserSpec(user *databasesv1alpha1.DatabaseUser) error {
+	if user.Spec.Database != nil && len(user.Spec.Databases) > 0 {
+		return fmt.Errorf("cannot specify both 'database' and 'databases' - use one or the other")
+	}
+	if !user.Spec.HasDatabases() {
+		return fmt.Errorf("must specify either 'database' or 'databases'")
+	}
+
+	accesses := user.Spec.GetDatabases()
+	seen := make(map[types.NamespacedName]struct{}, len(accesses))
+	// Per-database secret names drop the namespace, so a reused Database name collides.
+	namespaceByName := make(map[string]string, len(accesses))
+	perDatabaseSecrets := user.Spec.SecretGeneration == "perDatabase"
+
+	for _, access := range accesses {
+		ref := types.NamespacedName{Namespace: databaseAccessNamespace(user, access), Name: access.Name}
+		if _, duplicate := seen[ref]; duplicate {
+			return fmt.Errorf("database %s is listed more than once", ref)
+		}
+		seen[ref] = struct{}{}
+
+		if !perDatabaseSecrets {
+			continue
+		}
+		if other, clash := namespaceByName[ref.Name]; clash {
+			return fmt.Errorf("per-database secrets need distinct Database names: %s is referenced from %s and %s",
+				ref.Name, other, ref.Namespace)
+		}
+		namespaceByName[ref.Name] = ref.Namespace
+	}
+	return nil
 }
 
 // UsernameForUser is the PostgreSQL role name backing a DatabaseUser.

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
 	"github.com/certainty3452/dbtether/pkg/postgres"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -390,66 +393,6 @@ func TestDatabaseUserReconciler_ShouldIncludeDatabasesList(t *testing.T) {
 			got := r.shouldIncludeDatabasesList(tt.user, tt.dbCount)
 			if got != tt.expected {
 				t.Errorf("shouldIncludeDatabasesList() = %v, want %v", got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestDatabaseUserReconciler_ValidateSpec(t *testing.T) {
-	r := &DatabaseUserReconciler{}
-
-	tests := []struct {
-		name    string
-		user    *databasesv1alpha1.DatabaseUser
-		wantErr bool
-	}{
-		{
-			name: "valid single database",
-			user: &databasesv1alpha1.DatabaseUser{
-				Spec: databasesv1alpha1.DatabaseUserSpec{
-					Database: &databasesv1alpha1.DatabaseAccess{Name: "my-db"},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "valid multiple databases",
-			user: &databasesv1alpha1.DatabaseUser{
-				Spec: databasesv1alpha1.DatabaseUserSpec{
-					Databases: []databasesv1alpha1.DatabaseAccess{
-						{Name: "db1"},
-						{Name: "db2"},
-					},
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "invalid - both database and databases",
-			user: &databasesv1alpha1.DatabaseUser{
-				Spec: databasesv1alpha1.DatabaseUserSpec{
-					Database: &databasesv1alpha1.DatabaseAccess{Name: "my-db"},
-					Databases: []databasesv1alpha1.DatabaseAccess{
-						{Name: "db1"},
-					},
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name: "invalid - neither database nor databases",
-			user: &databasesv1alpha1.DatabaseUser{
-				Spec: databasesv1alpha1.DatabaseUserSpec{},
-			},
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := r.validateSpec(tt.user)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("validateSpec() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
@@ -1639,6 +1582,7 @@ func newTestReconciler(objects ...runtime.Object) *DatabaseUserReconciler {
 		WithScheme(scheme).
 		WithRuntimeObjects(objects...).
 		WithStatusSubresource(&databasesv1alpha1.DatabaseUser{}).
+		WithIndex(&databasesv1alpha1.DatabaseUser{}, DatabaseUserDatabaseRefIndex, indexDatabaseUserDatabaseRefs).
 		Build()
 
 	return &DatabaseUserReconciler{
@@ -1656,6 +1600,7 @@ func newTestReconcilerWithCache(pgCache postgres.ClientCacheInterface, objects .
 		WithScheme(scheme).
 		WithRuntimeObjects(objects...).
 		WithStatusSubresource(&databasesv1alpha1.DatabaseUser{}).
+		WithIndex(&databasesv1alpha1.DatabaseUser{}, DatabaseUserDatabaseRefIndex, indexDatabaseUserDatabaseRefs).
 		Build()
 
 	return &DatabaseUserReconciler{
@@ -3176,9 +3121,12 @@ func TestApplyPerDatabasePrivileges(t *testing.T) {
 	r := newTestReconciler()
 	mock := postgres.NewMockClient()
 
-	statuses := r.applyPerDatabasePrivileges(ctx, mock, user, "u", databases)
+	statuses, applyFailures := r.applyPerDatabasePrivileges(ctx, mock, user, "u", databases, ownerConflicts{})
 	if len(statuses) != 2 {
 		t.Fatalf("got %d statuses, want 2", len(statuses))
+	}
+	if len(applyFailures) != 0 {
+		t.Errorf("applyFailures = %v, want none", applyFailures)
 	}
 	if statuses[0].Privileges != "admin" {
 		t.Errorf("db1 privileges = %q, want admin (per-DB override)", statuses[0].Privileges)
@@ -3211,12 +3159,15 @@ func TestApplyPerDatabasePrivileges_PerDBError(t *testing.T) {
 	mock.ShouldFail = true
 	mock.FailError = errors.New("boom")
 
-	statuses := r.applyPerDatabasePrivileges(ctx, mock, user, "u", databases)
+	statuses, applyFailures := r.applyPerDatabasePrivileges(ctx, mock, user, "u", databases, ownerConflicts{})
 	if statuses[0].Phase != "Failed" {
 		t.Errorf("phase = %q, want Failed", statuses[0].Phase)
 	}
 	if statuses[0].Message == "" {
 		t.Errorf("Message should carry the underlying error")
+	}
+	if len(applyFailures) != 1 || applyFailures[0] != "appdb" {
+		t.Errorf("applyFailures = %v, want [appdb]", applyFailures)
 	}
 }
 
@@ -3851,7 +3802,7 @@ func TestDatabaseUserReconciler_ReconcileUser_PerDatabaseFailureSetsTopLevelFail
 		t.Fatalf("failed to get user: %v", err)
 	}
 
-	_, err := r.reconcileUser(ctx, &fetchedUser, databases, cluster)
+	_, err := r.reconcileUser(ctx, &fetchedUser, databases, cluster, ownerConflicts{})
 	if err == nil {
 		t.Fatal("expected error when a per-database privilege apply fails")
 	}
@@ -3869,4 +3820,620 @@ func TestDatabaseUserReconciler_ReconcileUser_PerDatabaseFailureSetsTopLevelFail
 	if !strings.Contains(afterFailure.Status.Message, "faildb") {
 		t.Errorf("expected status message to name the failing database, got %q", afterFailure.Status.Message)
 	}
+}
+
+func newOwnerConflictFixture() (*corev1.Secret, *databasesv1alpha1.DBCluster, *databasesv1alpha1.Database) {
+	clusterSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "owner-conflict-creds", Namespace: "default"},
+		Data:       map[string][]byte{"username": []byte("postgres"), "password": []byte("pw")},
+	}
+	cluster := &databasesv1alpha1.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "owner-conflict-cluster"},
+		Spec: databasesv1alpha1.DBClusterSpec{
+			Endpoint: "localhost",
+			Port:     5432,
+			CredentialsSecretRef: &databasesv1alpha1.SecretReference{
+				Name:      "owner-conflict-creds",
+				Namespace: "default",
+			},
+		},
+		Status: databasesv1alpha1.DBClusterStatus{Phase: "Connected"},
+	}
+	db := &databasesv1alpha1.Database{
+		ObjectMeta: metav1.ObjectMeta{Name: "owner-conflict-db", Namespace: "default"},
+		Spec: databasesv1alpha1.DatabaseSpec{
+			ClusterRef: databasesv1alpha1.ClusterReference{Name: "owner-conflict-cluster"},
+		},
+		Status: databasesv1alpha1.DatabaseStatus{Phase: "Ready", DatabaseName: "owner_conflict_db"},
+	}
+	return clusterSecret, cluster, db
+}
+
+const wantOwnerConflictMessage = "owner conflict: DatabaseUser default/owner-holder already holds privileges=owner on " +
+	"Database default/owner-conflict-db; only one owner per database"
+
+func newOwnerConflictDatabase(name string) *databasesv1alpha1.Database {
+	return &databasesv1alpha1.Database{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec: databasesv1alpha1.DatabaseSpec{
+			ClusterRef: databasesv1alpha1.ClusterReference{Name: "owner-conflict-cluster"},
+		},
+		Status: databasesv1alpha1.DatabaseStatus{Phase: "Ready"},
+	}
+}
+
+type recordingPGClient struct {
+	*postgres.MockClient
+	applied       []appliedPrivilege
+	failDatabases map[string]error
+}
+
+type appliedPrivilege struct {
+	database   string
+	privileges string
+}
+
+func (m *recordingPGClient) ApplyPrivileges(ctx context.Context, username, database, preset string, additionalGrants []postgres.TableGrant) error {
+	m.applied = append(m.applied, appliedPrivilege{database: database, privileges: preset})
+	if err, ok := m.failDatabases[database]; ok {
+		return err
+	}
+	return m.MockClient.ApplyPrivileges(ctx, username, database, preset, additionalGrants)
+}
+
+func (m *recordingPGClient) appliedTo(database string) *appliedPrivilege {
+	for i := range m.applied {
+		if m.applied[i].database == database {
+			return &m.applied[i]
+		}
+	}
+	return nil
+}
+
+func (m *recordingPGClient) reset() {
+	m.applied = nil
+}
+
+func newRecordingReconciler(objects ...runtime.Object) (*DatabaseUserReconciler, *recordingPGClient) {
+	mock := &recordingPGClient{MockClient: postgres.NewMockClient()}
+	return newTestReconcilerWithCache(&singleClientCache{pgClient: mock}, objects...), mock
+}
+
+func newOwnerConflictUser(name string, created time.Time, privileges string) *databasesv1alpha1.DatabaseUser {
+	return &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "default",
+			CreationTimestamp: metav1.NewTime(created),
+		},
+		Spec: databasesv1alpha1.DatabaseUserSpec{
+			Database:   &databasesv1alpha1.DatabaseAccess{Name: "owner-conflict-db"},
+			Privileges: privileges,
+		},
+	}
+}
+
+func reconcilePastFinalizer(t *testing.T, r *DatabaseUserReconciler, name string) reconcile.Result {
+	t.Helper()
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: "default"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("finalizer reconcile for %s: %v", name, err)
+	}
+	result, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("reconcile for %s: %v", name, err)
+	}
+	return result
+}
+
+func getUserStatus(t *testing.T, r *DatabaseUserReconciler, name string) databasesv1alpha1.DatabaseUserStatus {
+	t.Helper()
+	var user databasesv1alpha1.DatabaseUser
+	if err := r.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, &user); err != nil {
+		t.Fatalf("failed to get user %s: %v", name, err)
+	}
+	return user.Status
+}
+
+func assertApplied(t *testing.T, mock *recordingPGClient, database, wantPrivileges string) {
+	t.Helper()
+	applied := mock.appliedTo(database)
+	if applied == nil {
+		t.Fatalf("no ApplyPrivileges call for %s", database)
+	}
+	if applied.privileges != wantPrivileges {
+		t.Errorf("privileges on %s = %q, want %q", database, applied.privileges, wantPrivileges)
+	}
+}
+
+func assertDatabaseStatus(t *testing.T, got *databasesv1alpha1.DatabaseAccessStatus, wantPhase, wantPrivileges, wantMessage string) {
+	t.Helper()
+	if got.Phase != wantPhase || got.Privileges != wantPrivileges || got.Message != wantMessage {
+		t.Errorf("database entry = %+v, want phase %q privileges %q message %q", got, wantPhase, wantPrivileges, wantMessage)
+	}
+}
+
+func assertRotationRequeue(t *testing.T, r *DatabaseUserReconciler, name string, got time.Duration) {
+	t.Helper()
+	var user databasesv1alpha1.DatabaseUser
+	if err := r.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, &user); err != nil {
+		t.Fatalf("failed to get user %s: %v", name, err)
+	}
+	want := r.calculateRequeueAfter(&user)
+	if want <= 0 {
+		t.Fatalf("the fixture must keep a live rotation timer, got %v", want)
+	}
+	if drift := got - want; drift < -time.Minute || drift > time.Minute {
+		t.Errorf("RequeueAfter = %v, want the rotation timer %v", got, want)
+	}
+}
+
+func TestDatabaseUserReconciler_LoserFailsContestedDatabaseOnly(t *testing.T) {
+	ctx := context.Background()
+	clusterSecret, cluster, db := newOwnerConflictFixture()
+	db2 := newOwnerConflictDatabase("owner-conflict-db2")
+	base := time.Now().Add(-time.Hour)
+	holder := newOwnerConflictUser("owner-holder", base, "owner")
+	loser := newOwnerConflictUser("owner-loser", base.Add(time.Minute), "owner")
+	loser.Spec.Database = nil
+	loser.Spec.Databases = []databasesv1alpha1.DatabaseAccess{
+		{Name: "owner-conflict-db"},
+		{Name: "owner-conflict-db2"},
+	}
+	rotated := metav1.NewTime(time.Now())
+	loser.Spec.Rotation = &databasesv1alpha1.RotationConfig{Days: 30}
+	loser.Status.PasswordUpdatedAt = &rotated
+
+	r, mock := newRecordingReconciler(clusterSecret, cluster, db, db2, holder, loser)
+
+	result := reconcilePastFinalizer(t, r, "owner-loser")
+	assertRotationRequeue(t, r, "owner-loser", result.RequeueAfter)
+
+	status := getUserStatus(t, r, "owner-loser")
+	if status.Phase != "Failed" {
+		t.Errorf("Phase = %q, want %q", status.Phase, "Failed")
+	}
+	if status.Message != wantOwnerConflictMessage {
+		t.Errorf("Message = %q, want %q", status.Message, wantOwnerConflictMessage)
+	}
+
+	if len(status.Databases) != 2 {
+		t.Fatalf("got %d database statuses, want 2: %+v", len(status.Databases), status.Databases)
+	}
+	assertDatabaseStatus(t, &status.Databases[0], "Failed", "admin", wantOwnerConflictMessage)
+	assertDatabaseStatus(t, &status.Databases[1], "Ready", "owner", "")
+
+	assertApplied(t, mock, "owner_conflict_db", "admin")
+	assertApplied(t, mock, "owner_conflict_db2", "owner")
+
+	if exists, err := mock.UserExists(ctx, "owner_loser"); err != nil || !exists {
+		t.Errorf("the PostgreSQL role must still be created (exists=%v, err=%v)", exists, err)
+	}
+	var secret corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Name: "owner-loser-credentials", Namespace: "default"}, &secret); err != nil {
+		t.Errorf("the credentials secret must still be created: %v", err)
+	}
+}
+
+func TestDatabaseUserReconciler_ApplyFailureKeepsConflictMessage(t *testing.T) {
+	ctx := context.Background()
+	clusterSecret, cluster, db := newOwnerConflictFixture()
+	base := time.Now().Add(-time.Hour)
+	holder := newOwnerConflictUser("owner-holder", base, "owner")
+	loser := newOwnerConflictUser("owner-loser", base.Add(time.Minute), "owner")
+
+	r, mock := newRecordingReconciler(clusterSecret, cluster, db, holder, loser)
+	mock.failDatabases = map[string]error{"owner_conflict_db": errors.New("permission denied for database owner_conflict_db")}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "owner-loser", Namespace: "default"}}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("finalizer reconcile: %v", err)
+	}
+	_, err := r.Reconcile(ctx, req)
+	if err == nil {
+		t.Fatal("an apply failure must be returned so controller-runtime backs off")
+	}
+	if !strings.Contains(err.Error(), "owner_conflict_db") {
+		t.Errorf("error should name the failing database, got %v", err)
+	}
+
+	assertApplied(t, mock, "owner_conflict_db", "admin")
+
+	status := getUserStatus(t, r, "owner-loser")
+	if status.Phase != "Failed" {
+		t.Errorf("Phase = %q, want %q", status.Phase, "Failed")
+	}
+	wantMessage := wantOwnerConflictMessage + "; permission denied for database owner_conflict_db"
+	if len(status.Databases) != 1 {
+		t.Fatalf("got %d database statuses, want 1: %+v", len(status.Databases), status.Databases)
+	}
+	assertDatabaseStatus(t, &status.Databases[0], "Failed", "admin", wantMessage)
+}
+
+func TestDatabaseUserReconciler_ReadyOwnerLoserIsDemoted(t *testing.T) {
+	ctx := context.Background()
+	clusterSecret, cluster, db := newOwnerConflictFixture()
+	base := time.Now().Add(-time.Hour)
+	loser := newOwnerConflictUser("owner-loser", base.Add(time.Minute), "owner")
+
+	r, mock := newRecordingReconciler(clusterSecret, cluster, db, loser)
+
+	reconcilePastFinalizer(t, r, "owner-loser")
+	if status := getUserStatus(t, r, "owner-loser"); status.Phase != "Ready" {
+		t.Fatalf("Phase = %q, want Ready before the conflict appears (message %q)", status.Phase, status.Message)
+	}
+	var secret corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Name: "owner-loser-credentials", Namespace: "default"}, &secret); err != nil {
+		t.Fatalf("expected the credentials secret to exist: %v", err)
+	}
+
+	if err := r.Create(ctx, newOwnerConflictUser("owner-holder", base, "owner")); err != nil {
+		t.Fatalf("failed to create the older owner: %v", err)
+	}
+
+	mock.reset()
+	result, err := r.Reconcile(ctx, reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "owner-loser", Namespace: "default"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("RequeueAfter = %v, want 0", result.RequeueAfter)
+	}
+
+	status := getUserStatus(t, r, "owner-loser")
+	if status.Phase != "Failed" || status.Message != wantOwnerConflictMessage {
+		t.Errorf("a Ready loser must be demoted, got phase %q message %q", status.Phase, status.Message)
+	}
+	assertApplied(t, mock, "owner_conflict_db", "admin")
+}
+
+func TestDatabaseUserReconciler_TerminatingHolderYieldsOwner(t *testing.T) {
+	clusterSecret, cluster, db := newOwnerConflictFixture()
+	base := time.Now().Add(-time.Hour)
+	holder := newOwnerConflictUser("owner-holder", base, "owner")
+	deleted := metav1.NewTime(time.Now())
+	holder.DeletionTimestamp = &deleted
+	holder.Finalizers = []string{UserFinalizerName}
+	successor := newOwnerConflictUser("owner-successor", base.Add(time.Minute), "owner")
+
+	r, mock := newRecordingReconciler(clusterSecret, cluster, db, holder, successor)
+
+	reconcilePastFinalizer(t, r, "owner-successor")
+
+	status := getUserStatus(t, r, "owner-successor")
+	if status.Phase != "Ready" {
+		t.Errorf("Phase = %q, want Ready (message %q)", status.Phase, status.Message)
+	}
+	assertApplied(t, mock, "owner_conflict_db", "owner")
+}
+
+func TestDatabaseUserReconciler_ContestedWinnerSkipsTheFastPath(t *testing.T) {
+	ctx := context.Background()
+	clusterSecret, cluster, db := newOwnerConflictFixture()
+	base := time.Now().Add(-time.Hour)
+	holder := newOwnerConflictUser("owner-holder", base, "owner")
+	loser := newOwnerConflictUser("owner-loser", base.Add(time.Minute), "owner")
+
+	r, mock := newRecordingReconciler(clusterSecret, cluster, db, holder, loser)
+
+	reconcilePastFinalizer(t, r, "owner-holder")
+	if status := getUserStatus(t, r, "owner-holder"); status.Phase != "Ready" {
+		t.Fatalf("Phase = %q, want Ready (message %q)", status.Phase, status.Message)
+	}
+
+	mock.reset()
+	if _, err := r.Reconcile(ctx, reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "owner-holder", Namespace: "default"},
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	applied := mock.appliedTo("owner_conflict_db")
+	if applied == nil {
+		t.Fatal("a contested winner must re-apply its privileges instead of taking the fast path")
+	}
+	if applied.privileges != "owner" {
+		t.Errorf("privileges = %q, want owner", applied.privileges)
+	}
+}
+
+func TestDatabaseUserReconciler_UncontestedOwnerTakesTheFastPath(t *testing.T) {
+	ctx := context.Background()
+	clusterSecret, cluster, db := newOwnerConflictFixture()
+	holder := newOwnerConflictUser("owner-holder", time.Now().Add(-time.Hour), "owner")
+
+	r, mock := newRecordingReconciler(clusterSecret, cluster, db, holder)
+
+	reconcilePastFinalizer(t, r, "owner-holder")
+	if status := getUserStatus(t, r, "owner-holder"); status.Phase != "Ready" {
+		t.Fatalf("Phase = %q, want Ready (message %q)", status.Phase, status.Message)
+	}
+
+	mock.reset()
+	if _, err := r.Reconcile(ctx, reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "owner-holder", Namespace: "default"},
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(mock.applied) != 0 {
+		t.Errorf("an uncontested Ready owner must take the fast path, got %+v", mock.applied)
+	}
+}
+
+func TestDatabaseUserReconciler_PerDatabaseUserTakesTheFastPath(t *testing.T) {
+	ctx := context.Background()
+	clusterSecret, cluster, firstDB := newOwnerConflictFixture()
+	secondDB := &databasesv1alpha1.Database{
+		ObjectMeta: metav1.ObjectMeta{Name: "owner-conflict-db-2", Namespace: "default"},
+		Spec: databasesv1alpha1.DatabaseSpec{
+			ClusterRef: databasesv1alpha1.ClusterReference{Name: "owner-conflict-cluster"},
+		},
+		Status: databasesv1alpha1.DatabaseStatus{Phase: "Ready", DatabaseName: "owner_conflict_db_2"},
+	}
+
+	user := newOwnerConflictUser("per-db-user", time.Now().Add(-time.Hour), "readwrite")
+	user.Spec.SecretGeneration = "perDatabase"
+	user.Spec.Database = nil
+	user.Spec.Databases = []databasesv1alpha1.DatabaseAccess{
+		{Name: firstDB.Name},
+		{Name: secondDB.Name},
+	}
+
+	r, mock := newRecordingReconciler(clusterSecret, cluster, firstDB, secondDB, user)
+
+	reconcilePastFinalizer(t, r, "per-db-user")
+	status := getUserStatus(t, r, "per-db-user")
+	if status.Phase != "Ready" {
+		t.Fatalf("Phase = %q, want %q (message %q)", status.Phase, "Ready", status.Message)
+	}
+	firstSecret := "per-db-user-owner-conflict-db-credentials"
+	secondSecret := "per-db-user-owner-conflict-db-2-credentials"
+	if status.SecretName != firstSecret {
+		t.Fatalf("SecretName = %q, want %q", status.SecretName, firstSecret)
+	}
+	if secretExists(t, r, "per-db-user-credentials") {
+		t.Fatal("perDatabase mode must not create a primary secret; the fast path has nothing else to key on")
+	}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "per-db-user", Namespace: "default"}}
+	reconcileApplied := func() []appliedPrivilege {
+		t.Helper()
+		mock.reset()
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		return mock.applied
+	}
+
+	if applied := reconcileApplied(); len(applied) != 0 {
+		t.Errorf("a Ready perDatabase user with every secret present must take the fast path, got %+v", applied)
+	}
+
+	deleteSecret(t, r, secondSecret)
+	if applied := reconcileApplied(); len(applied) == 0 {
+		t.Error("a missing secondary per-database secret must drop the user back to the full reconcile")
+	}
+	if !secretExists(t, r, secondSecret) {
+		t.Error("the full reconcile must recreate the deleted secondary secret")
+	}
+
+	deleteSecret(t, r, firstSecret)
+	if applied := reconcileApplied(); len(applied) == 0 {
+		t.Error("a missing primary per-database secret must drop the user back to the full reconcile")
+	}
+}
+
+func TestDatabaseUserReconciler_NewlyInvalidSpecDemotesReady(t *testing.T) {
+	ctx := context.Background()
+	clusterSecret, cluster, db := newOwnerConflictFixture()
+
+	user := newOwnerConflictUser("per-db-user", time.Now().Add(-time.Hour), "readwrite")
+	user.Generation = 1
+	user.Finalizers = []string{UserFinalizerName}
+	user.Spec.SecretGeneration = "perDatabase"
+	user.Spec.Database = nil
+	user.Spec.Databases = []databasesv1alpha1.DatabaseAccess{
+		{Name: db.Name},
+		{Name: db.Name, Namespace: "team-b"},
+	}
+	user.Status = databasesv1alpha1.DatabaseUserStatus{
+		Phase:              "Ready",
+		ObservedGeneration: 1,
+		Username:           "per_db_user",
+		SecretName:         "per-db-user-owner-conflict-db-credentials",
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "per-db-user-owner-conflict-db-credentials",
+			Namespace: "default",
+		},
+	}
+
+	r, mock := newRecordingReconciler(clusterSecret, cluster, db, user, secret)
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "per-db-user", Namespace: "default"}}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	status := getUserStatus(t, r, "per-db-user")
+	if status.Phase != "Failed" {
+		t.Fatalf("Phase = %q, want %q (message %q)", status.Phase, "Failed", status.Message)
+	}
+	wantMessage := "validation error: per-database secrets need distinct Database names: " +
+		"owner-conflict-db is referenced from default and team-b"
+	if status.Message != wantMessage {
+		t.Errorf("Message = %q, want %q", status.Message, wantMessage)
+	}
+	if len(mock.applied) != 0 {
+		t.Errorf("an invalid spec must not reach ApplyPrivileges, got %+v", mock.applied)
+	}
+}
+
+func secretExists(t *testing.T, r *DatabaseUserReconciler, name string) bool {
+	t.Helper()
+	var secret corev1.Secret
+	err := r.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, &secret)
+	if err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("failed to get secret %s: %v", name, err)
+	}
+	return err == nil
+}
+
+func deleteSecret(t *testing.T, r *DatabaseUserReconciler, name string) {
+	t.Helper()
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"}}
+	if err := r.Delete(context.Background(), secret); err != nil {
+		t.Fatalf("failed to delete secret %s: %v", name, err)
+	}
+}
+
+func TestDatabaseUserReconciler_EnqueueOwnerPeers(t *testing.T) {
+	ctx := context.Background()
+	base := time.Now().Add(-time.Hour)
+	holder := newOwnerConflictUser("owner-holder", base, "owner")
+	loser := newOwnerConflictUser("owner-loser", base.Add(time.Minute), "owner")
+	writer := newOwnerConflictUser("owner-writer", base, "readwrite")
+	remote := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "remote-owner",
+			Namespace:         "team-b",
+			CreationTimestamp: metav1.NewTime(base.Add(2 * time.Minute)),
+		},
+		Spec: databasesv1alpha1.DatabaseUserSpec{
+			Database:   &databasesv1alpha1.DatabaseAccess{Name: "owner-conflict-db", Namespace: "default"},
+			Privileges: "owner",
+		},
+	}
+
+	r := newTestReconciler(holder, loser, writer, remote)
+
+	if got := r.enqueueOwnerPeers(ctx, writer); len(got) != 0 {
+		t.Errorf("a non-owner event must enqueue nothing, got %v", got)
+	}
+
+	got := requestNames(r.enqueueOwnerPeers(ctx, holder))
+	want := []string{"default/owner-loser", "team-b/remote-owner"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("owner event enqueued %v, want %v", got, want)
+	}
+
+	got = requestNames(r.enqueueOwnerPeers(ctx, remote))
+	want = []string{"default/owner-holder", "default/owner-loser"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("cross-namespace owner event enqueued %v, want %v", got, want)
+	}
+}
+
+func requestNames(requests []reconcile.Request) []string {
+	names := make([]string, 0, len(requests))
+	for _, request := range requests {
+		names = append(names, request.String())
+	}
+	sort.Strings(names)
+	return names
+}
+
+func TestDatabaseUserReconciler_OldestOwnerKeepsOwnership(t *testing.T) {
+	clusterSecret, cluster, db := newOwnerConflictFixture()
+	base := time.Now().Add(-time.Hour)
+	holder := newOwnerConflictUser("owner-holder", base, "owner")
+	loser := newOwnerConflictUser("owner-loser", base.Add(time.Minute), "owner")
+
+	r := newTestReconcilerWithCache(postgres.NewMockClientCache(), clusterSecret, cluster, db, holder, loser)
+
+	reconcilePastFinalizer(t, r, "owner-holder")
+
+	status := getUserStatus(t, r, "owner-holder")
+	if strings.Contains(status.Message, "owner conflict") {
+		t.Errorf("the oldest owner must not report a conflict, got %q", status.Message)
+	}
+	if status.Phase != "Ready" {
+		t.Errorf("Phase = %q, want %q", status.Phase, "Ready")
+	}
+}
+
+func TestDatabaseUserReconciler_OwnerAndReadwriteCoexist(t *testing.T) {
+	clusterSecret, cluster, db := newOwnerConflictFixture()
+	base := time.Now().Add(-time.Hour)
+	writer := newOwnerConflictUser("owner-writer", base, "readwrite")
+	owner := newOwnerConflictUser("owner-boss", base.Add(time.Minute), "owner")
+
+	r := newTestReconcilerWithCache(postgres.NewMockClientCache(), clusterSecret, cluster, db, writer, owner)
+
+	for _, name := range []string{"owner-writer", "owner-boss"} {
+		reconcilePastFinalizer(t, r, name)
+		status := getUserStatus(t, r, name)
+		if status.Phase != "Ready" {
+			t.Errorf("%s: Phase = %q, want %q (message %q)", name, status.Phase, "Ready", status.Message)
+		}
+	}
+}
+
+func TestDatabaseUserReconciler_ConflictClearsWhenHolderGone(t *testing.T) {
+	clusterSecret, cluster, db := newOwnerConflictFixture()
+	base := time.Now().Add(-time.Hour)
+	holder := newOwnerConflictUser("owner-holder", base, "owner")
+	loser := newOwnerConflictUser("owner-loser", base.Add(time.Minute), "owner")
+
+	r := newTestReconcilerWithCache(postgres.NewMockClientCache(), clusterSecret, cluster, db, holder, loser)
+
+	reconcilePastFinalizer(t, r, "owner-loser")
+	if status := getUserStatus(t, r, "owner-loser"); status.Phase != "Failed" {
+		t.Fatalf("Phase = %q, want %q", status.Phase, "Failed")
+	}
+
+	if err := r.Delete(context.Background(), holder); err != nil {
+		t.Fatalf("failed to delete the owner holder: %v", err)
+	}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "owner-loser", Namespace: "default"}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile after holder deletion: %v", err)
+	}
+
+	status := getUserStatus(t, r, "owner-loser")
+	if status.Phase != "Ready" {
+		t.Errorf("Phase = %q, want %q (message %q)", status.Phase, "Ready", status.Message)
+	}
+	if strings.Contains(status.Message, "owner conflict") {
+		t.Errorf("conflict message should be gone, got %q", status.Message)
+	}
+}
+
+func TestDatabaseUserReconciler_DuplicateRefYieldsOwner(t *testing.T) {
+	clusterSecret, cluster, db := newOwnerConflictFixture()
+	base := time.Now().Add(-time.Hour)
+
+	duplicated := newOwnerConflictUser("owner-duplicated", base, "owner")
+	duplicated.Spec.Database = nil
+	duplicated.Spec.Databases = []databasesv1alpha1.DatabaseAccess{
+		{Name: "owner-conflict-db"},
+		{Name: "owner-conflict-db", Namespace: "default"},
+	}
+	rival := newOwnerConflictUser("owner-rival", base.Add(time.Minute), "owner")
+
+	r, mock := newRecordingReconciler(clusterSecret, cluster, db, duplicated, rival)
+
+	reconcilePastFinalizer(t, r, "owner-duplicated")
+	status := getUserStatus(t, r, "owner-duplicated")
+	if status.Phase != "Failed" {
+		t.Fatalf("Phase = %q, want %q (message %q)", status.Phase, "Failed", status.Message)
+	}
+	wantMessage := "validation error: database default/owner-conflict-db is listed more than once"
+	if status.Message != wantMessage {
+		t.Errorf("Message = %q, want %q", status.Message, wantMessage)
+	}
+	if len(mock.applied) != 0 {
+		t.Fatalf("an invalid spec must not reach ApplyPrivileges, got %+v", mock.applied)
+	}
+
+	reconcilePastFinalizer(t, r, "owner-rival")
+	if status := getUserStatus(t, r, "owner-rival"); status.Phase != "Ready" {
+		t.Errorf("Phase = %q, want %q (message %q)", status.Phase, "Ready", status.Message)
+	}
+	assertApplied(t, mock, "owner_conflict_db", "owner")
 }

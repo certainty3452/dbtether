@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -129,6 +130,49 @@ func TestBackupConfig_Validation(t *testing.T) {
 				t.Errorf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+func TestPgDumpEnv_PropagatesPasswordAndSSLMode(t *testing.T) {
+	var sawPassword, sawSSLMode bool
+	for _, entry := range pgDumpEnv(&BackupConfig{Password: "secret", SSLMode: "require"}) {
+		switch entry {
+		case "PGPASSWORD=secret":
+			sawPassword = true
+		case "PGSSLMODE=require":
+			sawSSLMode = true
+		}
+	}
+
+	if !sawPassword {
+		t.Error("PGPASSWORD missing")
+	}
+	if !sawSSLMode {
+		t.Error("PGSSLMODE missing — pg_dump would silently fall back to the libpq default")
+	}
+}
+
+func TestPgDumpEnv_SetsAConnectTimeout(t *testing.T) {
+	if !slices.Contains(pgDumpEnv(&BackupConfig{Password: "secret"}), "PGCONNECT_TIMEOUT=30") {
+		t.Error("PGCONNECT_TIMEOUT missing — a hung TCP connect keeps the Job running until its deadline")
+	}
+}
+
+func TestPgDumpEnv_KeepsAConnectTimeoutFromTheEnvironment(t *testing.T) {
+	t.Setenv("PGCONNECT_TIMEOUT", "5")
+
+	env := pgDumpEnv(&BackupConfig{Password: "secret"})
+
+	if !slices.Contains(env, "PGCONNECT_TIMEOUT=5") || slices.Contains(env, "PGCONNECT_TIMEOUT=30") {
+		t.Errorf("an explicit PGCONNECT_TIMEOUT must win, got %v", env)
+	}
+}
+
+func TestPgDumpEnv_SkipsEmptySSLMode(t *testing.T) {
+	for _, entry := range pgDumpEnv(&BackupConfig{Password: "secret"}) {
+		if entry == "PGSSLMODE=" {
+			t.Error("an empty PGSSLMODE is rejected by libpq; the variable has to stay unset")
+		}
 	}
 }
 

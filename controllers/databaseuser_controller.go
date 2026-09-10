@@ -16,9 +16,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
 	"github.com/certainty3452/dbtether/pkg/postgres"
@@ -61,38 +64,33 @@ func (r *DatabaseUserReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	username := r.getUsername(&user)
-
-	// Check if secret still exists before early exit
-	if user.Status.Phase == "Ready" && user.Status.ObservedGeneration == user.Generation {
-		secretName := r.getSecretName(&user)
-		var secret corev1.Secret
-		if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: user.Namespace}, &secret); err == nil {
-			// Rotation is time-driven: only fall through when it is actually due,
-			// otherwise re-arm the requeue this fast path would otherwise swallow.
-			if !r.shouldRotatePassword(&user) {
-				return ctrl.Result{RequeueAfter: r.calculateRequeueAfter(&user)}, nil
-			}
-		} else {
-			logger.Info("secret missing, triggering reconciliation", "secret", secretName)
-		}
-	}
-	logger.V(1).Info("reconciling", "username", username)
-
 	if !user.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, &user)
 	}
 
-	if result, err := r.ensureFinalizer(ctx, &user); result != nil || err != nil {
-		return *result, err
-	}
-
-	// Validate spec
-	if err := r.validateSpec(&user); err != nil {
+	// Ahead of the fast path: a Ready user whose spec turned invalid must not stay Ready.
+	if err := ValidateUserSpec(&user); err != nil {
 		return r.setStatus(ctx, &user, &statusUpdate{
 			Phase:   "Failed",
 			Message: fmt.Sprintf("validation error: %s", err.Error()),
 		})
+	}
+
+	// Ahead of the fast path: a Ready owner must still be demoted when an older claim appears.
+	conflicts, err := r.evaluateOwnerConflicts(ctx, &user)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if conflicts.empty() {
+		if result := r.readyFastPath(ctx, &user); result != nil {
+			return *result, nil
+		}
+	}
+	logger.V(1).Info("reconciling", "username", r.getUsername(&user))
+
+	if result, err := r.ensureFinalizer(ctx, &user); result != nil || err != nil {
+		return *result, err
 	}
 
 	// Fetch all databases and validate they are on the same cluster
@@ -101,18 +99,42 @@ func (r *DatabaseUserReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return *result, err
 	}
 
-	return r.reconcileUser(ctx, &user, databases, cluster)
+	return r.reconcileUser(ctx, &user, databases, cluster, conflicts)
 }
 
-// validateSpec ensures the user spec is valid
-func (r *DatabaseUserReconciler) validateSpec(user *databasesv1alpha1.DatabaseUser) error {
-	if user.Spec.Database != nil && len(user.Spec.Databases) > 0 {
-		return fmt.Errorf("cannot specify both 'database' and 'databases' - use one or the other")
+func (r *DatabaseUserReconciler) readyFastPath(ctx context.Context, user *databasesv1alpha1.DatabaseUser) *ctrl.Result {
+	if user.Status.Phase != "Ready" || user.Status.ObservedGeneration != user.Generation {
+		return nil
 	}
-	if !user.Spec.HasDatabases() {
-		return fmt.Errorf("must specify either 'database' or 'databases'")
+
+	secretNames := r.fastPathSecretNames(user)
+	if len(secretNames) == 0 {
+		return nil
 	}
-	return nil
+	for _, secretName := range secretNames {
+		var secret corev1.Secret
+		if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: user.Namespace}, &secret); err != nil {
+			log.FromContext(ctx).Info("secret missing, triggering reconciliation", "secret", secretName)
+			return nil
+		}
+	}
+	if r.shouldRotatePassword(user) {
+		return nil
+	}
+	// Rotation is time-driven: re-arm the requeue this fast path would otherwise swallow.
+	return &ctrl.Result{RequeueAfter: r.calculateRequeueAfter(user)}
+}
+
+func (r *DatabaseUserReconciler) fastPathSecretNames(user *databasesv1alpha1.DatabaseUser) []string {
+	if user.Spec.SecretGeneration != "perDatabase" {
+		return []string{r.getSecretName(user)}
+	}
+	accesses := user.Spec.GetDatabases()
+	names := make([]string, 0, len(accesses))
+	for _, access := range accesses {
+		names = append(names, r.getSecretNameForDatabase(user, access.Name))
+	}
+	return names
 }
 
 // validateAndFetchDatabases fetches all databases and validates they are on the same cluster
@@ -594,7 +616,8 @@ func (r *DatabaseUserReconciler) ensureFinalizer(ctx context.Context, user *data
 }
 
 func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
-	databases []*databasesv1alpha1.Database, cluster *databasesv1alpha1.DBCluster) (ctrl.Result, error) {
+	databases []*databasesv1alpha1.Database, cluster *databasesv1alpha1.DBCluster,
+	conflicts ownerConflicts) (ctrl.Result, error) {
 
 	username := r.getUsername(user)
 	dbNames := make([]string, len(databases))
@@ -632,7 +655,7 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 		return r.setStatus(ctx, user, &baseStatus)
 	}
 
-	dbStatuses := r.applyPerDatabasePrivileges(ctx, pgClient, user, username, databases)
+	dbStatuses, applyFailures := r.applyPerDatabasePrivileges(ctx, pgClient, user, username, databases, conflicts)
 
 	if err := r.syncRuntimeParams(ctx, pgClient, user, username); err != nil {
 		baseStatus.Phase = "Failed"
@@ -647,14 +670,22 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 
 	// A per-database apply failure must not read as Ready: surface it top-level
 	// and return an error so controller-runtime retries with backoff.
-	if failed := failedDatabaseNames(dbStatuses); len(failed) > 0 {
-		msg := fmt.Sprintf("failed to apply privileges for database(s): %s", strings.Join(failed, ", "))
+	if len(applyFailures) > 0 {
+		msg := fmt.Sprintf("failed to apply privileges for database(s): %s", strings.Join(applyFailures, ", "))
 		baseStatus.Phase = "Failed"
 		baseStatus.Message = msg
 		if _, err := r.setStatus(ctx, user, &baseStatus); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, errors.New(msg)
+	}
+
+	// Recovery arrives through enqueueOwnerPeers; the requeue is the rotation timer alone.
+	if messages := conflicts.messages(); len(messages) > 0 {
+		baseStatus.Phase = "Failed"
+		baseStatus.Message = strings.Join(messages, "; ")
+		baseStatus.RequeueAfter = r.calculateRequeueAfter(user)
+		return r.setStatus(ctx, user, &baseStatus)
 	}
 
 	log.FromContext(ctx).Info("user ready", "username", username, "databases", len(databases))
@@ -680,33 +711,49 @@ func (r *DatabaseUserReconciler) syncPostgresUser(ctx context.Context, pgClient 
 }
 
 func (r *DatabaseUserReconciler) applyPerDatabasePrivileges(ctx context.Context, pgClient postgres.ClientInterface,
-	user *databasesv1alpha1.DatabaseUser, username string, databases []*databasesv1alpha1.Database) []databasesv1alpha1.DatabaseAccessStatus {
+	user *databasesv1alpha1.DatabaseUser, username string, databases []*databasesv1alpha1.Database,
+	conflicts ownerConflicts) (dbStatuses []databasesv1alpha1.DatabaseAccessStatus, applyFailures []string) {
 
-	dbStatuses := make([]databasesv1alpha1.DatabaseAccessStatus, len(databases))
+	dbStatuses = make([]databasesv1alpha1.DatabaseAccessStatus, len(databases))
 	dbAccesses := user.Spec.GetDatabases()
 
 	for i, db := range databases {
 		dbName := r.getDatabaseNameFromSpec(db)
 		grants := ResolveUserGrants(user, dbAccesses[i])
+		lost := conflicts.lossFor(db.Namespace, db.Name)
+		if lost != "" {
+			grants = LoserGrants(grants)
+		}
 
 		status := databasesv1alpha1.DatabaseAccessStatus{
 			Name:         dbAccesses[i].Name,
 			Namespace:    dbAccesses[i].Namespace,
 			DatabaseName: dbName,
 			Privileges:   grants.Privileges,
+			Phase:        "Ready",
+		}
+		if lost != "" {
+			status.Phase = "Failed"
+			status.Message = lost
 		}
 		if err := pgClient.ApplyPrivileges(ctx, username, dbName, grants.Privileges, grants.AdditionalGrants); err != nil {
 			status.Phase = "Failed"
-			status.Message = err.Error()
-		} else {
-			status.Phase = "Ready"
+			status.Message = appendStatusMessage(status.Message, err.Error())
+			applyFailures = append(applyFailures, dbName)
 		}
 		if user.Spec.SecretGeneration == "perDatabase" {
 			status.SecretName = r.getSecretNameForDatabase(user, db.Name)
 		}
 		dbStatuses[i] = status
 	}
-	return dbStatuses
+	return dbStatuses, applyFailures
+}
+
+func appendStatusMessage(existing, addition string) string {
+	if existing == "" {
+		return addition
+	}
+	return existing + "; " + addition
 }
 
 func (r *DatabaseUserReconciler) syncRuntimeParams(ctx context.Context, pgClient postgres.ClientInterface,
@@ -1474,19 +1521,15 @@ func (r *DatabaseUserReconciler) buildDatabasesSummary(databases []databasesv1al
 	return fmt.Sprintf("%s (+%d)", databases[0].DatabaseName, len(databases)-1)
 }
 
-func failedDatabaseNames(statuses []databasesv1alpha1.DatabaseAccessStatus) []string {
-	var failed []string
-	for _, s := range statuses {
-		if s.Phase == "Failed" {
-			failed = append(failed, s.DatabaseName)
-		}
-	}
-	return failed
-}
-
 func (r *DatabaseUserReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := RegisterIndexers(context.Background(), mgr); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&databasesv1alpha1.DatabaseUser{}).
 		Owns(&corev1.Secret{}).
+		Watches(&databasesv1alpha1.DatabaseUser{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueOwnerPeers),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Complete(r)
 }

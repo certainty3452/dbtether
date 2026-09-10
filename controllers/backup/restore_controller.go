@@ -495,7 +495,7 @@ func (r *RestoreReconciler) evaluateJobStatus(ctx context.Context, restore *data
 	if job.Status.Failed > 0 {
 		message := "restore job failed"
 		// Try to get failure reason from pod
-		if reason := r.getJobFailureReason(ctx, job); reason != "" {
+		if reason := jobFailureReason(ctx, r.Client, job); reason != "" {
 			message = reason
 		}
 		logger.Error(nil, "restore failed", "reason", message)
@@ -504,25 +504,6 @@ func (r *RestoreReconciler) evaluateJobStatus(ctx context.Context, restore *data
 
 	// Still running
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-}
-
-func (r *RestoreReconciler) getJobFailureReason(ctx context.Context, job *batchv1.Job) string {
-	var pods corev1.PodList
-	if err := r.List(ctx, &pods, client.InNamespace(job.Namespace), client.MatchingLabels{
-		"job-name": job.Name,
-	}); err != nil {
-		return ""
-	}
-
-	for i := range pods.Items {
-		for j := range pods.Items[i].Status.ContainerStatuses {
-			cs := &pods.Items[i].Status.ContainerStatuses[j]
-			if cs.State.Terminated != nil && cs.State.Terminated.Reason != "" {
-				return cs.State.Terminated.Reason
-			}
-		}
-	}
-	return ""
 }
 
 func (r *RestoreReconciler) handleDeletion(ctx context.Context, restore *databasesv1alpha1.Restore) (ctrl.Result, error) {
@@ -647,6 +628,9 @@ func (r *RestoreReconciler) computeSpecHash(restore *databasesv1alpha1.Restore) 
 }
 
 func (r *RestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := controllers.RegisterIndexers(context.Background(), mgr); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&databasesv1alpha1.Restore{}).
 		// Jobs don't have OwnerReference (cross-namespace), so we watch by labels
@@ -801,9 +785,7 @@ func (r *RestoreReconciler) recordGrantsSkipped(restore *databasesv1alpha1.Resto
 func (r *RestoreReconciler) regrantDatabaseUsers(
 	ctx context.Context,
 	restore *databasesv1alpha1.Restore,
-) (failures []userGrantFailure, err error) {
-	logger := log.FromContext(ctx)
-
+) ([]userGrantFailure, error) {
 	var db databasesv1alpha1.Database
 	if err := r.Get(ctx, types.NamespacedName{
 		Name:      restore.Spec.Target.DatabaseRef.Name,
@@ -824,6 +806,7 @@ func (r *RestoreReconciler) regrantDatabaseUsers(
 	if len(users.Items) == 0 {
 		return nil, nil
 	}
+	ownerWinner := controllers.ElectOwner(users.Items, db.Namespace, db.Name)
 
 	var cluster databasesv1alpha1.DBCluster
 	if err := r.Get(ctx, types.NamespacedName{Name: db.Spec.ClusterRef.Name}, &cluster); err != nil {
@@ -838,12 +821,45 @@ func (r *RestoreReconciler) regrantDatabaseUsers(
 		return nil, fmt.Errorf("failed to connect to cluster %s: %w", cluster.Name, err)
 	}
 
-	for i := range users.Items {
-		user := &users.Items[i]
+	return applyRestoredGrants(ctx, pgClient, users.Items, &db, ownerWinner), nil
+}
+
+func applyRestoredGrants(
+	ctx context.Context,
+	pgClient postgres.ClientInterface,
+	users []databasesv1alpha1.DatabaseUser,
+	db *databasesv1alpha1.Database,
+	ownerWinner *databasesv1alpha1.DatabaseUser,
+) []userGrantFailure {
+	logger := log.FromContext(ctx)
+
+	var failures []userGrantFailure
+	for i := range users {
+		user := &users[i]
 
 		grants, ok := controllers.ResolveUserGrantsForDatabase(user, db.Namespace, db.Name)
 		if !ok {
 			continue
+		}
+
+		// An invalid spec resolves to a different grant set than the user's own controller applies.
+		if err := controllers.ValidateUserSpec(user); err != nil {
+			logger.Info("skipping grants for a DatabaseUser with an invalid spec",
+				"user", user.Name, "namespace", user.Namespace, "reason", err.Error())
+			continue
+		}
+
+		// Granting to a role the user's finalizer is dropping makes that DROP ROLE fail.
+		if !user.DeletionTimestamp.IsZero() {
+			logger.Info("skipping grants for a DatabaseUser being deleted",
+				"user", user.Name, "namespace", user.Namespace, "role", grants.Username)
+			continue
+		}
+
+		if grants.Privileges == "owner" && !controllers.SameUser(ownerWinner, user) {
+			logger.Info("lowering grants to admin for a DatabaseUser that lost the owner election",
+				"user", user.Name, "namespace", user.Namespace, "database", db.Name)
+			grants = controllers.LoserGrants(grants)
 		}
 
 		// The role decides, not the CR phase: a Failed user can still own a live
@@ -874,7 +890,7 @@ func (r *RestoreReconciler) regrantDatabaseUsers(
 			"user", grants.Username, "database", db.Status.DatabaseName, "privileges", grants.Privileges)
 	}
 
-	return failures, nil
+	return failures
 }
 
 type userGrantFailure struct {

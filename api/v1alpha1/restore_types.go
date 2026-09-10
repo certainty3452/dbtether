@@ -66,8 +66,7 @@ type RestoreSpec struct {
 	// How to handle conflicts with existing data
 	// - fail: Abort if database is not empty (default)
 	// - drop: Drop and recreate the database before restore
-	// - overwrite: Restore over existing data (may cause conflicts)
-	// +kubebuilder:validation:Enum=fail;drop;overwrite
+	// +kubebuilder:validation:Enum=fail;drop
 	// +kubebuilder:default=fail
 	// +optional
 	OnConflict string `json:"onConflict,omitempty"`

@@ -56,11 +56,11 @@ spec:
 | `secret` | object | ❌ | — | Secret configuration (see below) |
 | `secretGeneration` | enum | ❌ | `primary` | How to generate secrets: `primary` or `perDatabase` |
 
-\* One of `database` or `databases` is required.
+\* Exactly one of `database` or `databases` is required.
 
 ### database / databases
 
-You must specify either `database` (for single database) or `databases` (for multiple databases).
+Specify exactly one of `database` (a single database) or `databases` (several). Setting both or neither is rejected on apply.
 
 **Single database:**
 ```yaml
@@ -83,7 +83,7 @@ spec:
       # uses spec.privileges (default: readonly)
 ```
 
-All databases must be on the same DBCluster.
+All databases must be on the same DBCluster, and each may be listed only once. An entry without `namespace` resolves to the DatabaseUser's own.
 
 ## username
 
@@ -113,6 +113,10 @@ Preset privilege levels applied to the `public` schema:
 Can be set at spec level (default for all databases) or per-database.
 
 **Note on `owner` privilege:**
+- Only one DatabaseUser holds `owner` on a Database: the oldest by creation time wins, ties broken by namespace then name
+- Every other claimant gets `admin` there and reports `Failed`
+- A DatabaseUser that is being deleted, or whose spec fails validation, is not a candidate
+- The grant pass after a restore applies the same rule
 - Transfers ownership of the tables, sequences, views, materialized views, types and routines in `public` that the user does not already own; objects belonging to an extension are left with the extension owner
 - The operator grants itself membership in the user's role before transferring ownership and before reassigning it on deletion; that membership is permanent and goes away only with the role (`DROP ROLE`)
 - The multirange of a range type stays with its creator on PostgreSQL 16 and is dropped together with the range type
@@ -213,6 +217,8 @@ Creates secrets:
 - `airbyte-service-temporal-db-credentials` with `POSTGRES_DATABASE: temporal_db`
 
 All secrets share the same password.
+
+The secret name comes from the Database name alone, so the listed Databases must have distinct names.
 
 ## secret
 
@@ -419,9 +425,9 @@ kubectl delete secret my-app-readonly-credentials -n my-team
 
 ## Troubleshooting
 
-### Phase: Failed, message: "validation error: cannot specify both 'database' and 'databases'"
+### Rejected on apply: "exactly one of database or databases must be set"
 
-Use either `database` OR `databases`, not both:
+Admission rejects the resource; it is never created. Set exactly one:
 
 ```yaml
 # Wrong
@@ -431,10 +437,53 @@ spec:
   databases:
     - name: db2
 
+# Wrong
+spec:
+  privileges: readonly
+
 # Correct
 spec:
   database:
     name: db1
+```
+
+### Phase: Failed, message: "validation error: database <namespace>/<name> is listed more than once"
+
+`databases` names the same Database twice. An entry without `namespace` resolves to the DatabaseUser's own — `my-team` here — so both entries are one reference:
+
+```yaml
+# Wrong
+spec:
+  databases:
+    - name: db1
+    - name: db1
+      namespace: my-team
+
+# Correct
+spec:
+  databases:
+    - name: db1
+      privileges: readwrite
+```
+
+### Phase: Failed, message: "validation error: per-database secrets need distinct Database names: \<name\> is referenced from \<ns1\> and \<ns2\>"
+
+With `secretGeneration: perDatabase` the secret name comes from the Database name alone, so two Databases sharing a name across namespaces write to one secret. Drop one, or use `secretGeneration: primary`:
+
+```yaml
+# Wrong
+spec:
+  secretGeneration: perDatabase
+  databases:
+    - name: orders
+    - name: orders
+      namespace: other-team
+
+# Correct
+spec:
+  secretGeneration: perDatabase
+  databases:
+    - name: orders
 ```
 
 ### Phase: Failed, message: "all databases must be on the same cluster"
@@ -447,6 +496,25 @@ Check that database resource exists:
 ```bash
 kubectl get database -A
 ```
+
+### Phase: Failed, message: "owner conflict: ..."
+
+Two DatabaseUsers claim `owner` on the same Database; the older one keeps it. The other gets `admin` there and marks that database `Failed` in `status.databases`, with the same message at the top level; its role, secret, other databases and rotation keep reconciling.
+
+The message names the holder. Lower the reporting user to `admin`:
+
+```yaml
+spec:
+  privileges: admin
+```
+
+Or delete the one that should not own the objects:
+
+```bash
+kubectl delete databaseuser <name> -n <namespace>
+```
+
+Either way the reporting DatabaseUser recovers on its own.
 
 ### User has access to unexpected databases
 

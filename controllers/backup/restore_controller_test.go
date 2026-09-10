@@ -66,7 +66,7 @@ func TestRestoreSpec_Validation(t *testing.T) {
 			isValid: true,
 		},
 		{
-			name: "valid with overwrite conflict",
+			name: "valid with fail conflict",
 			spec: dbtether.RestoreSpec{
 				Source: dbtether.RestoreSource{
 					BackupRef: &dbtether.BackupReference{
@@ -78,7 +78,7 @@ func TestRestoreSpec_Validation(t *testing.T) {
 						Name: "my-database",
 					},
 				},
-				OnConflict: "overwrite",
+				OnConflict: "fail",
 			},
 			isValid: true,
 		},
@@ -1326,6 +1326,60 @@ func TestRestoreReconciler_RegrantsGrantsOnSuccess(t *testing.T) {
 	assert.Equal(t, "Completed", updated.Status.Phase)
 }
 
+func TestRestoreReconciler_RegrantsOwnerToWinnerAdminToLoser(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+
+	base := time.Now().Add(-time.Hour)
+	holder := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "owner-holder",
+			Namespace:         "app-ns",
+			CreationTimestamp: metav1.NewTime(base),
+		},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "owner"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+	loser := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "owner-loser",
+			Namespace:         "app-ns",
+			CreationTimestamp: metav1.NewTime(base.Add(time.Minute)),
+		},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "owner"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, holder, loser).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient()}
+	require.NoError(t, pg.CreateUser(context.Background(), "owner_holder", "pw"))
+	require.NoError(t, pg.CreateUser(context.Background(), "owner_loser", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	require.Len(t, pg.calls, 2, "both users must be re-granted")
+	presets := map[string]string{}
+	for _, call := range pg.calls {
+		presets[call.Username] = call.Preset
+	}
+	assert.Equal(t, map[string]string{"owner_holder": "owner", "owner_loser": "admin"}, presets)
+}
+
 func TestRestoreReconciler_RegrantFailureKeepsGranting(t *testing.T) {
 	restore, job, db, cluster, secret := newRegrantFixture()
 
@@ -1395,6 +1449,105 @@ func TestRestoreReconciler_RegrantSkipsUsersWithoutRole(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Empty(t, pg.calls, "the role does not exist yet, so the user's own reconcile is what creates and grants it")
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Completed", updated.Status.Phase)
+}
+
+func TestRestoreReconciler_RegrantSkipsTerminatingUser(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+
+	now := metav1.NewTime(time.Now())
+	terminating := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "going-user",
+			Namespace:         "app-ns",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{controllers.UserFinalizerName},
+		},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "readwrite"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+	staying := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "staying-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "readwrite"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, terminating, staying).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient()}
+	require.NoError(t, pg.CreateUser(context.Background(), "going_user", "pw"))
+	require.NoError(t, pg.CreateUser(context.Background(), "staying_user", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	require.Len(t, pg.calls, 1, "granting to a role being dropped would break the user's finalizer")
+	assert.Equal(t, "staying_user", pg.calls[0].Username)
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Completed", updated.Status.Phase)
+}
+
+func TestRestoreReconciler_RegrantSkipsUserWithInvalidSpec(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+
+	duplicated := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "duplicated-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Databases: []dbtether.DatabaseAccess{
+				{Name: "my-database", Privileges: "readwrite"},
+				{Name: "my-database", Namespace: "app-ns", Privileges: "owner"},
+			},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+	valid := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "valid-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "readwrite"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, duplicated, valid).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient()}
+	require.NoError(t, pg.CreateUser(context.Background(), "duplicated_user", "pw"))
+	require.NoError(t, pg.CreateUser(context.Background(), "valid_user", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	require.Len(t, pg.calls, 1, "a spec its own controller rejects must not be applied by the restore either")
+	assert.Equal(t, "valid_user", pg.calls[0].Username)
 
 	var updated dbtether.Restore
 	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
@@ -1491,6 +1644,55 @@ func TestRestoreReconciler_JobDeletedWhileRunning_Failed(t *testing.T) {
 	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
 	assert.Equal(t, "Failed", updated.Status.Phase)
 	assert.Equal(t, "restore job was deleted", updated.Status.Message)
+}
+
+func TestJobFailureReasonPrefersTerminationMessage(t *testing.T) {
+	tests := []struct {
+		name       string
+		terminated corev1.ContainerStateTerminated
+		want       string
+	}{
+		{
+			name: "termination message wins over reason",
+			terminated: corev1.ContainerStateTerminated{
+				Reason:  "Error",
+				Message: "restore failed: psql failed: exit status 3: psql:<stdin>:12: ERROR:  syntax error\n",
+			},
+			want: "restore failed: psql failed: exit status 3: psql:<stdin>:12: ERROR:  syntax error",
+		},
+		{
+			name: "reason without a termination message",
+			terminated: corev1.ContainerStateTerminated{
+				Reason:  "OOMKilled",
+				Message: "   \n",
+			},
+			want: "OOMKilled",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			job := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{Name: "restore-my-restore-abc123", Namespace: "dbtether"},
+			}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "restore-my-restore-abc123-xyz",
+					Namespace: "dbtether",
+					Labels:    map[string]string{"job-name": job.Name},
+				},
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{
+						{State: corev1.ContainerState{Terminated: &tt.terminated}},
+					},
+				},
+			}
+
+			fakeClient := fake.NewClientBuilder().WithScheme(newRestoreTestScheme()).WithObjects(job, pod).Build()
+
+			assert.Equal(t, tt.want, jobFailureReason(context.Background(), fakeClient, job))
+		})
+	}
 }
 
 func TestRestoreReconciler_DatabaseDeletedDuringGranting_CompletesWithWarning(t *testing.T) {

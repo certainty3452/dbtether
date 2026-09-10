@@ -44,6 +44,7 @@ type BackupScheduleReconciler struct {
 
 // +kubebuilder:rbac:groups=dbtether.io,resources=backupschedules,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=dbtether.io,resources=backupschedules/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=dbtether.io,resources=backupschedules/finalizers,verbs=update
 // +kubebuilder:rbac:groups=dbtether.io,resources=backups,verbs=get;list;watch;create;update;patch;delete
 
 func (r *BackupScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

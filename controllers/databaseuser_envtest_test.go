@@ -1103,8 +1103,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
 		})
 
-		It("Should validate mutually exclusive database and databases fields", func() {
-			By("Creating a DatabaseUser with both database and databases (should fail validation)")
+		It("Should reject a DatabaseUser with both database and databases", func() {
 			user := &databasesv1alpha1.DatabaseUser{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "user-both-fields",
@@ -1120,23 +1119,26 @@ var _ = Describe("DatabaseUser Controller", func() {
 					Privileges: "readonly",
 				},
 			}
-			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
 
-			By("The controller should set status to Failed due to validation error")
-			createdUser := &databasesv1alpha1.DatabaseUser{}
-			Eventually(func() string {
-				err := k8sClient.Get(ctx, types.NamespacedName{
-					Name:      "user-both-fields",
+			err := k8sClient.Create(ctx, user)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("exactly one of database or databases"))
+		})
+
+		It("Should reject a DatabaseUser with neither database nor databases", func() {
+			user := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-no-fields",
 					Namespace: namespace,
-				}, createdUser)
-				if err != nil {
-					return ""
-				}
-				return createdUser.Status.Phase
-			}, timeout, interval).Should(Equal("Failed"))
+				},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Privileges: "readonly",
+				},
+			}
 
-			By(stepCleaningUp)
-			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+			err := k8sClient.Create(ctx, user)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("exactly one of database or databases"))
 		})
 
 		It("Should accept per-database privilege overrides", func() {
@@ -1908,6 +1910,64 @@ var _ = Describe("DatabaseUser Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, user)).Should(Succeed())
 			Expect(k8sClient.Delete(ctx, user)).Should(Succeed())
+		})
+	})
+
+	Context("When two DatabaseUsers claim owner on the same Database", func() {
+		It("Should fail the second one with an owner conflict until the holder is gone", func() {
+			primary := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "owner-primary", Namespace: namespace},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database:   &databasesv1alpha1.DatabaseAccess{Name: databaseName},
+					Privileges: "owner",
+				},
+			}
+			Expect(k8sClient.Create(ctx, primary)).Should(Succeed())
+
+			Eventually(func() string {
+				fetched := &databasesv1alpha1.DatabaseUser{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{
+					Name: "owner-primary", Namespace: namespace,
+				}, fetched); err != nil {
+					return ""
+				}
+				return fetched.Status.Phase
+			}, timeout, interval).ShouldNot(BeEmpty())
+
+			secondary := &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "owner-secondary", Namespace: namespace},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database:   &databasesv1alpha1.DatabaseAccess{Name: databaseName},
+					Privileges: "owner",
+				},
+			}
+			Expect(k8sClient.Create(ctx, secondary)).Should(Succeed())
+
+			Eventually(func() string {
+				fetched := &databasesv1alpha1.DatabaseUser{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{
+					Name: "owner-secondary", Namespace: namespace,
+				}, fetched); err != nil {
+					return ""
+				}
+				return fetched.Status.Message
+			}, timeout, interval).Should(ContainSubstring("owner conflict"))
+
+			By("Deleting the owner holder")
+			Expect(k8sClient.Delete(ctx, primary)).Should(Succeed())
+
+			Eventually(func() string {
+				fetched := &databasesv1alpha1.DatabaseUser{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{
+					Name: "owner-secondary", Namespace: namespace,
+				}, fetched); err != nil {
+					return ""
+				}
+				return fetched.Status.Phase
+			}, timeout, interval).Should(Equal("Ready"))
+
+			By(stepCleaningUp)
+			Expect(k8sClient.Delete(ctx, secondary)).Should(Succeed())
 		})
 	})
 })

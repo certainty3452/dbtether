@@ -41,7 +41,7 @@ As a GitOps enthusiast, this operator fits perfectly into my workflow. I hope it
 - **Database isolation** - users are granted access only to their assigned database (cannot query other databases)
 - **Configurable deletion policies** - choose between Retain (keep data) or Delete on resource removal
 - **Database backups** - one-time and scheduled backups with `pg_dump` → gzip → cloud storage
-- **Database restore** - restore from backups with conflict handling (fail, drop, overwrite)
+- **Database restore** - restore from backups with conflict handling (fail, drop)
 - **Multi-cloud storage** - backup to AWS S3, Google Cloud Storage, or Azure Blob Storage
 - **Retention policies** - automatic cleanup with `keepLast`, `keepDaily`, `keepWeekly`, `keepMonthly`
 - **Cloud-native auth** - IRSA, Workload Identity, Managed Identity for secure storage access
@@ -222,7 +222,7 @@ See full documentation in [docs/](docs/README.md):
 - `spec.source.path` - Direct path to backup file (requires `storageRef`)
 - `spec.source.storageRef.name` - BackupStorage for direct path
 - `spec.target.databaseRef.name` - Target Database to restore into (required)
-- `spec.onConflict` - `fail` (default), `drop`, or `overwrite`
+- `spec.onConflict` - `fail` (default) or `drop`
 - `spec.ttlAfterCompletion` - Job auto-cleanup duration (default: 1h)
 
 ## Required permissions and security implications

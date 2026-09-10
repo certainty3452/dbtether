@@ -138,7 +138,7 @@ func TestBackupSpec_StorageRef(t *testing.T) {
 }
 
 func TestRestoreSpec_OnConflictValues(t *testing.T) {
-	validValues := []string{"fail", "drop", "overwrite"}
+	validValues := []string{"fail", "drop"}
 
 	for _, v := range validValues {
 		t.Run(v, func(t *testing.T) {

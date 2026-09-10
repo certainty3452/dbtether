@@ -50,10 +50,24 @@ jobs:
           export KUBEBUILDER_ASSETS=$(setup-envtest use 1.31.0 -p path)
           go test ./... -tags=envtest -race -coverprofile=coverage.out -covermode=atomic
 
+      - name: Install PostgreSQL clients
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-client-16 postgresql-client-18
+
       - name: Run PostgreSQL integration tests
         env:
           DBTETHER_TEST_DSN: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
-        run: go test ./pkg/postgres/ -tags=integration -count=1 -v
+          DBTETHER_TEST_PG_CLIENT_DIRS: 16=/usr/lib/postgresql/16/bin,18=/usr/lib/postgresql/18/bin
+        run: PATH=/usr/lib/postgresql/16/bin:$PATH go test ./pkg/postgres/ ./pkg/backup/ -tags=integration -count=1 -v
+
+      - name: Run PostgreSQL integration tests against an older server
+        env:
+          DBTETHER_TEST_DSN: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+          DBTETHER_TEST_PG_CLIENT_DIRS: 16=/usr/lib/postgresql/16/bin,18=/usr/lib/postgresql/18/bin
+        run: PATH=/usr/lib/postgresql/18/bin:$PATH go test ./pkg/backup/ -tags=integration -count=1 -v
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4
@@ -80,6 +94,18 @@ jobs:
           go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.20.1 object:headerFile="hack/boilerplate.go.txt" paths="./..."
           go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.20.1 rbac:roleName=manager-role crd paths="./..." output:crd:artifacts:config=config/crd/bases
           git diff --exit-code config/crd/bases/ config/rbac/role.yaml api/v1alpha1/zz_generated.deepcopy.go
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t dbtether:ci .
+
+      - name: Verify the bundled PostgreSQL clients
+        run: |
+          docker run --rm --entrypoint sh dbtether:ci -c 'set -e; for v in 16 17 18; do /usr/libexec/postgresql$v/pg_dump --version; /usr/libexec/postgresql$v/psql --version; done'
 
   chart:
     runs-on: ubuntu-latest

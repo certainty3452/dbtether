@@ -89,6 +89,8 @@ Template for the backup filename.
 
 Sets `ttlSecondsAfterFinished` on the Kubernetes Job that runs the backup. Kubernetes deletes the Job and its pods that long after the Job finishes; the Backup resource and its status are untouched, and the uploaded backup file stays in storage.
 
+Each attempt runs in its own Pod; failed Pods are kept until the TTL, so their logs survive.
+
 | Value | Behavior |
 |-------|----------|
 | Not set | Job is deleted 1 hour after it finishes |
@@ -143,7 +145,7 @@ The operator writes `status.observedGeneration` when a run starts, not when it f
 | `completedAt` | time | When backup completed |
 | `observedGeneration` | int64 | The spec generation the current run started with |
 | `failureReason` | string | Machine-readable failure reason (e.g., `BackoffLimitExceeded`) |
-| `failureMessage` | string | Detailed failure message |
+| `failureMessage` | string | What the backup Job reported, or the Job's condition message |
 | `failedAttempts` | int | Number of failed Job attempts |
 | `lastPodName` | string | Name of the last Pod (for log retrieval) |
 
@@ -295,6 +297,10 @@ Backups are created using `pg_dump` with the following settings:
 - **Compression:** gzip (`.sql.gz`)
 - **Encoding:** UTF-8
 
+### Client version
+
+Backup Jobs run the bundled `pg_dump` matching the source server's major version, or the oldest bundled one above it. The image bundles the PostgreSQL 16, 17 and 18 clients; a newer server fails the Job with a message naming the majors.
+
 ### S3 Object Tags
 
 When uploading to S3, the operator adds metadata tags (best-effort):
@@ -332,7 +338,7 @@ When uploading to S3, the operator adds metadata tags (best-effort):
 
 Too many concurrent backups for this cluster. The backup will be automatically retried in 30 seconds.
 
-### Phase: Failed, message: "S3 upload failed: AccessDenied"
+### Phase: Failed, message: "upload failed: failed to upload to S3: ..."
 
 Check IAM permissions. See [BackupStorage Troubleshooting](backupstorage.md#troubleshooting).
 

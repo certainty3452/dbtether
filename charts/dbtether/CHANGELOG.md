@@ -2,6 +2,23 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.9.0] - 2026-09-10
+
+### Breaking
+- Restore no longer offers `onConflict: overwrite`. Use `drop` to replace the database or `fail` to refuse when it is not empty.
+- A DatabaseUser must list each database once and use either `database` or `databases`, not both. With per-database secrets (`secretGeneration: perDatabase`) the database names must be unique.
+
+### Fixed
+- A restore that ran into an error used to report success and leave the database half restored. It now restores everything or nothing and reports the error.
+- Restoring into RDS failed on extension comments in the dump. They are skipped now.
+- Empty or unsupported backup files are refused before the target database is touched.
+- Backup Jobs ignored the configured SSL mode.
+- A failed backup now reports what went wrong instead of a generic "retries exhausted".
+
+### Changed
+- Only one DatabaseUser can own a database. When two claim it, the older one keeps ownership and the other is reported as failed.
+- Backup and restore Jobs use the PostgreSQL client that matches the database server version; clients 16, 17 and 18 ship in the image.
+
 ## [0.8.1] - 2026-09-08
 
 ### Fixed

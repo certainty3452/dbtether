@@ -9,6 +9,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -96,7 +97,7 @@ func (r *BackupReconciler) maxConcurrent() int {
 // +kubebuilder:rbac:groups=dbtether.io,resources=dbclusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
@@ -548,7 +549,8 @@ func (r *BackupReconciler) createBackupJob(ctx context.Context, backup *database
 					Annotations: podAnnotations,
 				},
 				Spec: corev1.PodSpec{
-					RestartPolicy:      corev1.RestartPolicyOnFailure,
+					// OnFailure would let the job controller delete the pod, taking the container's reported cause with it.
+					RestartPolicy:      corev1.RestartPolicyNever,
 					ServiceAccountName: "dbtether", // Uses operator's SA for IRSA
 					Containers: []corev1.Container{
 						{
@@ -682,7 +684,7 @@ func (r *BackupReconciler) evaluateJobStatus(ctx context.Context, backup *databa
 		if err := r.updateFailedJobTTL(ctx, backup, job); err != nil {
 			log.FromContext(ctx).Error(err, "failed to update TTL for failed job")
 		}
-		failureInfo := r.getJobFailureInfo(job)
+		failureInfo := r.getJobFailureInfo(ctx, job)
 		return r.updateStatusFailedWithInfo(ctx, backup, job, failureInfo)
 	}
 
@@ -705,6 +707,7 @@ type JobFailureInfo struct {
 	Reason         string // Machine-readable reason (e.g., BackoffLimitExceeded)
 	Message        string // Human-readable message
 	FailedAttempts int32  // Number of failed pod attempts
+	MessageFromPod bool
 }
 
 // isJobFailed reports whether a Job has definitively failed, from its JobFailed condition.
@@ -725,7 +728,7 @@ func isJobFailed(job *batchv1.Job) (string, bool) {
 }
 
 // getJobFailureInfo extracts detailed failure information from a failed job
-func (r *BackupReconciler) getJobFailureInfo(job *batchv1.Job) *JobFailureInfo {
+func (r *BackupReconciler) getJobFailureInfo(ctx context.Context, job *batchv1.Job) *JobFailureInfo {
 	info := &JobFailureInfo{
 		FailedAttempts: job.Status.Failed,
 	}
@@ -735,6 +738,14 @@ func (r *BackupReconciler) getJobFailureInfo(job *batchv1.Job) *JobFailureInfo {
 			info.Reason = c.Reason
 			info.Message = c.Message
 			break
+		}
+	}
+
+	// DeadlineExceeded is a kill the pod never reports, so only the backoff verdict may be replaced.
+	if info.Reason == "" || info.Reason == "BackoffLimitExceeded" {
+		if reason := jobFailureReason(ctx, r.Client, job); reason != "" {
+			info.Message = reason
+			info.MessageFromPod = true
 		}
 	}
 
@@ -759,7 +770,11 @@ func (r *BackupReconciler) updateStatusFailedWithInfo(ctx context.Context, backu
 
 	// Core status fields; specHash and observedGeneration stay as recorded at run start
 	backup.Status.Phase = "Failed"
-	backup.Status.Message = fmt.Sprintf("backup job failed: %s", failureInfo.Reason)
+	cause := failureInfo.Reason
+	if failureInfo.MessageFromPod {
+		cause = failureInfo.Message
+	}
+	backup.Status.Message = fmt.Sprintf("backup job failed: %s", cause)
 
 	// Detailed failure info
 	backup.Status.FailureReason = failureInfo.Reason
@@ -824,30 +839,64 @@ func (r *BackupReconciler) updateStatusJobLost(ctx context.Context, backup *data
 
 // getLastPodName tries to find the name of the last pod that ran for this job
 func (r *BackupReconciler) getLastPodName(ctx context.Context, job *batchv1.Job) string {
+	pod := latestJobPod(ctx, r.Client, job)
+	if pod == nil {
+		return ""
+	}
+	return pod.Name
+}
+
+func latestJobPod(ctx context.Context, c client.Client, job *batchv1.Job) *corev1.Pod {
 	var pods corev1.PodList
-	if err := r.List(ctx, &pods, client.InNamespace(job.Namespace), client.MatchingLabels{
+	if err := c.List(ctx, &pods, client.InNamespace(job.Namespace), client.MatchingLabels{
 		"job-name": job.Name,
 	}); err != nil {
-		return ""
+		return nil
 	}
 
-	if len(pods.Items) == 0 {
-		return ""
-	}
-
-	// Return the most recently created pod
-	var lastPod *corev1.Pod
+	var latest *corev1.Pod
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if lastPod == nil || pod.CreationTimestamp.After(lastPod.CreationTimestamp.Time) {
-			lastPod = pod
+		if latest == nil || podAttemptIsLater(pod, latest) {
+			latest = pod
 		}
 	}
+	return latest
+}
 
-	if lastPod != nil {
-		return lastPod.Name
+func podAttemptIsLater(candidate, incumbent *corev1.Pod) bool {
+	if !candidate.CreationTimestamp.Equal(&incumbent.CreationTimestamp) {
+		return candidate.CreationTimestamp.After(incumbent.CreationTimestamp.Time)
+	}
+	return candidate.Name > incumbent.Name
+}
+
+func jobFailureReason(ctx context.Context, c client.Client, job *batchv1.Job) string {
+	pod := latestJobPod(ctx, c, job)
+	if pod == nil {
+		return ""
+	}
+
+	for i := range pod.Status.ContainerStatuses {
+		cs := &pod.Status.ContainerStatuses[i]
+		if cause := terminationCause(cs.State.Terminated); cause != "" {
+			return cause
+		}
+		if cause := terminationCause(cs.LastTerminationState.Terminated); cause != "" {
+			return cause
+		}
 	}
 	return ""
+}
+
+func terminationCause(terminated *corev1.ContainerStateTerminated) string {
+	if terminated == nil {
+		return ""
+	}
+	if message := strings.TrimSpace(terminated.Message); message != "" {
+		return message
+	}
+	return terminated.Reason
 }
 
 // startRun resets the whole status so a re-run never reports the earlier run's file or failure.
@@ -939,6 +988,10 @@ func (r *BackupReconciler) updateStatusCompleted(ctx context.Context, backup *da
 	// Core status fields; specHash and observedGeneration stay as recorded at run start
 	backup.Status.Phase = "Completed"
 	backup.Status.Message = "backup completed successfully"
+
+	if podName := r.getLastPodName(ctx, job); podName != "" {
+		backup.Status.LastPodName = podName
+	}
 
 	now := metav1.Now()
 	backup.Status.CompletedAt = &now

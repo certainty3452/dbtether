@@ -4,6 +4,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// +kubebuilder:validation:XValidation:rule="has(self.database) != has(self.databases)",message="exactly one of database or databases must be set"
 // +kubebuilder:validation:XValidation:rule="!(self.secretGeneration == 'perDatabase' && has(self.secret) && has(self.secret.name) && size(self.secret.name) > 0)",message="spec.secret.name cannot be set when secretGeneration=perDatabase (each per-DB secret derives its name from the DB)"
 // +kubebuilder:validation:XValidation:rule="!(self.secretGeneration == 'perDatabase' && has(self.secret) && has(self.secret.onConflict) && self.secret.onConflict != 'Fail')",message="onConflict policies Adopt/Merge are not supported when secretGeneration=perDatabase; only Fail is allowed"
 type DatabaseUserSpec struct {

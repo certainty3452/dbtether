@@ -249,6 +249,8 @@ spec:
                 type: string
             type: object
             x-kubernetes-validations:
+            - message: exactly one of database or databases must be set
+              rule: has(self.database) != has(self.databases)
             - message: spec.secret.name cannot be set when secretGeneration=perDatabase
                 (each per-DB secret derives its name from the DB)
               rule: '!(self.secretGeneration == ''perDatabase'' && has(self.secret)

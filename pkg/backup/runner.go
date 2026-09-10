@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -24,6 +25,7 @@ type BackupConfig struct {
 	Database string
 	Username string
 	Password string
+	SSLMode  string
 
 	// Storage
 	StorageType string // "s3", "gcs", "azure"
@@ -96,7 +98,18 @@ func RunBackup(ctx context.Context, cfg *BackupConfig) (*BackupResult, error) {
 		CreatedBy:  "dbtether",
 	}
 
-	result, err := runStreamingBackup(ctx, cfg, fullPath, tags)
+	pgDump, err := resolvePgDump(ctx, pgClientRoot, &serverProbe{
+		Host:     cfg.Host,
+		Port:     cfg.Port,
+		Username: cfg.Username,
+		Database: cfg.Database,
+		Env:      pgDumpEnv(cfg),
+	}, slog.Default())
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := runStreamingBackup(ctx, cfg, pgDump, fullPath, tags)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +120,7 @@ func RunBackup(ctx context.Context, cfg *BackupConfig) (*BackupResult, error) {
 
 // runStreamingBackup streams pg_dump output through gzip directly to storage.
 // Memory usage is O(buffer size) instead of O(database size).
-func runStreamingBackup(ctx context.Context, cfg *BackupConfig, fullPath string, tags *storage.ObjectTags) (*BackupResult, error) {
+func runStreamingBackup(ctx context.Context, cfg *BackupConfig, pgDump, fullPath string, tags *storage.ObjectTags) (*BackupResult, error) {
 	pr, pw := io.Pipe()
 
 	var uncompressedSize atomic.Int64
@@ -118,7 +131,7 @@ func runStreamingBackup(ctx context.Context, cfg *BackupConfig, fullPath string,
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		pgDumpErr = runPgDumpToWriter(ctx, cfg, pw, &uncompressedSize)
+		pgDumpErr = runPgDumpToWriter(ctx, cfg, pgDump, pw, &uncompressedSize)
 	}()
 
 	gzipReader := newGzipStreamReader(pr, &compressedSize)
@@ -132,7 +145,7 @@ func runStreamingBackup(ctx context.Context, cfg *BackupConfig, fullPath string,
 	wg.Wait()
 
 	if pgDumpErr != nil {
-		return nil, fmt.Errorf("pg_dump failed: %w", pgDumpErr)
+		return nil, pgDumpErr
 	}
 	if uploadErr != nil {
 		return nil, fmt.Errorf("upload failed: %w", uploadErr)
@@ -145,11 +158,11 @@ func runStreamingBackup(ctx context.Context, cfg *BackupConfig, fullPath string,
 	}, nil
 }
 
-func runPgDumpToWriter(ctx context.Context, cfg *BackupConfig, pw *io.PipeWriter, size *atomic.Int64) error {
+func runPgDumpToWriter(ctx context.Context, cfg *BackupConfig, pgDump string, pw *io.PipeWriter, size *atomic.Int64) error {
 	defer func() { _ = pw.Close() }()
 
 	// #nosec G204 -- args from trusted config (CRD spec), not user input
-	cmd := exec.CommandContext(ctx, "pg_dump",
+	cmd := exec.CommandContext(ctx, pgDump,
 		"--host", cfg.Host,
 		"--port", fmt.Sprintf("%d", cfg.Port),
 		"--dbname", cfg.Database,
@@ -158,18 +171,26 @@ func runPgDumpToWriter(ctx context.Context, cfg *BackupConfig, pw *io.PipeWriter
 		"--no-owner",
 		"--no-acl",
 	)
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+cfg.Password)
+	cmd.Env = pgDumpEnv(cfg)
 	cmd.Stdout = &countingWriter{w: pw, count: size}
 
 	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	cmd.Stderr = io.MultiWriter(&stderr, os.Stderr)
 
 	if err := cmd.Run(); err != nil {
-		err = fmt.Errorf("pg_dump error: %s, stderr: %s", err, stderr.String())
+		err = fmt.Errorf("pg_dump failed: %w", withDiagnostic(err, serverDiagnostic(stderr.String())))
 		_ = pw.CloseWithError(err)
 		return err
 	}
 	return nil
+}
+
+func pgDumpEnv(cfg *BackupConfig) []string {
+	env := append(os.Environ(), "PGPASSWORD="+cfg.Password)
+	if cfg.SSLMode != "" {
+		env = append(env, "PGSSLMODE="+cfg.SSLMode)
+	}
+	return withConnectTimeout(env)
 }
 
 func uploadToStorage(ctx context.Context, cfg *BackupConfig, path string, data io.Reader, tags *storage.ObjectTags) error {

@@ -247,3 +247,136 @@ func TestResolveUserGrantsForDatabase(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateUserSpec(t *testing.T) {
+	tests := []struct {
+		name    string
+		user    *databasesv1alpha1.DatabaseUser
+		wantErr string
+	}{
+		{
+			name: "single database",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "team-a"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database: &databasesv1alpha1.DatabaseAccess{Name: "orders"},
+				},
+			},
+		},
+		{
+			name: "distinct databases",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "team-a"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Databases: []databasesv1alpha1.DatabaseAccess{
+						{Name: "orders"},
+						{Name: "billing"},
+					},
+				},
+			},
+		},
+		{
+			name: "same name in another namespace is a different database",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "team-a"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Databases: []databasesv1alpha1.DatabaseAccess{
+						{Name: "orders"},
+						{Name: "orders", Namespace: "team-b"},
+					},
+				},
+			},
+		},
+		{
+			name: "perDatabase rejects one name reused across namespaces",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "team-a"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					SecretGeneration: "perDatabase",
+					Databases: []databasesv1alpha1.DatabaseAccess{
+						{Name: "billing"},
+						{Name: "orders"},
+						{Name: "orders", Namespace: "team-b"},
+					},
+				},
+			},
+			wantErr: "per-database secrets need distinct Database names: orders is referenced from team-a and team-b",
+		},
+		{
+			name: "perDatabase allows distinct names across namespaces",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "team-a"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					SecretGeneration: "perDatabase",
+					Databases: []databasesv1alpha1.DatabaseAccess{
+						{Name: "orders"},
+						{Name: "billing", Namespace: "team-b"},
+					},
+				},
+			},
+		},
+		{
+			name: "both database and databases",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "team-a"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Database:  &databasesv1alpha1.DatabaseAccess{Name: "orders"},
+					Databases: []databasesv1alpha1.DatabaseAccess{{Name: "billing"}},
+				},
+			},
+			wantErr: "cannot specify both 'database' and 'databases' - use one or the other",
+		},
+		{
+			name: "neither database nor databases",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "team-a"},
+			},
+			wantErr: "must specify either 'database' or 'databases'",
+		},
+		{
+			name: "same database listed twice",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "team-a"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Databases: []databasesv1alpha1.DatabaseAccess{
+						{Name: "orders", Privileges: "readonly"},
+						{Name: "billing"},
+						{Name: "orders", Privileges: "owner"},
+					},
+				},
+			},
+			wantErr: "database team-a/orders is listed more than once",
+		},
+		{
+			name: "implicit and explicit own namespace are one reference",
+			user: &databasesv1alpha1.DatabaseUser{
+				ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "team-a"},
+				Spec: databasesv1alpha1.DatabaseUserSpec{
+					Databases: []databasesv1alpha1.DatabaseAccess{
+						{Name: "orders"},
+						{Name: "orders", Namespace: "team-a"},
+					},
+				},
+			},
+			wantErr: "database team-a/orders is listed more than once",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateUserSpec(tt.user)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateUserSpec() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("ValidateUserSpec() error = nil, want %q", tt.wantErr)
+			}
+			if err.Error() != tt.wantErr {
+				t.Errorf("ValidateUserSpec() error = %q, want %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}

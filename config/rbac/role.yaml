@@ -18,6 +18,7 @@ rules:
   verbs:
   - get
   - list
+  - watch
 - apiGroups:
   - ""
   resources:
@@ -76,6 +77,7 @@ rules:
   - dbtether.io
   resources:
   - backups/finalizers
+  - backupschedules/finalizers
   - backupstorages/finalizers
   - databases/finalizers
   - databaseusers/finalizers

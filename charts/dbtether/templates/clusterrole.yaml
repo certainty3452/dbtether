@@ -107,6 +107,12 @@ rules:
       - get
       - patch
       - update
+  - apiGroups:
+      - dbtether.io
+    resources:
+      - backupstorages/finalizers
+    verbs:
+      - update
   # Backup permissions
   - apiGroups:
       - dbtether.io

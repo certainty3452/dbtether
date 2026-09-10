@@ -330,7 +330,7 @@ func TestBackupReconciler_JobAlreadyExists(t *testing.T) {
 		Spec: batchv1.JobSpec{
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy: corev1.RestartPolicyNever,
 					Containers: []corev1.Container{
 						{Name: "backup", Image: "test"},
 					},
@@ -394,7 +394,7 @@ func TestBackupReconciler_JobCompleted(t *testing.T) {
 			BackoffLimit: func() *int32 { v := int32(3); return &v }(),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy: corev1.RestartPolicyNever,
 					Containers:    []corev1.Container{{Name: "backup", Image: "test"}},
 				},
 			},
@@ -449,7 +449,7 @@ func TestBackupReconciler_JobFailed(t *testing.T) {
 			BackoffLimit: &backoffLimit,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy: corev1.RestartPolicyNever,
 					Containers:    []corev1.Container{{Name: "backup", Image: "test"}},
 				},
 			},
@@ -527,7 +527,7 @@ func TestBackupReconciler_JobFailedCustomTTL(t *testing.T) {
 			TTLSecondsAfterFinished: &oldTTL,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy: corev1.RestartPolicyNever,
 					Containers:    []corev1.Container{{Name: "backup", Image: "test"}},
 				},
 			},
@@ -590,7 +590,7 @@ func TestBackupReconciler_Deletion(t *testing.T) {
 		Spec: batchv1.JobSpec{
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy: corev1.RestartPolicyNever,
 					Containers:    []corev1.Container{{Name: "backup", Image: "test"}},
 				},
 			},
@@ -653,7 +653,7 @@ func TestBackupReconciler_Throttling(t *testing.T) {
 			Spec: batchv1.JobSpec{
 				Template: corev1.PodTemplateSpec{
 					Spec: corev1.PodSpec{
-						RestartPolicy: corev1.RestartPolicyOnFailure,
+						RestartPolicy: corev1.RestartPolicyNever,
 						Containers:    []corev1.Container{{Name: "backup", Image: "test"}},
 					},
 				},
@@ -785,7 +785,7 @@ func TestBackupReconciler_FindJobByLabels(t *testing.T) {
 			BackoffLimit: func() *int32 { v := int32(3); return &v }(),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy: corev1.RestartPolicyNever,
 					Containers:    []corev1.Container{{Name: "backup", Image: "test"}},
 				},
 			},
@@ -1266,7 +1266,7 @@ func TestBackupReconciler_JobWithAnnotations(t *testing.T) {
 			BackoffLimit: func() *int32 { v := int32(3); return &v }(),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy: corev1.RestartPolicyNever,
 					Containers:    []corev1.Container{{Name: "backup", Image: "test"}},
 				},
 			},
@@ -1586,7 +1586,7 @@ func TestCreateBackupJobIfAllowed_ExistingJob(t *testing.T) {
 		Spec: batchv1.JobSpec{
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy: corev1.RestartPolicyNever,
 					Containers: []corev1.Container{
 						{Name: "backup", Image: testImage, Env: []corev1.EnvVar{{Name: "RUN_ID", Value: "existing1"}}},
 					},
@@ -1790,7 +1790,7 @@ func TestBackupReconciler_JobFailedWithCondition(t *testing.T) {
 			BackoffLimit: &backoffLimit,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy: corev1.RestartPolicyNever,
 					Containers:    []corev1.Container{{Name: "backup", Image: "test"}},
 				},
 			},
@@ -1834,6 +1834,236 @@ func TestBackupReconciler_JobFailedWithCondition(t *testing.T) {
 	// Verify failure reason is captured
 	if !contains(updatedBackup.Status.Message, "BackoffLimitExceeded") {
 		t.Errorf("expected message to contain 'BackoffLimitExceeded', got %q", updatedBackup.Status.Message)
+	}
+}
+
+func newSpentBackoffFixture() (*databasesv1alpha1.Backup, *batchv1.Job) {
+	backup := newTestBackup(testBackupName, testNamespace)
+	backup.Finalizers = []string{backupFinalizer}
+	backup.Status.JobName = testJobName
+	backup.Status.Phase = "Running"
+	backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: testJobName, Namespace: testOperatorNS},
+		Status: batchv1.JobStatus{
+			Failed: 1,
+			Conditions: []batchv1.JobCondition{
+				{
+					Type:    batchv1.JobFailed,
+					Status:  corev1.ConditionTrue,
+					Reason:  "BackoffLimitExceeded",
+					Message: "Job has reached the specified backoff limit",
+				},
+			},
+		},
+	}
+	return backup, job
+}
+
+func newAttemptPod(name string, created time.Time, status *corev1.ContainerStatus) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         testOperatorNS,
+			Labels:            map[string]string{"job-name": testJobName},
+			CreationTimestamp: metav1.NewTime(created),
+		},
+		Spec:   corev1.PodSpec{RestartPolicy: corev1.RestartPolicyNever},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{*status}},
+	}
+}
+
+func terminatedWith(message string) *corev1.ContainerStatus {
+	return &corev1.ContainerStatus{
+		Name: "backup",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			Reason:  "Error",
+			Message: message + "\n",
+		}},
+	}
+}
+
+func reconcileToFailed(t *testing.T, r *BackupReconciler) databasesv1alpha1.Backup {
+	t.Helper()
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: testBackupName, Namespace: testNamespace},
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf(errUnexpectedError, err)
+	}
+
+	var updated databasesv1alpha1.Backup
+	if err := r.Get(context.Background(), req.NamespacedName, &updated); err != nil {
+		t.Fatalf(errFailedToGet, err)
+	}
+	if updated.Status.Phase != "Failed" {
+		t.Fatalf(errExpectedPhase, "Failed", updated.Status.Phase)
+	}
+	return updated
+}
+
+func TestBackupReconciler_JobUsesRestartPolicyNever(t *testing.T) {
+	backup := newTestBackup(testBackupName, testNamespace)
+	backup.Finalizers = []string{backupFinalizer}
+
+	r := newTestReconciler(backup,
+		newTestDatabase(testDBName, testNamespace, testClusterName),
+		newTestCluster(testClusterName),
+		newTestStorage(testStorageName),
+		newTestSecret(testSecretName, testOperatorNS))
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: testBackupName, Namespace: testNamespace},
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf(errUnexpectedError, err)
+	}
+
+	var jobs batchv1.JobList
+	if err := r.List(context.Background(), &jobs, client.InNamespace(testOperatorNS)); err != nil {
+		t.Fatalf(errFailedToListJobs, err)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf(errExpectedOneJob, len(jobs.Items))
+	}
+
+	got := jobs.Items[0].Spec.Template.Spec.RestartPolicy
+	if got != corev1.RestartPolicyNever {
+		t.Errorf("RestartPolicy = %q, want %q", got, corev1.RestartPolicyNever)
+	}
+}
+
+func TestBackupReconciler_JobFailurePrefersPodTerminationMessage(t *testing.T) {
+	const cause = "backup failed: pg_dump failed: exit status 1: pg_dump: error: connection to server failed"
+
+	backup, failedJob := newSpentBackoffFixture()
+	pod := newAttemptPod(testJobName+"-abc12", time.Now().Add(-time.Minute), terminatedWith(cause))
+
+	updated := reconcileToFailed(t, newTestReconciler(backup, failedJob, pod))
+
+	if updated.Status.FailureMessage != cause {
+		t.Errorf("FailureMessage = %q, want %q", updated.Status.FailureMessage, cause)
+	}
+	if updated.Status.FailureReason != "BackoffLimitExceeded" {
+		t.Errorf("FailureReason = %q, want %q", updated.Status.FailureReason, "BackoffLimitExceeded")
+	}
+	wantMessage := "backup job failed: " + cause
+	if updated.Status.Message != wantMessage {
+		t.Errorf("Message = %q, want %q", updated.Status.Message, wantMessage)
+	}
+}
+
+func TestBackupReconciler_JobFailureUsesTheLatestAttempt(t *testing.T) {
+	const earlierCause = "backup failed: pg_dump failed: exit status 1: could not connect"
+	const latestCause = "backup failed: upload failed: AccessDenied"
+
+	backup, failedJob := newSpentBackoffFixture()
+	base := time.Now().Add(-time.Hour)
+	earlier := newAttemptPod(testJobName+"-zzzzz", base, terminatedWith(earlierCause))
+	latest := newAttemptPod(testJobName+"-aaaaa", base.Add(time.Minute), terminatedWith(latestCause))
+
+	updated := reconcileToFailed(t, newTestReconciler(backup, failedJob, earlier, latest))
+
+	if updated.Status.FailureMessage != latestCause {
+		t.Errorf("FailureMessage = %q, want %q", updated.Status.FailureMessage, latestCause)
+	}
+	if updated.Status.Message != "backup job failed: "+latestCause {
+		t.Errorf("Message = %q, want %q", updated.Status.Message, "backup job failed: "+latestCause)
+	}
+	if updated.Status.LastPodName != latest.Name {
+		t.Errorf("LastPodName = %q, want %q", updated.Status.LastPodName, latest.Name)
+	}
+}
+
+func TestBackupReconciler_DeadlineKeepsConditionMessage(t *testing.T) {
+	const deadlineMessage = "Job was active longer than specified deadline"
+
+	backup, failedJob := newSpentBackoffFixture()
+	failedJob.Status.Conditions = []batchv1.JobCondition{
+		{
+			Type:    batchv1.JobFailed,
+			Status:  corev1.ConditionTrue,
+			Reason:  "DeadlineExceeded",
+			Message: deadlineMessage,
+		},
+	}
+	pod := newAttemptPod(testJobName+"-abc12", time.Now(), terminatedWith("backup failed: pg_dump failed: exit status 1"))
+
+	updated := reconcileToFailed(t, newTestReconciler(backup, failedJob, pod))
+
+	if updated.Status.FailureReason != "DeadlineExceeded" {
+		t.Errorf("FailureReason = %q, want %q", updated.Status.FailureReason, "DeadlineExceeded")
+	}
+	if updated.Status.FailureMessage != deadlineMessage {
+		t.Errorf("FailureMessage = %q, want %q", updated.Status.FailureMessage, deadlineMessage)
+	}
+	if updated.Status.Message != "backup job failed: DeadlineExceeded" {
+		t.Errorf("Message = %q, want %q", updated.Status.Message, "backup job failed: DeadlineExceeded")
+	}
+}
+
+func TestBackupReconciler_CompletedBackupNamesTheSucceededPod(t *testing.T) {
+	backup := newTestBackup(testBackupName, testNamespace)
+	backup.Finalizers = []string{backupFinalizer}
+	backup.Status.JobName = testJobName
+	backup.Status.Phase = "Running"
+	backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
+	backup.Status.LastPodName = testJobName + "-zzzzz"
+
+	succeededJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: testJobName, Namespace: testOperatorNS},
+		Status:     batchv1.JobStatus{Succeeded: 1, Failed: 1},
+	}
+
+	base := time.Now().Add(-time.Hour)
+	failed := newAttemptPod(testJobName+"-zzzzz", base, terminatedWith("backup failed: pg_dump failed: exit status 1"))
+	succeeded := newAttemptPod(testJobName+"-aaaaa", base.Add(time.Minute), &corev1.ContainerStatus{
+		Name:  "backup",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Reason: "Completed"}},
+	})
+
+	r := newTestReconciler(backup, succeededJob, failed, succeeded)
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: testBackupName, Namespace: testNamespace},
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf(errUnexpectedError, err)
+	}
+
+	var updated databasesv1alpha1.Backup
+	if err := r.Get(context.Background(), req.NamespacedName, &updated); err != nil {
+		t.Fatalf(errFailedToGet, err)
+	}
+	if updated.Status.Phase != "Completed" {
+		t.Fatalf(errExpectedPhase, "Completed", updated.Status.Phase)
+	}
+	if updated.Status.LastPodName != succeeded.Name {
+		t.Errorf("LastPodName = %q, want %q", updated.Status.LastPodName, succeeded.Name)
+	}
+}
+
+func TestBackupReconciler_FailureFallsBackToLastTermination(t *testing.T) {
+	const cause = "backup failed: pg_dump failed: exit status 2"
+
+	backup, failedJob := newSpentBackoffFixture()
+	pod := newAttemptPod(testJobName+"-abc12", time.Now(), &corev1.ContainerStatus{
+		Name:  "backup",
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+		LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			Reason:  "Error",
+			Message: cause + "\n",
+		}},
+	})
+
+	updated := reconcileToFailed(t, newTestReconciler(backup, failedJob, pod))
+
+	if updated.Status.FailureMessage != cause {
+		t.Errorf("FailureMessage = %q, want %q", updated.Status.FailureMessage, cause)
+	}
+	if updated.Status.Message != "backup job failed: "+cause {
+		t.Errorf("Message = %q, want %q", updated.Status.Message, "backup job failed: "+cause)
 	}
 }
 
@@ -1939,7 +2169,7 @@ func TestBackupReconciler_DeadlineExceeded(t *testing.T) {
 			ActiveDeadlineSeconds: &deadline,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					RestartPolicy: corev1.RestartPolicyNever,
 					Containers:    []corev1.Container{{Name: "backup", Image: "test"}},
 				},
 			},

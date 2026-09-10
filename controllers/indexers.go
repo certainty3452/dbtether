@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -16,18 +17,24 @@ import (
 // in a different namespace than the Database it points at.
 const DatabaseUserDatabaseRefIndex = ".spec.databaseRefs"
 
-// RegisterIndexers must run before mgr.Start. The informer cache locks its index
-// set when it starts, so IndexField calls made afterwards are rejected.
+var (
+	registerIndexersOnce sync.Once
+	registerIndexersErr  error
+)
+
+// Must run before mgr.Start, and only once: re-registering the same field fails.
 func RegisterIndexers(ctx context.Context, mgr ctrl.Manager) error {
-	if err := mgr.GetFieldIndexer().IndexField(
-		ctx,
-		&databasesv1alpha1.DatabaseUser{},
-		DatabaseUserDatabaseRefIndex,
-		indexDatabaseUserDatabaseRefs,
-	); err != nil {
-		return fmt.Errorf("failed to index DatabaseUser by %s: %w", DatabaseUserDatabaseRefIndex, err)
-	}
-	return nil
+	registerIndexersOnce.Do(func() {
+		if err := mgr.GetFieldIndexer().IndexField(
+			ctx,
+			&databasesv1alpha1.DatabaseUser{},
+			DatabaseUserDatabaseRefIndex,
+			indexDatabaseUserDatabaseRefs,
+		); err != nil {
+			registerIndexersErr = fmt.Errorf("failed to index DatabaseUser by %s: %w", DatabaseUserDatabaseRefIndex, err)
+		}
+	})
+	return registerIndexersErr
 }
 
 // DatabaseUserDatabaseRefKey builds the DatabaseUserDatabaseRefIndex lookup value

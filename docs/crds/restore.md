@@ -33,7 +33,7 @@ spec:
 | `source` | object | ✅ | — | Where to restore from. Exactly one of `backupRef`, `latestFrom`, or (`path` + `storageRef`) must be set |
 | `target.databaseRef.name` | string | ✅ | — | Name of the Database to restore into |
 | `target.databaseRef.namespace` | string | ❌ | same as Restore | Namespace of the target Database |
-| `onConflict` | enum | ❌ | `fail` | What to do if the target database is not empty: `fail`, `drop`, `overwrite` |
+| `onConflict` | enum | ❌ | `fail` | What to do if the target database is not empty: `fail`, `drop` |
 | `ttlAfterCompletion` | duration | ❌ | `1h` | How long Kubernetes keeps the finished restore Job |
 
 ### source
@@ -88,7 +88,6 @@ Behavior when the target database already exists or contains data.
 |--------|----------|
 | `fail` (default) | Abort if the database is not empty. Safest. |
 | `drop` | `DROP DATABASE` and recreate before restoring. Destroys whatever is there. |
-| `overwrite` | Restore on top of existing data. May produce conflicts on duplicate keys / existing objects. |
 
 ### ttlAfterCompletion
 
@@ -114,7 +113,7 @@ Sets `ttlSecondsAfterFinished` on the Kubernetes Job that runs the restore. Same
 | Phase | Description |
 |-------|-------------|
 | `Pending` | Restore created, source resolution in progress |
-| `Running` | `pg_restore` job is executing |
+| `Running` | Restore job is executing |
 | `Completed` | Restore finished successfully |
 | `Failed` | Restore failed; see `message` |
 
@@ -126,9 +125,13 @@ Sets `ttlSecondsAfterFinished` on the Kubernetes Job that runs the restore. Same
    - `path` → uses the value directly with the referenced `BackupStorage`
 2. **Generate RunID.** Controller generates an 8-char alphanumeric `runId`.
 3. **Resolve target.** Reads the target `Database` to learn cluster connection + PG database name.
-4. **Apply onConflict.** If `drop`, the database is dropped + recreated. If `overwrite`, restore runs on top of existing data. If `fail`, restore aborts when the database is non-empty.
-5. **Create Job.** Controller creates a Kubernetes Job named `restore-<name>-<runId>` that streams the object from storage → `gunzip` → `psql` (or `pg_restore`, depending on the dump format).
+4. **Apply onConflict.** If `drop`, the database is dropped + recreated. If `fail`, restore aborts when the database is non-empty.
+5. **Create Job.** Controller creates a Kubernetes Job named `restore-<name>-<runId>` that streams the object from storage → `gunzip` → `psql`. The whole dump runs as one transaction, so any error rolls everything back. `COMMENT ON EXTENSION` and `SET transaction_timeout` statements are skipped.
 6. **Update status.** Phase, duration, and any error are recorded back onto the Restore CRD.
+
+### Client version
+
+Restore Jobs run the bundled `psql` closest to the target server's major version — the matching one, the oldest above it, or the newest available. The image bundles the PostgreSQL 16, 17 and 18 clients.
 
 ### Idempotency
 
@@ -247,24 +250,39 @@ kubectl get bkp -n <namespace> -l dbtether.io/database=<db-name>
 
 If you expect a backup elsewhere, set `source.latestFrom.namespace` explicitly.
 
-### Phase: Failed, message: "target database is not empty"
+### Phase: Failed, message: "database is not empty and onConflict=fail"
 
-`onConflict: fail` (default) refuses to restore into a non-empty database. Either:
+`onConflict: fail` (default) refuses to restore into a database that holds any table, view, materialized view, sequence or foreign table outside the system schemas. Either:
 - Set `onConflict: drop` to wipe and recreate, or
-- Set `onConflict: overwrite` to layer on top (may fail with duplicate-key errors), or
 - Pick a fresh target Database.
 
-### Phase: Failed, message: "S3 download failed: AccessDenied"
+### Phase: Failed, message: "failed to download backup: failed to download from S3: ..."
 
 The operator's IRSA/Pod Identity role lacks read access to the backup object. See [BackupStorage troubleshooting](backupstorage.md#troubleshooting).
 
-### Phase: Failed, message: "pg_restore exit 3"
+### Phase: Failed, message: "backup contains no SQL statements"
 
-A real restore error. Pull logs:
+The resolved object holds nothing to run — an empty object, an S3 folder marker, or a `source.path` typo. The target is untouched, `drop` included. Check which object was picked:
+
+```bash
+kubectl get rst <name> -n <ns> -o jsonpath='{.status.sourcePath}'
+```
+
+### Phase: Failed, message: "backup is a pg_dump custom-format archive; only plain-format SQL dumps can be restored"
+
+The object is a `pg_dump -Fc` archive, and only plain-format SQL dumps restore; `backup is not a plain-format SQL dump` says the same for any other binary content. The target is untouched — re-run against a dbtether backup or a `pg_dump --format=plain` file.
+
+### Phase: Failed, message: "restore failed: psql failed: exit status 3: `psql:<stdin>:12`: ERROR: ..."
+
+A real restore error, quoted from psql with the dump's line number; the `ERROR:` line can carry dump data to anyone who can read the Restore. The database is left as it was before the restore — empty after `onConflict: drop`. Pull logs:
 
 ```bash
 JOB=$(kubectl get rst <name> -n <ns> -o jsonpath='{.status.jobName}')
 kubectl logs -n dbtether job/$JOB
 ```
 
-Common causes: schema-version mismatch, extension missing in target cluster, target user lacks `owner` privilege. Restored objects are created by the cluster admin. A DatabaseUser with `privileges: owner` owns the tables, sequences, views, types and routines in `public`; the restore runs that grant pass itself before it reports Completed.
+Common causes: schema-version mismatch, extension missing in target cluster, target user lacks `owner` privilege. Restored objects are created by the cluster admin. A DatabaseUser with `privileges: owner` owns the tables, sequences, views, types and routines in `public`; the restore runs that grant pass itself before it reports Completed. A DatabaseUser that loses the owner election gets `admin` instead ([DatabaseUser](databaseuser.md#privileges)).
+
+### Phase: Failed, message: "restore failed: psql failed: exit status 3: `psql:<stdin>:812`: ERROR: out of shared memory"
+
+The single transaction holds a lock per relation, and this dump has more relations than the cluster's lock table holds. Raise `max_locks_per_transaction` in the cluster's parameter group (RDS needs a reboot) and re-run the Restore.

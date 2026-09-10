@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -16,6 +18,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	ctrlzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -34,7 +38,10 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
-const errUnableToCreateController = "unable to create controller"
+const (
+	errUnableToCreateController = "unable to create controller"
+	terminationLogPath          = "/dev/termination-log"
+)
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -81,16 +88,16 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "dbtether.io",
+		// Backup and restore Jobs, and the Pods behind them, only ever exist here.
+		Cache: cache.Options{
+			ByObject: map[client.Object]cache.ByObject{
+				&corev1.Pod{}:  {Namespaces: map[string]cache.Config{operatorNamespace: {}}},
+				&batchv1.Job{}: {Namespaces: map[string]cache.Config{operatorNamespace: {}}},
+			},
+		},
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
-		os.Exit(1)
-	}
-
-	// Before any controller: the cache locks its index set once started, and the
-	// Restore controller lists DatabaseUsers by indexed field.
-	if err := controllers.RegisterIndexers(context.Background(), mgr); err != nil {
-		setupLog.Error(err, "unable to register field indexers")
 		os.Exit(1)
 	}
 
@@ -221,6 +228,7 @@ func runBackupJob() {
 		Database: getEnvRequired("DB_NAME"),
 		Username: getEnvRequired("DB_USER"),
 		Password: getEnvRequired("DB_PASSWORD"),
+		SSLMode:  getEnv("DB_SSLMODE", "require"),
 
 		// Storage
 		StorageType: getEnvRequired("STORAGE_TYPE"),
@@ -254,6 +262,7 @@ func runBackupJob() {
 	result, err := backuppkg.RunBackup(ctx, &cfg)
 	if err != nil {
 		setupLog.Error(err, "backup failed")
+		writeTerminationMessage(terminationLogPath, err)
 		os.Exit(1)
 	}
 
@@ -324,6 +333,7 @@ func runRestoreJob() {
 	ctx := context.Background()
 	if err := backuppkg.RunRestore(ctx, &cfg); err != nil {
 		setupLog.Error(err, "restore failed")
+		writeTerminationMessage(terminationLogPath, err)
 		os.Exit(1)
 	}
 
@@ -331,6 +341,12 @@ func runRestoreJob() {
 		"database", cfg.Database,
 		"source", cfg.SourcePath,
 	)
+}
+
+func writeTerminationMessage(path string, cause error) {
+	if err := os.WriteFile(path, []byte(cause.Error()), 0o600); err != nil {
+		setupLog.Error(err, "failed to write termination message")
+	}
 }
 
 func getEnvRequired(key string) string {

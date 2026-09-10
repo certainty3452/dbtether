@@ -60,11 +60,9 @@ spec:
                   How to handle conflicts with existing data
                   - fail: Abort if database is not empty (default)
                   - drop: Drop and recreate the database before restore
-                  - overwrite: Restore over existing data (may cause conflicts)
                 enum:
                 - fail
                 - drop
-                - overwrite
                 type: string
               source:
                 description: Source of the backup to restore from

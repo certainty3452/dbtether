@@ -23,9 +23,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -a -o manager main.go
 # Runtime stage with pg_dump
 FROM alpine:3.23
 
-# Install PostgreSQL 18 client (compatible with PG 9.x - 18.x)
+# Each Job runs the client matching its server's major version.
 RUN apk upgrade --no-cache \
-    && apk add --no-cache postgresql18-client \
+    && apk add --no-cache postgresql16-client postgresql17-client postgresql18-client \
     && rm -rf /var/cache/apk/*
 
 WORKDIR /
