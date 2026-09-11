@@ -33,7 +33,7 @@ type DatabaseReconciler struct {
 // +kubebuilder:rbac:groups=dbtether.io,resources=dbclusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
-func (r *DatabaseReconciler) getDatabaseName(db *databasesv1alpha1.Database) string {
+func DatabaseNameFor(db *databasesv1alpha1.Database) string {
 	if db.Spec.DatabaseName != "" {
 		return db.Spec.DatabaseName
 	}
@@ -46,7 +46,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	log.FromContext(ctx).Info("reconciling", "database", r.getDatabaseName(&db))
+	log.FromContext(ctx).Info("reconciling", "database", DatabaseNameFor(&db))
 
 	if !db.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, &db)
@@ -106,9 +106,9 @@ func (r *DatabaseReconciler) reconcileDatabase(ctx context.Context, db *database
 		return ctrl.Result{}, err
 	}
 
-	ownershipTracked, err := r.ensureDatabase(ctx, db, pgClient)
-	if err != nil {
-		return r.handleDatabaseError(ctx, db, err)
+	ownershipTracked, step, applyErr := ApplyDatabaseSpec(ctx, pgClient, DatabaseNameFor(db), db)
+	if applyErr != nil && step == DatabaseStepOwnership {
+		return r.handleDatabaseError(ctx, db, step, applyErr)
 	}
 
 	// Log warning once if ownership tracking failed (legacy database not owned by operator)
@@ -116,17 +116,18 @@ func (r *DatabaseReconciler) reconcileDatabase(ctx context.Context, db *database
 		log.FromContext(ctx).Info("WARNING: database ownership tracking not available (legacy database not owned by operator's PostgreSQL user). "+
 			"Multiple Database CRDs may reference this database without conflict detection. "+
 			"To enable tracking, change PostgreSQL owner: ALTER DATABASE <name> OWNER TO <operator_user>",
-			"database", r.getDatabaseName(db))
+			"database", DatabaseNameFor(db))
 	}
 	if err := r.persistOwnershipTracked(ctx, db, ownershipTracked); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if err := r.ensureExtensions(ctx, db, pgClient); err != nil {
-		return r.setStatus(ctx, db, "Failed", fmt.Sprintf("failed to create extensions: %s", err.Error()))
+	// A transient revoke or extension failure must requeue: parking in Failed keeps every DatabaseUser of this database waiting for the resync.
+	if applyErr != nil {
+		return r.handleDatabaseError(ctx, db, step, applyErr)
 	}
 
-	log.FromContext(ctx).Info("database ready", "database", r.getDatabaseName(db))
+	log.FromContext(ctx).Info("database ready", "database", DatabaseNameFor(db))
 	return r.setStatus(ctx, db, "Ready", "database is ready")
 }
 
@@ -140,40 +141,57 @@ func (r *DatabaseReconciler) ensureCreatingStatus(ctx context.Context, db *datab
 
 const forceAdoptAnnotation = "dbtether.io/force-adopt"
 
-func (r *DatabaseReconciler) ensureDatabase(ctx context.Context, db *databasesv1alpha1.Database, pgClient postgres.ClientInterface) (ownershipTracked bool, err error) {
-	dbName := r.getDatabaseName(db)
+type DatabaseSpecStep string
 
+const (
+	DatabaseStepOwnership     DatabaseSpecStep = "ownership"
+	DatabaseStepPublicConnect DatabaseSpecStep = "public connect"
+	DatabaseStepExtensions    DatabaseSpecStep = "extensions"
+)
+
+func ApplyDatabaseSpec(ctx context.Context, pgClient postgres.ClientInterface, databaseName string, db *databasesv1alpha1.Database) (ownershipTracked bool, failedStep DatabaseSpecStep, err error) {
 	// Check for force-adopt annotation
 	forceAdopt := db.Annotations[forceAdoptAnnotation] == "true"
 
 	// Use ownership tracking to prevent conflicts across namespaces
-	ownershipTracked, err = pgClient.EnsureDatabaseWithOwner(ctx, dbName, db.Namespace, db.Name, forceAdopt)
+	ownershipTracked, err = pgClient.EnsureDatabaseWithOwner(ctx, databaseName, db.Namespace, db.Name, forceAdopt)
 	if err != nil {
-		return false, err
+		return false, DatabaseStepOwnership, err
 	}
 
 	if db.Spec.RevokePublicConnect {
-		if err := pgClient.RevokePublicConnect(ctx, dbName); err != nil {
-			log.FromContext(ctx).V(1).Info("failed to revoke public connect", "error", err.Error())
+		if err := pgClient.RevokePublicConnect(ctx, databaseName); err != nil {
+			return ownershipTracked, DatabaseStepPublicConnect, err
 		}
 	}
 
-	return ownershipTracked, nil
-}
-
-func (r *DatabaseReconciler) ensureExtensions(ctx context.Context, db *databasesv1alpha1.Database, pgClient postgres.ClientInterface) error {
-	if len(db.Spec.Extensions) == 0 {
-		return nil
+	if len(db.Spec.Extensions) > 0 {
+		if err := pgClient.EnsureExtensions(ctx, databaseName, db.Spec.Extensions); err != nil {
+			return ownershipTracked, DatabaseStepExtensions, err
+		}
 	}
-	return pgClient.EnsureExtensions(ctx, r.getDatabaseName(db), db.Spec.Extensions)
+
+	return ownershipTracked, "", nil
 }
 
-func (r *DatabaseReconciler) handleDatabaseError(ctx context.Context, db *databasesv1alpha1.Database, err error) (ctrl.Result, error) {
+func databaseSpecFailureMessage(step DatabaseSpecStep, err error) string {
+	switch step {
+	case DatabaseStepPublicConnect:
+		return fmt.Sprintf("failed to revoke public connect: %s", err.Error())
+	case DatabaseStepExtensions:
+		return fmt.Sprintf("failed to create extensions: %s", err.Error())
+	default:
+		return fmt.Sprintf("failed to create database: %s", err.Error())
+	}
+}
+
+func (r *DatabaseReconciler) handleDatabaseError(ctx context.Context, db *databasesv1alpha1.Database, step DatabaseSpecStep, err error) (ctrl.Result, error) {
+	message := databaseSpecFailureMessage(step, err)
 	if postgres.IsTransientError(err) {
 		return r.setStatusWithRequeue(ctx, db, "Failed",
-			fmt.Sprintf("transient error (will retry): %s", err.Error()), 60*time.Second)
+			fmt.Sprintf("transient error (will retry): %s", message), 60*time.Second)
 	}
-	return r.setStatus(ctx, db, "Failed", fmt.Sprintf("failed to create database: %s", err.Error()))
+	return r.setStatus(ctx, db, "Failed", message)
 }
 
 func (r *DatabaseReconciler) handleDeletion(ctx context.Context, db *databasesv1alpha1.Database) (ctrl.Result, error) {
@@ -182,7 +200,7 @@ func (r *DatabaseReconciler) handleDeletion(ctx context.Context, db *databasesv1
 	}
 
 	logger := log.FromContext(ctx)
-	logger.Info("handling deletion", "database", r.getDatabaseName(db), "policy", db.Spec.DeletionPolicy)
+	logger.Info("handling deletion", "database", DatabaseNameFor(db), "policy", db.Spec.DeletionPolicy)
 
 	if _, err := r.setStatus(ctx, db, "Deleting", "deleting database..."); err != nil {
 		return ctrl.Result{}, err
@@ -223,7 +241,7 @@ func (r *DatabaseReconciler) dropDatabaseIfPossible(ctx context.Context, db *dat
 		return fmt.Errorf("failed to get postgres client: %w", err)
 	}
 
-	dbName := r.getDatabaseName(db)
+	dbName := DatabaseNameFor(db)
 	logger.Info("dropping database", "database", dbName)
 	return pgClient.DropDatabase(ctx, dbName)
 }
@@ -245,7 +263,7 @@ func (r *DatabaseReconciler) clearDatabaseOwnerIfPossible(ctx context.Context, d
 		return fmt.Errorf("failed to get postgres client: %w", err)
 	}
 
-	dbName := r.getDatabaseName(db)
+	dbName := DatabaseNameFor(db)
 	logger.Info("clearing database ownership for re-adoption", "database", dbName)
 	return pgClient.ClearDatabaseOwner(ctx, dbName)
 }
@@ -272,7 +290,7 @@ func (r *DatabaseReconciler) setStatus(ctx context.Context, db *databasesv1alpha
 	db.Status.Phase = phase
 	db.Status.Message = message
 	db.Status.ObservedGeneration = db.Generation
-	db.Status.DatabaseName = r.getDatabaseName(db)
+	db.Status.DatabaseName = DatabaseNameFor(db)
 
 	if err := r.Status().Patch(ctx, db, patch); err != nil {
 		return ctrl.Result{}, err

@@ -64,9 +64,7 @@ func TestDatabaseReconciler_ShouldDropDatabase(t *testing.T) {
 	}
 }
 
-func TestDatabaseReconciler_GetDatabaseName(t *testing.T) {
-	r := &DatabaseReconciler{}
-
+func TestDatabaseNameFor(t *testing.T) {
 	tests := []struct {
 		name       string
 		specDBName string
@@ -89,9 +87,9 @@ func TestDatabaseReconciler_GetDatabaseName(t *testing.T) {
 					DatabaseName: tt.specDBName,
 				},
 			}
-			got := r.getDatabaseName(db)
+			got := DatabaseNameFor(db)
 			if got != tt.want {
-				t.Errorf("getDatabaseName() = %v, want %v", got, tt.want)
+				t.Errorf("DatabaseNameFor() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -133,8 +131,6 @@ func simulateDBPendingTimeout(phase string, pendingSince, now *metav1.Time) stri
 }
 
 func TestDatabaseReconciler_StatusDatabaseName(t *testing.T) {
-	r := &DatabaseReconciler{}
-
 	tests := []struct {
 		name       string
 		specDBName string
@@ -157,7 +153,7 @@ func TestDatabaseReconciler_StatusDatabaseName(t *testing.T) {
 			}
 
 			// Simulate what setStatus does
-			db.Status.DatabaseName = r.getDatabaseName(db)
+			db.Status.DatabaseName = DatabaseNameFor(db)
 
 			if db.Status.DatabaseName != tt.wantStatus {
 				t.Errorf("status.databaseName = %v, want %v", db.Status.DatabaseName, tt.wantStatus)
@@ -267,6 +263,125 @@ func TestDatabaseReconciler_OwnershipTrackedStatus(t *testing.T) {
 
 func boolPtr(b bool) *bool {
 	return &b
+}
+
+// Fails exactly one step of ApplyDatabaseSpec instead of the blunt global ShouldFail on MockClient.
+type stepFailingPGClient struct {
+	*postgres.MockClient
+	revokeErr     error
+	extensionsErr error
+}
+
+func (c *stepFailingPGClient) RevokePublicConnect(ctx context.Context, name string) error {
+	if c.revokeErr != nil {
+		return c.revokeErr
+	}
+	return c.MockClient.RevokePublicConnect(ctx, name)
+}
+
+func (c *stepFailingPGClient) EnsureExtensions(ctx context.Context, dbName string, extensions []string) error {
+	if c.extensionsErr != nil {
+		return c.extensionsErr
+	}
+	return c.MockClient.EnsureExtensions(ctx, dbName, extensions)
+}
+
+func newDatabaseSpecFixture(name string, specify func(*databasesv1alpha1.DatabaseSpec)) (*corev1.Secret, *databasesv1alpha1.DBCluster, *databasesv1alpha1.Database) {
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster-creds", Namespace: "default"},
+		Data:       map[string][]byte{"username": []byte("postgres"), "password": []byte("pw")},
+	}
+	cluster := &databasesv1alpha1.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
+		Spec: databasesv1alpha1.DBClusterSpec{
+			Endpoint: "localhost",
+			Port:     5432,
+			CredentialsSecretRef: &databasesv1alpha1.SecretReference{
+				Name:      "cluster-creds",
+				Namespace: "default",
+			},
+		},
+		Status: databasesv1alpha1.DBClusterStatus{Phase: "Connected"},
+	}
+	db := &databasesv1alpha1.Database{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       name,
+			Namespace:  "default",
+			Finalizers: []string{FinalizerName},
+		},
+		Spec: databasesv1alpha1.DatabaseSpec{
+			ClusterRef: databasesv1alpha1.ClusterReference{Name: "test-cluster"},
+		},
+	}
+	specify(&db.Spec)
+	return secret, cluster, db
+}
+
+func TestDatabaseReconciler_DatabaseSpecFailureRequeues(t *testing.T) {
+	tests := []struct {
+		name    string
+		dbName  string
+		specify func(*databasesv1alpha1.DatabaseSpec)
+		pg      func() *stepFailingPGClient
+		want    string
+	}{
+		{
+			name:   "revoking public connect fails",
+			dbName: "revoke-fail-db",
+			specify: func(spec *databasesv1alpha1.DatabaseSpec) {
+				spec.RevokePublicConnect = true
+			},
+			pg: func() *stepFailingPGClient {
+				return &stepFailingPGClient{
+					MockClient: postgres.NewMockClient(),
+					revokeErr:  errors.New("server closed the connection unexpectedly"),
+				}
+			},
+			want: "transient error (will retry): failed to revoke public connect: server closed the connection unexpectedly",
+		},
+		{
+			name:   "creating extensions fails",
+			dbName: "extension-fail-db",
+			specify: func(spec *databasesv1alpha1.DatabaseSpec) {
+				spec.Extensions = []string{"pg_trgm"}
+			},
+			pg: func() *stepFailingPGClient {
+				return &stepFailingPGClient{
+					MockClient:    postgres.NewMockClient(),
+					extensionsErr: errors.New("server closed the connection unexpectedly"),
+				}
+			},
+			want: "transient error (will retry): failed to create extensions: server closed the connection unexpectedly",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			secret, cluster, db := newDatabaseSpecFixture(tt.dbName, tt.specify)
+			r := newDatabaseTestReconciler(&singleClientCache{pgClient: tt.pg()}, secret, cluster, db)
+
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: tt.dbName, Namespace: "default"}}
+			result, err := r.Reconcile(ctx, req)
+			if err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			if result.RequeueAfter != 60*time.Second {
+				t.Errorf("RequeueAfter = %v, want 60s: a transient failure must not park the database until the resync", result.RequeueAfter)
+			}
+
+			var updated databasesv1alpha1.Database
+			if err := r.Get(ctx, req.NamespacedName, &updated); err != nil {
+				t.Fatalf("failed to get database: %v", err)
+			}
+			if updated.Status.Phase != "Failed" {
+				t.Errorf("phase = %q, want Failed", updated.Status.Phase)
+			}
+			if updated.Status.Message != tt.want {
+				t.Errorf("message = %q, want %q", updated.Status.Message, tt.want)
+			}
+		})
+	}
 }
 
 func TestDatabaseReconciler_DeletionPolicyDelete_DropFailureKeepsFinalizer(t *testing.T) {

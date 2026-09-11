@@ -1,4 +1,4 @@
-# PostgreSQL Database Operator Documentation
+# dbtether Documentation
 
 ## CRD Reference
 
@@ -17,12 +17,12 @@
 ### 1. Install the operator
 
 ```bash
-helm install dbtether ./charts/dbtether \
-  -n dbtether \
-  --create-namespace
+helm upgrade -i dbtether oci://ghcr.io/certainty3452/charts/dbtether -n dbtether --create-namespace
 ```
 
 ### 2. Create credentials
+
+The role needs `CREATEDB` on the target cluster — on Aurora/RDS, the master user.
 
 ```yaml
 apiVersion: v1
@@ -77,54 +77,30 @@ kubectl get database -A
 
 ## Architecture
 
+The operator never hosts a database. It holds a connection pool per DBCluster and drives an existing PostgreSQL server over SQL; backups and restores run as Jobs in the operator's namespace, streaming between that server and object storage.
+
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                              Kubernetes Cluster                               │
-│                                                                               │
-│  ┌────────────────────┐  ┌─────────────────────┐  ┌───────────────────────┐  │
-│  │ DBCluster (cluster)│  │ BackupStorage       │  │ Backup (namespaced)   │  │
-│  │                    │  │ (cluster)           │  │                       │  │
-│  │ name: prod         │  │                     │  │ databaseRef: my-app   │  │
-│  │ endpoint: ...      │  │ s3:                 │  │ storageRef: s3-backup │  │
-│  │ credentials: ...   │  │   bucket: backups   │  └───────────┬───────────┘  │
-│  └────────┬───────────┘  │   region: eu-ctr-1  │              │              │
-│           │              └─────────┬───────────┘              │              │
-│           │                        │                          │              │
-│  ┌────────▼────────────────────────▼──────────────────────────▼───────────┐  │
-│  │                         Operator Pod                                    │  │
-│  │  ┌──────────────┐ ┌──────────────┐ ┌────────────┐ ┌─────────────────┐  │  │
-│  │  │ DBCluster    │ │ Database     │ │ Backup     │ │ BackupStorage   │  │  │
-│  │  │ Controller   │ │ Controller   │ │ Controller │ │ Controller      │  │  │
-│  │  └──────────────┘ └──────────────┘ └─────┬──────┘ └─────────────────┘  │  │
-│  └───────────┬───────────────────────────────┼────────────────────────────┘  │
-│              │                               │                                │
-│              │                      ┌────────▼────────┐                      │
-│              │                      │   Backup Job    │                      │
-│              │                      │   (pg_dump →    │                      │
-│              │                      │    gzip → S3)   │                      │
-│              │                      └────────┬────────┘                      │
-└──────────────┼───────────────────────────────┼───────────────────────────────┘
-               │                               │
-               │ TCP/5432 (TLS)                │ HTTPS (S3 API)
-               │                               │
-┌──────────────▼─────────────────┐   ┌─────────▼─────────────────────────────┐
-│   External PostgreSQL          │   │           Cloud Storage               │
-│   (Aurora, RDS, self-hosted)   │   │        (S3, GCS, Azure Blob)          │
-│                                │   │                                        │
-│   ┌──────────┐  ┌──────────┐   │   │  ┌────────────────────────────────┐   │
-│   │  my_app  │  │ postgres │   │   │  │ prod/my_app/20260120-143022.gz │   │
-│   │          │  │ (system) │   │   │  └────────────────────────────────┘   │
-│   └──────────┘  └──────────┘   │   │                                        │
-└────────────────────────────────┘   └────────────────────────────────────────┘
+┌──────────────────────────── Kubernetes cluster ────────────────────────────┐
+│                                                                            │
+│  DBCluster (cluster-scoped)     BackupStorage (cluster-scoped)             │
+│  Database, DatabaseUser         Backup, BackupSchedule, Restore            │
+│  (namespaced, per team)         (namespaced, per team)                     │
+│                 │                             │                            │
+│                 └────────────┬────────────────┘                            │
+│                              ▼                                             │
+│                      ┌───────────────┐                                     │
+│                      │ Operator pod  │  one controller per CRD             │
+│                      └───────┬───────┘                                     │
+│                              │ creates                                     │
+│                    ┌─────────▼──────────┐                                  │
+│                    │ Backup / Restore   │  pg_dump | gzip → storage        │
+│                    │ Jobs               │  storage → gunzip | psql         │
+│                    └─────────┬──────────┘                                  │
+└──────────────┬───────────────┴──────────────┬─────────────────────────────┘
+               │ TCP/5432 (TLS)               │ HTTPS
+               ▼                              ▼
+┌──────────────────────────────┐   ┌────────────────────────────────────────┐
+│ External PostgreSQL          │   │ Cloud storage (S3, GCS, Azure Blob)    │
+│ (Aurora, RDS, self-hosted)   │   │ production/my_app/20260120-143022.sql.gz│
+└──────────────────────────────┘   └────────────────────────────────────────┘
 ```
-
-## Deletion Policies
-
-| Policy | Behavior | Use Case |
-|--------|----------|----------|
-| `Retain` | Database stays in PostgreSQL | Production, important data |
-| `Delete` | `DROP DATABASE` is executed | Dev/test, feature branches |
-
-## Roadmap
-
-See [ROADMAP.md](../ROADMAP.md) for full roadmap.

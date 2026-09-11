@@ -7,44 +7,30 @@
 
 > Kubernetes operator for external PostgreSQL databases - manage AWS Aurora, RDS, and self-hosted databases and users declaratively via CRDs.
 
-Tether your databases to Kubernetes. Create databases and users in existing PostgreSQL clusters through GitOps workflows. Perfect for platform teams building self-service developer experiences.
+Tether your databases to Kubernetes. Create databases and users in existing PostgreSQL clusters through GitOps workflows. Built for platform teams where the infrastructure team provisions shared Aurora/RDS clusters and developers self-serve databases inside them.
 
 ## Why This Operator?
 
-When building a platform on Kubernetes, I faced a common dilemma with database provisioning:
+Existing tools solve a different problem:
 
-- **CloudNativePG** creates databases inside the Kubernetes cluster, requiring PV/PVC management and adding operational complexity
-- **Crossplane** provisions separate database instances per resource, which becomes expensive when you just need multiple databases in a shared cluster
+- **CloudNativePG** runs PostgreSQL inside the Kubernetes cluster, which means PV/PVC management and an in-cluster database to operate.
+- **Crossplane** provisions a separate database instance per resource, which gets expensive when what you need is several databases in one shared cluster.
 
-Both are great tools designed for **isolated environments** — separate clusters or instances per team. But I was building a platform where **separation of concerns** mattered more than isolation: infrastructure team provisions shared Aurora clusters via Terraform, developers manage their own databases and users via GitOps.
+Both are built for **isolation** — a cluster or instance per team. dbtether is built for **manageability** in a shared cluster: it connects to an existing PostgreSQL-compatible server and manages databases and users inside it via CRDs, so a database can be requested in a pull request instead of a ticket.
 
-I needed **manageability**, not isolation. A simple way for developers to self-serve databases without tickets or manual SQL, while infrastructure controls the underlying clusters.
-
-This operator fills that gap. It connects to existing PostgreSQL-compatible clusters (AWS Aurora, RDS, or self-hosted) and manages databases and users declaratively through CRDs. Perfect for Helm charts that need a database, Backstage templates for self-service portals, or ArgoCD workflows where databases are provisioned via pull requests.
-
-As a GitOps enthusiast, this operator fits perfectly into my workflow. I hope it helps others facing the same challenge.
-
-## Use Cases
-
-- **Manage RDS/Aurora from Kubernetes** - connect to existing AWS database clusters and create databases via CRDs
-- **Self-service database provisioning** - developers request databases via pull requests, platform team approves, GitOps applies
-- **Multi-tenant database management** - one Aurora cluster, multiple databases with isolated users per team/namespace
-- **Database-as-Code with ArgoCD / Flux** - declarative database and user management synced from Git
-- **Ephemeral environments** - spin up isolated databases for preview/feature branches via Helm charts, auto-cleanup on teardown
+Typical uses: Helm charts that need a database, Backstage self-service templates, ArgoCD-driven provisioning, and ephemeral per-branch databases that clean themselves up on teardown.
 
 ## Features
 
-- **Declarative management** - manage databases and users via Kubernetes CRDs
-- **GitOps-friendly** - works seamlessly with ArgoCD, Flux, and other GitOps tools
-- **Auto-generated credentials** - secure passwords stored in Kubernetes Secrets
-- **Password rotation** - automatic credential rotation with configurable schedule
-- **Database isolation** - users are granted access only to their assigned database (cannot query other databases)
-- **Configurable deletion policies** - choose between Retain (keep data) or Delete on resource removal
-- **Database backups** - one-time and scheduled backups with `pg_dump` → gzip → cloud storage
-- **Database restore** - restore from backups with conflict handling (fail, drop)
-- **Multi-cloud storage** - backup to AWS S3, Google Cloud Storage, or Azure Blob Storage
-- **Retention policies** - automatic cleanup with `keepLast`, `keepDaily`, `keepWeekly`, `keepMonthly`
-- **Cloud-native auth** - IRSA, Workload Identity, Managed Identity for secure storage access
+- **Declarative management** - databases and users as Kubernetes CRDs
+- **Auto-generated credentials** - passwords generated into Kubernetes Secrets, with scheduled rotation
+- **Database isolation** - users are granted `CONNECT` only on their assigned databases
+- **Configurable deletion policies** - `Retain` or `Delete` per database and per user
+- **Database backups** - one-time and scheduled, `pg_dump` → gzip → cloud storage
+- **Database restore** - transactional, with conflict handling (`fail`, `drop`) and automatic re-granting
+- **Multi-cloud storage** - AWS S3, Google Cloud Storage, Azure Blob Storage
+- **Retention policies** - `keepLast`, `keepDaily`, `keepWeekly`, `keepMonthly`
+- **Cloud-native auth** - IRSA, Workload Identity, Managed Identity for storage access
 
 ## Installation
 
@@ -57,10 +43,7 @@ helm upgrade -i dbtether oci://ghcr.io/certainty3452/charts/dbtether -n dbtether
 ### Using kubectl (from source)
 
 ```bash
-# Install CRDs
 kubectl apply -f config/crd/bases/
-
-# Install RBAC and operator
 kubectl apply -f config/rbac/
 kubectl apply -f config/manager/
 ```
@@ -81,7 +64,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: aurora-admin-credentials
-  namespace: postgres-operator-system
+  namespace: dbtether
 type: Opaque
 stringData:
   username: postgres
@@ -100,7 +83,7 @@ spec:
   port: 5432
   credentialsSecretRef:
     name: aurora-admin-credentials
-    namespace: postgres-operator-system
+    namespace: dbtether
 ```
 
 ### 3. Create a Database
@@ -138,22 +121,18 @@ spec:
 ### 5. Check status
 
 ```bash
-# Check cluster connection
 kubectl get dbclusters
 NAME               ENDPOINT                                    PHASE      VERSION   AGE
 my-aurora-cluster  my-cluster.xxx.rds.amazonaws.com            Connected  15.4      5m
 
-# Check databases
 kubectl get databases -A
 NAMESPACE   NAME        CLUSTER            DATABASE   PHASE   AGE
 default     my-app-db   my-aurora-cluster  my_app     Ready   2m
 
-# Check users
 kubectl get databaseusers -A
-NAMESPACE   NAME             DATABASE    USERNAME         PRIVILEGES   PHASE   AGE
-default     my-app-readonly  my-app-db   my-app-readonly  readonly     Ready   1m
+NAMESPACE   NAME             CLUSTER            DATABASES   USERNAME          PRIVILEGES   PHASE   AGE
+default     my-app-readonly  my-aurora-cluster  my_app      my_app_readonly   readonly     Ready   1m
 
-# Get generated credentials
 kubectl get secret my-app-readonly-credentials -o jsonpath='{.data.password}' | base64 -d
 ```
 
@@ -169,25 +148,27 @@ See full documentation in [docs/](docs/README.md):
 | [BackupStorage](docs/crds/backupstorage.md) | Cluster | S3/GCS/Azure storage configuration |
 | [Backup](docs/crds/backup.md) | Namespaced | One-time database backup |
 | [BackupSchedule](docs/crds/backupschedule.md) | Namespaced | Scheduled backups with retention policy |
+| [Restore](docs/crds/restore.md) | Namespaced | Restore a database from a backup |
 
 ### Quick Reference
 
 **DBCluster:**
 - `spec.endpoint` - PostgreSQL hostname (required)
 - `spec.port` - Port, default 5432
-- `spec.credentialsSecretRef` - Reference to Secret with username/password
+- `spec.credentialsSecretRef` - Secret with `username`/`password`; required for anything beyond this resource's own health check
 
 **Database:**
 - `spec.clusterRef.name` - Name of DBCluster (required)
-- `spec.databaseName` - Database name in PostgreSQL (required)
+- `spec.databaseName` - Database name in PostgreSQL; defaults to `metadata.name` with `-` replaced by `_`
 - `spec.extensions` - List of PostgreSQL extensions
 - `spec.deletionPolicy` - `Retain` (default) or `Delete`
+- `spec.revokePublicConnect` - Revoke `CONNECT` from `PUBLIC`, default `false`
 
 **DatabaseUser:**
 - `spec.database.name` - Name of Database (for single database)
 - `spec.databases[]` - List of databases (for multi-database access)
 - `spec.privileges` - `readonly` (default), `readwrite`, `admin`, or `owner`
-- `spec.username` - PostgreSQL username (defaults to metadata.name)
+- `spec.username` - PostgreSQL username; defaults to `metadata.name` with `-` replaced by `_`
 - `spec.password.length` - Password length (default 16, range 12-64)
 - `spec.secretGeneration` - `primary` (default) or `perDatabase`
 - `spec.secret.name` - Custom secret name (default: `{name}-credentials`)
@@ -198,7 +179,7 @@ See full documentation in [docs/](docs/README.md):
 - `spec.s3.bucket` - S3 bucket name (required for S3)
 - `spec.s3.region` - AWS region (required for S3)
 - `spec.pathTemplate` - Path template (default: `{{ .ClusterName }}/{{ .DatabaseName }}`)
-- `spec.credentialsSecretRef` - Optional, uses IRSA/Pod Identity if omitted
+- `spec.credentialsSecretRef` - S3 only; uses IRSA/Pod Identity if omitted
 
 **Backup:**
 - `spec.databaseRef.name` - Name of Database to backup (required)
@@ -210,10 +191,9 @@ See full documentation in [docs/](docs/README.md):
 **BackupSchedule:**
 - `spec.databaseRef.name` - Name of Database to backup (required)
 - `spec.storageRef.name` - Name of BackupStorage (required)
-- `spec.schedule` - Cron schedule, e.g., `0 2 * * *` for 2 AM daily (required)
-- `spec.retention.keepLast` - Keep N most recent backups
-- `spec.retention.keepDaily` - Keep daily backups for N days
-- `spec.suspend` - Pause scheduling
+- `spec.schedule` - 5-field cron, e.g. `0 2 * * *` for 2 AM daily (required)
+- `spec.retention.keepLast` / `keepDaily` / `keepWeekly` / `keepMonthly` - at least one must be positive
+- `spec.suspend` - Pause scheduling and retention
 
 **Restore:**
 - `spec.source.latestFrom.databaseRef.name` - Auto-find latest backup for a database (recommended)
@@ -221,7 +201,7 @@ See full documentation in [docs/](docs/README.md):
 - `spec.source.backupRef.name` - Reference to a specific Backup CRD
 - `spec.source.path` - Direct path to backup file (requires `storageRef`)
 - `spec.source.storageRef.name` - BackupStorage for direct path
-- `spec.target.databaseRef.name` - Target Database to restore into (required)
+- `spec.target.databaseRef.name` - Target Database, in the Restore's own namespace (required)
 - `spec.onConflict` - `fail` (default) or `drop`
 - `spec.ttlAfterCompletion` - Job auto-cleanup duration (default: 1h)
 
@@ -231,32 +211,30 @@ The operator runs with cluster-scoped RBAC. Two grants are worth understanding b
 
 ### Secrets (cluster-wide, full CRUD)
 
-The operator's ClusterRole grants `get, list, watch, create, update, patch, delete` on `secrets` across **all namespaces**. This is required to:
+The ClusterRole grants `get, list, watch, create, update, patch, delete` on `secrets` in **all namespaces**, because the operator must:
 
-- Read `DBCluster.spec.credentialsSecretRef` from any namespace (clusters are cluster-scoped, but their master credentials usually live in a platform namespace).
-- Write generated `DatabaseUser` credentials into the user's namespace (which is arbitrary).
-- Manage cross-namespace storage credentials referenced by `BackupStorage`.
+- read `DBCluster.spec.credentialsSecretRef` from any namespace (clusters are cluster-scoped, but their master credentials usually live in a platform namespace);
+- write generated `DatabaseUser` credentials into the user's namespace, which is arbitrary;
+- read storage credentials referenced by `BackupStorage`.
 
-**Blast radius:** compromise of the operator ServiceAccount token = read/write of every Secret in the cluster. Treat the operator namespace as a high-trust zone. Concretely:
+**Blast radius:** compromise of the operator ServiceAccount token means read/write of every Secret in the cluster. Treat the operator namespace as a high-trust zone:
 
-- Pin the operator namespace as restricted in your admission policy (PSA/OPA).
-- Do not co-locate untrusted workloads in the operator's namespace.
-- Apply NetworkPolicies to limit egress from the operator pod to your DB endpoints only.
-- Rotate the operator's ServiceAccount token if you suspect compromise; cluster-wide Secret access is what an attacker would target.
-
-A namespace-scoped variant (operator only reads/writes Secrets in an allowlisted set of namespaces) is on the roadmap.
+- mark it restricted in your admission policy (PSA/OPA);
+- do not co-locate untrusted workloads there;
+- limit egress from the operator pod to your database endpoints;
+- rotate the ServiceAccount token if you suspect compromise.
 
 ### Cluster-scoped CRs
 
-`DBCluster` and `BackupStorage` are cluster-scoped. Any namespace can today create a `Database` or `DatabaseUser` referencing any `DBCluster`. If you run a shared platform with multiple tenants, see `spec.allowedNamespaces` on the roadmap — until it lands, gate `clusterRef` usage with admission policy (Kyverno / Gatekeeper / Validating Webhook).
+`DBCluster` and `BackupStorage` are cluster-scoped, and any namespace can create a `Database` or `DatabaseUser` referencing any `DBCluster`. On a shared platform, gate `clusterRef` usage with admission policy (Kyverno / Gatekeeper / a validating webhook).
 
 ### Backup pod identity
 
-Backup and restore Jobs run under the same ServiceAccount as the operator. The IRSA / Workload Identity / Managed Identity role attached to it has access to **every** bucket configured via `BackupStorage`. If you need per-tenant storage isolation, use a separate operator install per tenant (each with its own ServiceAccount and cloud-IAM binding) rather than one operator with cluster-wide buckets.
+Backup and restore Jobs run under the operator's ServiceAccount, so its cloud identity can reach **every** bucket configured through `BackupStorage`. For per-tenant storage isolation, run a separate operator install per tenant, each with its own ServiceAccount and IAM binding.
 
 ### Storage probe IAM requirements
 
-Since `0.6.2` the operator probes each `BackupStorage` on reconcile (every 30 minutes by default, and on every spec change). The probe issues one cheap call against the bucket/container to surface misconfiguration immediately instead of at first backup. This is a strict superset of what `0.6.1` required:
+The operator probes each `BackupStorage` on reconcile, at least every 30 minutes, with one cheap call so misconfiguration surfaces immediately instead of at the first backup:
 
 | Provider | Probe call | Required permission |
 |----------|------------|---------------------|
@@ -264,61 +242,42 @@ Since `0.6.2` the operator probes each `BackupStorage` on reconcile (every 30 mi
 | GCS | `Bucket.Attrs` | `storage.buckets.get` on the bucket |
 | Azure Blob | `Container.GetProperties` | container-level Read (covered by `Storage Blob Data Reader` / `Contributor`) |
 
-The probe verifies **auth and bucket existence**, not write access — if the role can list the bucket but lacks `s3:PutObject` / `storage.objects.create` / `Storage Blob Data Contributor`, the probe will report Ready and the first backup will fail. Treat the IAM policies below in the BackupStorage docs as the canonical write-path grants.
+The probe verifies auth and bucket existence, not write access: a role that can list the bucket but lacks `s3:PutObject` / `storage.objects.create` / `Storage Blob Data Contributor` reports `Ready` and fails at the first backup. The IAM policies in the [BackupStorage docs](docs/crds/backupstorage.md#iam-policy-aws-s3) are the canonical write-path grants.
 
-Probe failures continuously block *new* backup jobs (existing jobs continue normally). Transient cloud errors will briefly flip the storage to `Failed`; it auto-recovers within 60 seconds once the probe succeeds again.
+A `Failed` probe blocks *new* backup Jobs; running Jobs are unaffected. Failed storages are retried every 60 seconds.
 
 ## Development
 
 ```bash
-# Build
-make build
-
-# Run tests (unit)
-make test
-
-# Lint and security checks
-make check
-
-# Build multi-arch Docker image
-make docker-buildx
+make build            # compile bin/manager
+make test             # full suite, including envtest (alias for test-envtest)
+make test-unit        # ./pkg/... only
+make check            # fmt, vet, lint, gosec, govulncheck
+make docker-buildx    # multi-arch image
 ```
 
 ### Testing with envtest
 
-Controller tests use [envtest](https://book.kubebuilder.io/reference/envtest.html) which provides a real Kubernetes API server without requiring a full cluster:
+Controller tests use [envtest](https://book.kubebuilder.io/reference/envtest.html), a real Kubernetes API server without a full cluster. `make test-envtest` resolves the binaries through `setup-envtest`, so install it once:
 
 ```bash
-# Run all tests including envtest
-make test
-
-# Run only controller tests with envtest
-make test-envtest
-
-# Run the PostgreSQL integration tests; DBTETHER_TEST_DSN is a superuser DSN to a scratch server (PostgreSQL 16+), skipped when unset
-DBTETHER_TEST_DSN=postgres://postgres:it@localhost:55432/postgres?sslmode=disable go test ./pkg/postgres/ -tags=integration -count=1 -v
+go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
 ```
 
-**Requirements:** `setup-envtest` (installed automatically via `go run`)
+The PostgreSQL integration tests need a superuser DSN to a scratch server (PostgreSQL 16+) and are skipped when it is unset:
+
+```bash
+DBTETHER_TEST_DSN=postgres://postgres:it@localhost:55432/postgres?sslmode=disable make test-integration
+```
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for planned features:
-
-- **Database Features** — owner, templates, schemas, deletion protection
-- **Access Control** — namespace isolation, validating webhook, IAM authentication
-- **Secret Management** — AWS Secrets Manager, Vault, ESO integration
+See [ROADMAP.md](ROADMAP.md).
 
 ## Contributing
 
-Contributions are welcome! Whether it's bug reports, feature requests, documentation improvements, or code contributions - I appreciate any help from the community.
-
-Feel free to:
-- Open an issue to report bugs or suggest features
-- Submit a pull request with improvements
-- Share your use cases and feedback
+Bug reports, feature requests, documentation fixes and pull requests are all welcome — open an issue or a PR.
 
 ## License
 
 Apache 2.0
-

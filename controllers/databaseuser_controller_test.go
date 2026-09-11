@@ -1199,39 +1199,6 @@ func TestDatabaseUserReconciler_GetClusterFromStatus(t *testing.T) {
 	}
 }
 
-func TestDatabaseUserReconciler_GetDatabaseNameFromSpec(t *testing.T) {
-	r := &DatabaseUserReconciler{}
-
-	tests := []struct {
-		name       string
-		specDBName string
-		metaName   string
-		want       string
-	}{
-		{"uses spec.databaseName when set", "custom_db", "my-db", "custom_db"},
-		{"falls back to metadata.name with dash conversion", "", "my-db", "my_db"},
-		{"converts multiple dashes", "", "my-app-db", "my_app_db"},
-		{"no conversion needed", "", "mydb", "mydb"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			db := &databasesv1alpha1.Database{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: tt.metaName,
-				},
-				Spec: databasesv1alpha1.DatabaseSpec{
-					DatabaseName: tt.specDBName,
-				},
-			}
-			got := r.getDatabaseNameFromSpec(db)
-			if got != tt.want {
-				t.Errorf("getDatabaseNameFromSpec() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestDatabaseUserReconciler_PendingTimeout(t *testing.T) {
 	now := metav1.Now()
 	fiveMinutesAgo := metav1.NewTime(time.Now().Add(-5 * time.Minute))
@@ -3121,7 +3088,7 @@ func TestApplyPerDatabasePrivileges(t *testing.T) {
 	r := newTestReconciler()
 	mock := postgres.NewMockClient()
 
-	statuses, applyFailures := r.applyPerDatabasePrivileges(ctx, mock, user, "u", databases, ownerConflicts{})
+	statuses, applyFailures := r.applyPerDatabasePrivileges(ctx, mock, user, databases, ownerConflicts{})
 	if len(statuses) != 2 {
 		t.Fatalf("got %d statuses, want 2", len(statuses))
 	}
@@ -3159,7 +3126,7 @@ func TestApplyPerDatabasePrivileges_PerDBError(t *testing.T) {
 	mock.ShouldFail = true
 	mock.FailError = errors.New("boom")
 
-	statuses, applyFailures := r.applyPerDatabasePrivileges(ctx, mock, user, "u", databases, ownerConflicts{})
+	statuses, applyFailures := r.applyPerDatabasePrivileges(ctx, mock, user, databases, ownerConflicts{})
 	if statuses[0].Phase != "Failed" {
 		t.Errorf("phase = %q, want Failed", statuses[0].Phase)
 	}
@@ -3168,6 +3135,32 @@ func TestApplyPerDatabasePrivileges_PerDBError(t *testing.T) {
 	}
 	if len(applyFailures) != 1 || applyFailures[0] != "appdb" {
 		t.Errorf("applyFailures = %v, want [appdb]", applyFailures)
+	}
+}
+
+func TestApplyPerDatabasePrivileges_GrantsConnectBeforePrivileges(t *testing.T) {
+	ctx := context.Background()
+	user := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "u", Namespace: "default"},
+		Spec: databasesv1alpha1.DatabaseUserSpec{
+			Databases:  []databasesv1alpha1.DatabaseAccess{{Name: "db1"}, {Name: "db2"}},
+			Privileges: "readonly",
+		},
+	}
+	databases := []*databasesv1alpha1.Database{
+		{ObjectMeta: metav1.ObjectMeta{Name: "db1"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "appdb"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "db2"}, Spec: databasesv1alpha1.DatabaseSpec{DatabaseName: "cachedb"}},
+	}
+	r := newTestReconciler()
+	mock := &recordingPGClient{MockClient: postgres.NewMockClient()}
+
+	if _, applyFailures := r.applyPerDatabasePrivileges(ctx, mock, user, databases, ownerConflicts{}); len(applyFailures) != 0 {
+		t.Fatalf("applyFailures = %v, want none", applyFailures)
+	}
+
+	want := []string{"connect:appdb", "apply:appdb", "connect:cachedb", "apply:cachedb"}
+	if !reflect.DeepEqual(mock.sequence, want) {
+		t.Errorf("call sequence = %v, want %v", mock.sequence, want)
 	}
 }
 
@@ -3865,6 +3858,7 @@ func newOwnerConflictDatabase(name string) *databasesv1alpha1.Database {
 type recordingPGClient struct {
 	*postgres.MockClient
 	applied       []appliedPrivilege
+	sequence      []string // "connect:<db>" / "apply:<db>", in call order
 	failDatabases map[string]error
 }
 
@@ -3875,10 +3869,16 @@ type appliedPrivilege struct {
 
 func (m *recordingPGClient) ApplyPrivileges(ctx context.Context, username, database, preset string, additionalGrants []postgres.TableGrant) error {
 	m.applied = append(m.applied, appliedPrivilege{database: database, privileges: preset})
+	m.sequence = append(m.sequence, "apply:"+database)
 	if err, ok := m.failDatabases[database]; ok {
 		return err
 	}
 	return m.MockClient.ApplyPrivileges(ctx, username, database, preset, additionalGrants)
+}
+
+func (m *recordingPGClient) GrantDatabaseAccess(ctx context.Context, username, database string) error {
+	m.sequence = append(m.sequence, "connect:"+database)
+	return m.MockClient.GrantDatabaseAccess(ctx, username, database)
 }
 
 func (m *recordingPGClient) appliedTo(database string) *appliedPrivilege {
@@ -3892,6 +3892,7 @@ func (m *recordingPGClient) appliedTo(database string) *appliedPrivilege {
 
 func (m *recordingPGClient) reset() {
 	m.applied = nil
+	m.sequence = nil
 }
 
 func newRecordingReconciler(objects ...runtime.Object) (*DatabaseUserReconciler, *recordingPGClient) {
@@ -4043,7 +4044,8 @@ func TestDatabaseUserReconciler_ApplyFailureKeepsConflictMessage(t *testing.T) {
 	if status.Phase != "Failed" {
 		t.Errorf("Phase = %q, want %q", status.Phase, "Failed")
 	}
-	wantMessage := wantOwnerConflictMessage + "; permission denied for database owner_conflict_db"
+	wantMessage := wantOwnerConflictMessage +
+		"; failed to apply privileges for user owner_loser: permission denied for database owner_conflict_db"
 	if len(status.Databases) != 1 {
 		t.Fatalf("got %d database statuses, want 1: %+v", len(status.Databases), status.Databases)
 	}

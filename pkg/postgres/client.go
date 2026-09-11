@@ -283,11 +283,29 @@ func (c *Client) GetDatabaseOwner(ctx context.Context, name string) (namespace, 
 	return ns, n, nil
 }
 
+// A REVOKE by a role that does not own the database answers with a warning and no error, and a NULL datacl is the default ACL, which grants PUBLIC CONNECT.
+const publicConnectGrantedQuery = `
+	SELECT EXISTS (
+		SELECT 1 FROM pg_database d
+		WHERE d.datname = $1
+		  AND (d.datacl IS NULL
+		       OR EXISTS (SELECT 1 FROM aclexplode(d.datacl) a
+		                  WHERE a.grantee = 0 AND a.privilege_type = 'CONNECT'))
+	)`
+
 func (c *Client) RevokePublicConnect(ctx context.Context, name string) error {
 	query := fmt.Sprintf("REVOKE CONNECT ON DATABASE %s FROM PUBLIC", pq.QuoteIdentifier(name))
 	_, err := c.pool.Exec(ctx, query)
 	if err != nil {
 		return fmt.Errorf("failed to revoke public connect on %s: %w", name, err)
+	}
+
+	var stillGranted bool
+	if err := c.pool.QueryRow(ctx, publicConnectGrantedQuery, name).Scan(&stillGranted); err != nil {
+		return fmt.Errorf("failed to verify public connect on %s: %w", name, err)
+	}
+	if stillGranted {
+		return fmt.Errorf("public connect on database %s could not be revoked (not owner)", name)
 	}
 	return nil
 }

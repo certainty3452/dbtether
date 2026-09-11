@@ -4,6 +4,7 @@ Represents a scheduled backup policy for automatic database backups.
 
 **API Version:** `dbtether.io/v1alpha1`  
 **Kind:** `BackupSchedule`  
+**Short name:** `bks`  
 **Scope:** Namespaced
 
 ## Example
@@ -34,23 +35,15 @@ spec:
 | `databaseRef.name` | string | ✅ | — | Name of the Database resource |
 | `databaseRef.namespace` | string | ❌ | same as Schedule | Namespace of the Database |
 | `storageRef.name` | string | ✅ | — | Name of the BackupStorage resource |
-| `schedule` | string | ✅ | — | Cron schedule (5 fields) |
-| `filenameTemplate` | string | ❌ | `{{ .Timestamp }}.sql.gz` | Backup filename template |
+| `schedule` | string | ✅ | — | Cron schedule; admission enforces exactly 5 whitespace-separated fields |
+| `filenameTemplate` | string | ❌ | `{{ .Timestamp }}.sql.gz` | Backup filename template, inherited by every Backup it creates |
 | `retention` | object | ❌ | — | Retention policy for cleanup |
 | `suspend` | bool | ❌ | `false` | Pause scheduling |
 | `jobConfig` | object | ❌ | — | Job configuration inherited by all Backups |
 
 ### jobConfig
 
-Configure Kubernetes Job parameters inherited by all scheduled Backups. See [Backup jobConfig](backup.md#jobconfig) for details.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `backoffLimit` | int | `3` | Number of retries before marking backup failed (0-10) |
-| `activeDeadlineSeconds` | int | — | Hard timeout for the entire backup (seconds, min 60) |
-| `ttlSecondsAfterFailed` | int | `43200` (12h) | Keep failed Job for debugging (seconds) |
-
-**Example:**
+Copied verbatim onto every Backup this schedule creates — see [Backup jobConfig](backup.md#jobconfig).
 
 ```yaml
 spec:
@@ -62,17 +55,7 @@ spec:
 
 ## schedule (Cron Format)
 
-Standard 5-field cron format: `minute hour day month weekday`
-
-| Field | Values | Special |
-|-------|--------|---------|
-| minute | 0-59 | `*` = every |
-| hour | 0-23 | `*/N` = every N |
-| day | 1-31 | |
-| month | 1-12 | |
-| weekday | 0-6 (Sun=0) | |
-
-**Examples:**
+Standard 5-field cron: `minute hour day month weekday`, evaluated in the operator's timezone.
 
 | Schedule | Description |
 |----------|-------------|
@@ -82,123 +65,72 @@ Standard 5-field cron format: `minute hour day month weekday`
 | `0 3 1 * *` | Monthly on 1st at 3:00 AM |
 | `30 4 * * 1-5` | Weekdays at 4:30 AM |
 
+The next run is computed from `status.lastBackupTime`, falling back to the resource's creation time. A schedule created after today's slot has passed therefore fires its first backup immediately.
+
 ## retention
 
-Defines how long to keep backups. Files not matching any retention rule are deleted.
+At least one of the four fields must be a positive number — admission rejects an empty or all-zero policy, because that would mark every backup for deletion.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `keepLast` | int | Keep the N most recent backups |
-| `keepDaily` | int | Keep one backup per day for N days |
-| `keepWeekly` | int | Keep one backup per week for N weeks |
-| `keepMonthly` | int | Keep one backup per month for N months |
+| `keepDaily` | int | Keep the newest backup of each day, for days within the last N |
+| `keepWeekly` | int | Keep the newest backup of each ISO week, for weeks within the last N |
+| `keepMonthly` | int | Keep the newest backup of each month, for months within the last N |
 
-### How Retention Works
+The rules union: a file survives if any rule keeps it. With `keepLast: 3` plus `keepDaily: 7` over 10 backups from the last week, the 3 newest and one per day both survive — roughly 7-10 files.
 
-1. **List** all backup files in the database's S3 path
-2. **Parse** timestamps from filenames (`YYYYMMDD-HHMMSS*.sql.gz`)
-3. **Calculate** which files match retention rules:
-   - `keepLast`: newest N files
-   - `keepDaily`: newest file per day within N days
-   - `keepWeekly`: newest file per week within N weeks
-   - `keepMonthly`: newest file per month within N months
-4. **Delete** files that don't match any rule
+### What retention deletes
 
-**Overlap example:**
+Cleanup runs after each scheduled backup and covers two things:
 
-```yaml
-retention:
-  keepLast: 3      # Always keep 3 newest
-  keepDaily: 7     # Plus daily for 7 days
-```
+- **Objects** under the storage prefix whose name matches this schedule's `filenameTemplate`, with the template variables turned back into patterns (`{{ .Timestamp }}` → `\d{8}-\d{6}`, `{{ .RunID }}` → `[a-z0-9]{8}`). Files written by another schedule or by hand under the same prefix are left alone. Change `filenameTemplate` on a live schedule and the older files stop matching — they are then never cleaned up.
+- **Backup resources** labelled with this schedule, once they are `Completed` or `Failed`, using the same policy. Runs still in flight are never deleted.
 
-If you have 10 backups from the last 7 days:
-- `keepLast` protects: 3 newest
-- `keepDaily` protects: 1 per day = up to 7 files
-- Result: keeps ~7-10 files (union of both rules)
+Ordering uses the `YYYYMMDD-HHMMSS` timestamp in the object key; an object without one falls back to its storage last-modified time, and is skipped if that is unavailable too.
 
-### Retention applies to ALL files
-
-Retention operates on all `.sql.gz` files in the database's S3 path, regardless of whether they were created by this schedule or manually. This keeps storage management simple and predictable.
+Retention rebuilds the storage prefix from `.ClusterName` and `.DatabaseName` only, so a [`pathTemplate`](backupstorage.md#pathtemplate) containing `.Year`, `.Month` or `.Day` yields a prefix that matches no object and silently deletes nothing.
 
 ## filenameTemplate
 
-Same template variables as [Backup](backup.md#filenametemplate):
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `.DatabaseName` | PostgreSQL database name | `orders_db` |
-| `.Timestamp` | `YYYYMMDD-HHMMSS` format | `20260120-020000` |
-| `.RunID` | Unique 8-char identifier | `a1b2c3d4` |
+Same variables as [Backup](backup.md#filenametemplate): `.DatabaseName`, `.Timestamp`, `.RunID`.
 
 ## Status
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `phase` | enum | Current state (`Active`, `Suspended`, `Failed`) |
-| `message` | string | Detailed message |
-| `lastBackupTime` | time | When last backup was triggered |
-| `lastSuccessfulBackup` | string | Name of last successful Backup resource |
-| `nextScheduledTime` | time | When next backup will run |
-| `managedBackups` | int | Number of backups in S3 |
+| `phase` | enum | `Active`, `Suspended`, `Failed` |
+| `message` | string | Error text; empty while `Active` |
+| `lastBackupTime` | time | When the last backup was triggered |
+| `nextScheduledTime` | time | When the next backup will run |
 | `observedGeneration` | int64 | Processed spec version |
-
-### Status Phases
-
-| Phase | Description |
-|-------|-------------|
-| `Active` | Schedule is running normally |
-| `Suspended` | Schedule is paused (`spec.suspend: true`) |
-| `Failed` | Error (see `message`) |
 
 ## Behavior
 
 ### Backup Creation
 
-When scheduled time arrives:
-1. Controller creates a `Backup` resource: `{schedule-name}-{runID}`
-2. Backup is labeled with `dbtether.io/schedule: {schedule-name}`
-3. Backup follows normal backup flow (creates Job, uploads to S3)
-4. Schedule status updated with last/next times
+At each slot the controller creates a Backup named `<schedule-name>-<YYYYMMDD-HHMM>` from the slot's UTC time — deterministic, so a duplicate reconcile finds the existing object instead of running twice. It carries the labels `dbtether.io/schedule` and `dbtether.io/schedule-namespace`, and inherits `databaseRef`, `storageRef`, `filenameTemplate` and `jobConfig`. From there it follows the normal [Backup](backup.md) flow.
 
 ### Ownership
 
-BackupSchedule owns its Backup resources. When you delete a schedule:
-- All associated Backup CRDs are deleted
-- S3 files are NOT automatically deleted (run retention cleanup first)
+Each Backup is created with the schedule as its controller reference, so deleting the schedule deletes its Backup resources. Objects already in storage are never deleted with the schedule.
 
 ### Suspension
 
-Set `suspend: true` to pause scheduling:
-- No new backups are created
-- Running backups continue to completion
-- Retention cleanup is paused
-- Status shows `Suspended`
+`suspend: true` stops the scheduler and retention cleanup; already-running backups finish. Status shows `Suspended`.
 
 ## kubectl Commands
 
 ```bash
-# List all schedules
-kubectl get backupschedules -A
-kubectl get bks -A  # short name
-
-# Schedule details
+kubectl get bks -A
 kubectl describe bks orders-nightly -n orders-team
+kubectl get bks orders-nightly -n orders-team -o jsonpath='{.status.nextScheduledTime}'
 
-# Check next backup time
-kubectl get bks orders-nightly -n orders-team \
-  -o jsonpath='{.status.nextScheduledTime}'
-
-# List backups created by this schedule
+# Backups created by this schedule
 kubectl get backups -n orders-team -l dbtether.io/schedule=orders-nightly
 
-# Suspend a schedule
-kubectl patch bks orders-nightly -n orders-team \
-  --type=merge -p '{"spec":{"suspend":true}}'
-
-# Resume
-kubectl patch bks orders-nightly -n orders-team \
-  --type=merge -p '{"spec":{"suspend":false}}'
+kubectl patch bks orders-nightly -n orders-team --type=merge -p '{"spec":{"suspend":true}}'
+kubectl patch bks orders-nightly -n orders-team --type=merge -p '{"spec":{"suspend":false}}'
 ```
 
 ## Examples
@@ -242,24 +174,6 @@ spec:
     keepLast: 24  # Keep last 24 hours only
 ```
 
-### Analytics: Weekly
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: BackupSchedule
-metadata:
-  name: analytics-weekly
-  namespace: data-team
-spec:
-  databaseRef:
-    name: analytics-db
-  storageRef:
-    name: company-s3
-  schedule: "0 3 * * 0"  # Sunday 3 AM
-  retention:
-    keepLast: 8  # 2 months of weekly backups
-```
-
 ### Large Database: Custom Timeouts
 
 ```yaml
@@ -284,9 +198,10 @@ spec:
 
 ## Troubleshooting
 
-### Phase: Failed, message: "Invalid cron schedule"
+### Rejected on apply: `spec.schedule in body should match '^(\S+\s+){4}\S+$'`
 
-Check cron format is exactly 5 fields:
+The expression does not have exactly 5 fields. Six-field cron (with seconds) is the usual cause:
+
 ```
 # Wrong (6 fields - includes seconds)
 "0 0 2 * * *"
@@ -295,29 +210,25 @@ Check cron format is exactly 5 fields:
 "0 2 * * *"
 ```
 
+### Phase: Failed, message: "Invalid cron schedule: ..."
+
+Five fields, but one of them is not a valid cron value — `0 25 * * *`, `0 2 * * 8`, a typo in a range. The quoted parser error names the offending field.
+
 ### Backups not being created
 
-1. Check schedule is not suspended:
-   ```bash
-   kubectl get bks my-schedule -o jsonpath='{.spec.suspend}'
-   ```
+Check `spec.suspend`, then that the Database and BackupStorage are both ready — a schedule creates the Backup regardless, and the Backup itself parks in `Pending` naming the dependency:
 
-2. Check operator logs:
-   ```bash
-   kubectl logs -n dbtether deployment/dbtether -f | grep BackupSchedule
-   ```
-
-3. Verify Database and BackupStorage exist and are Ready
+```bash
+kubectl get bks my-schedule -o jsonpath='{.spec.suspend}'
+kubectl get bkp -n <namespace> -l dbtether.io/schedule=my-schedule
+```
 
 ### Retention not deleting files
 
-1. Ensure timestamps in filenames match format `YYYYMMDD-HHMMSS`
-2. Check operator has `s3:DeleteObject` permission
-3. Check operator logs for retention errors
+1. The filenames must match this schedule's `filenameTemplate` and contain a `YYYYMMDD-HHMMSS` timestamp. Files written under an earlier template are ignored.
+2. The operator needs `s3:DeleteObject` (or the equivalent) on the bucket.
+3. Retention failures never fail a backup; they are logged as `retention cleanup: ...` and nothing else.
 
-### S3 files remain after schedule deletion
+### Objects remain after the schedule is deleted
 
-By design, S3 files are not deleted when schedule is removed. To clean up:
-1. Keep schedule running until retention removes old files
-2. Or manually delete files from S3
-
+By design — deleting a schedule removes its Backup resources, never the files. Let retention drain them before deleting the schedule, or clean the prefix by hand.

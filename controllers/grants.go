@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -37,6 +38,16 @@ func ResolveUserGrantsForDatabase(user *databasesv1alpha1.DatabaseUser, namespac
 		}
 	}
 	return UserGrants{}, false
+}
+
+func ApplyUserGrants(ctx context.Context, pgClient postgres.ClientInterface, databaseName string, grants UserGrants) error {
+	if err := pgClient.GrantDatabaseAccess(ctx, grants.Username, databaseName); err != nil {
+		return fmt.Errorf("failed to grant database access for user %s: %w", grants.Username, err)
+	}
+	if err := pgClient.ApplyPrivileges(ctx, grants.Username, databaseName, grants.Privileges, grants.AdditionalGrants); err != nil {
+		return fmt.Errorf("failed to apply privileges for user %s: %w", grants.Username, err)
+	}
+	return nil
 }
 
 func ValidateUserSpec(user *databasesv1alpha1.DatabaseUser) error {

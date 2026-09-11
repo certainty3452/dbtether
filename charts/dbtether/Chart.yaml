@@ -2,8 +2,8 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.9.0
-appVersion: "0.9.0"
+version: 0.9.1
+appVersion: "0.9.1"
 home: https://github.com/certainty3452/dbtether
 # icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
@@ -159,21 +159,9 @@ annotations:
             name: orders-db-restored
         onConflict: drop
   artifacthub.io/changes: |
-    - kind: changed
-      description: "Breaking: Restore no longer offers `onConflict: overwrite`. Use `drop` to replace the database or `fail` to refuse when it is not empty."
-    - kind: changed
-      description: "Breaking: A DatabaseUser must list each database once and use either `database` or `databases`, not both. With per-database secrets (`secretGeneration: perDatabase`) the database names must be unique."
     - kind: fixed
-      description: "A restore that ran into an error used to report success and leave the database half restored. It now restores everything or nothing and reports the error."
+      description: "After a restore that replaced the database (`onConflict: drop`), the database was left open to every role of the cluster and looked unowned until the next periodic reconcile; the restore now re-applies the database settings (ownership, public access, extensions) as soon as the data is in"
     - kind: fixed
-      description: "Restoring into RDS failed on extension comments in the dump. They are skipped now."
+      description: "Users of a replaced database lost their connection right when that reconcile ran; the restore now re-grants every user's access and privileges"
     - kind: fixed
-      description: "Empty or unsupported backup files are refused before the target database is touched."
-    - kind: fixed
-      description: "Backup Jobs ignored the configured SSL mode."
-    - kind: fixed
-      description: "A failed backup now reports what went wrong instead of a generic \"retries exhausted\"."
-    - kind: changed
-      description: "Only one DatabaseUser can own a database. When two claim it, the older one keeps ownership and the other is reported as failed."
-    - kind: changed
-      description: "Backup and restore Jobs use the PostgreSQL client that matches the database server version; clients 16, 17 and 18 ship in the image."
+      description: "A database whose public access could not be revoked, including when the operator is not its owner, was reported as ready; it is now reported as failed"

@@ -4,6 +4,7 @@ Represents a one-time database backup operation.
 
 **API Version:** `dbtether.io/v1alpha1`  
 **Kind:** `Backup`  
+**Short name:** `bkp`  
 **Scope:** Namespaced
 
 ## Example
@@ -38,15 +39,11 @@ spec:
 
 ### jobConfig
 
-Configure Kubernetes Job parameters for backup execution.
-
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `backoffLimit` | int | `3` | Number of retries before marking backup failed (0-10) |
 | `activeDeadlineSeconds` | int | — | Hard timeout for the entire backup (seconds, min 60) |
 | `ttlSecondsAfterFailed` | int | `43200` (12h) | Keep failed Job for debugging (seconds) |
-
-**Example:**
 
 ```yaml
 spec:
@@ -58,17 +55,11 @@ spec:
 
 ## filenameTemplate
 
-Template for the backup filename.
-
-**Available variables:**
-
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `.DatabaseName` | PostgreSQL database name | `orders_db` |
-| `.Timestamp` | Timestamp in `YYYYMMDD-HHMMSS` format | `20260120-143022` |
-| `.RunID` | Unique 8-character alphanumeric ID | `a1b2c3d4` |
-
-**Examples:**
+| `.Timestamp` | UTC timestamp in `YYYYMMDD-HHMMSS` format | `20260120-143022` |
+| `.RunID` | Unique 8-character lowercase alphanumeric ID | `a1b2c3d4` |
 
 | Template | Result |
 |----------|--------|
@@ -77,27 +68,15 @@ Template for the backup filename.
 | `{{ .Timestamp }}-{{ .RunID }}.sql.gz` | `20260120-143022-a1b2c3d4.sql.gz` |
 | `backup-{{ .RunID }}.sql.gz` | `backup-a1b2c3d4.sql.gz` |
 
-### RunID
+A fresh `RunID` is generated per run and appears in the Job name, the filename and `status.runId`, which is what ties the three together when several runs of the same Backup are in flight.
 
-`RunID` is a unique 8-character alphanumeric identifier generated for each backup run. It provides:
-
-- **Uniqueness:** Guarantees unique filenames even if timestamp collides
-- **Traceability:** Same RunID appears in Job name, filename, and status
-- **Correlation:** Easy to find Job by RunID: `kubectl get jobs -l dbtether.io/backup-name=<name>`
+Directories come from the BackupStorage's [`pathTemplate`](backupstorage.md#pathtemplate); `filenameTemplate` is only the last segment. A schedule's retention only deletes files matching its own `filenameTemplate` — see [BackupSchedule retention](backupschedule.md#retention).
 
 ## ttlAfterCompletion
 
-Sets `ttlSecondsAfterFinished` on the Kubernetes Job that runs the backup. Kubernetes deletes the Job and its pods that long after the Job finishes; the Backup resource and its status are untouched, and the uploaded backup file stays in storage.
+Sets `ttlSecondsAfterFinished` on the Kubernetes Job that runs the backup: Kubernetes deletes the Job and its pods that long after the Job finishes. The Backup resource, its status and the uploaded file are untouched.
 
-Each attempt runs in its own Pod; failed Pods are kept until the TTL, so their logs survive.
-
-| Value | Behavior |
-|-------|----------|
-| Not set | Job is deleted 1 hour after it finishes |
-| `1h` | Job is deleted 1 hour after it finishes |
-| `24h` | Job is deleted 24 hours after it finishes |
-
-Raise it when you need more time to inspect Job logs after a run. Failed Jobs are kept on their own schedule; see `jobConfig.ttlSecondsAfterFailed`, which defaults to 12 hours.
+Each attempt runs in its own Pod and failed Pods are kept until the TTL, so their logs survive. Raise the value when you need more time to read them. A Job that ends in failure switches to `jobConfig.ttlSecondsAfterFailed` instead, which defaults to 12 hours.
 
 ## trigger
 
@@ -133,7 +112,7 @@ The operator writes `status.observedGeneration` when a run starts, not when it f
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `phase` | enum | Current state (`Pending`, `Running`, `Completed`, `Failed`) |
+| `phase` | enum | `Pending`, `Running`, `Completed`, `Failed` |
 | `message` | string | Detailed message or error |
 | `specHash` | string | Hash of spec (prevents re-runs on same config) |
 | `jobName` | string | Name of the Kubernetes Job |
@@ -153,55 +132,40 @@ The operator writes `status.observedGeneration` when a run starts, not when it f
 
 | Phase | Description |
 |-------|-------------|
-| `Pending` | Backup created, waiting to start |
+| `Pending` | Waiting on a dependency, a free job slot, or Job creation |
 | `Running` | Backup job is executing |
 | `Completed` | Backup finished successfully |
-| `Failed` | Backup failed (see `message`) |
+| `Failed` | Backup failed (see `message` and `failureMessage`) |
 
 ## How It Works
 
-1. **Create Backup:** You create a Backup resource
-2. **Generate RunID:** Controller generates unique 8-char RunID
-3. **Create Job:** Controller creates a Kubernetes Job with name `backup-<name>-<runID>`
-4. **Execute pg_dump:** Job runs `pg_dump` → compresses → uploads to storage
-5. **Update Status:** Controller updates Backup status with path, size, duration
-6. **Job Cleanup:** Kubernetes deletes the finished Job once `ttlAfterCompletion` elapses
+1. Controller resolves `databaseRef`, its DBCluster and `storageRef`, and requires all three to be ready.
+2. It generates an 8-character `runId` and creates a Job named `backup-<name>-<runId>` in the operator's namespace.
+3. The Job streams `pg_dump` → `gzip` → object storage without staging the dump on disk.
+4. The Job reports path, size and duration back through its own annotations; the controller copies them into the Backup status.
+5. Kubernetes deletes the finished Job once `ttlAfterCompletion` elapses.
 
 ### Idempotency
 
-The controller computes a `specHash` of your spec. If you apply the same Backup twice:
-- Same spec → no new backup (idempotent)
-- Changed spec → new backup runs
-
-This prevents accidental duplicate backups in GitOps workflows. Any field of the spec counts, so re-applying an unchanged manifest is free no matter how often your GitOps tool syncs it.
-
-To re-run on purpose from an unchanged manifest, change [`trigger`](#trigger).
+The controller hashes the spec. Applying the same Backup again does nothing, no matter how often a GitOps tool syncs it; changing any spec field starts a new run. To re-run from an unchanged manifest, change [`trigger`](#trigger).
 
 ### Throttling
 
-To prevent overloading the database, the operator limits concurrent backup jobs:
-- **Default:** 3 concurrent backups per DBCluster
-- Jobs are queued and retried with 30-second delay
+At most 3 backup Jobs per DBCluster run at once (`backup.maxConcurrentPerCluster` in the chart). Over the limit the Backup sits in `Pending` and is retried every 30 seconds.
 
 ## kubectl Commands
 
 ```bash
-# List all backups
-kubectl get backups -A
-kubectl get bkp -A  # short name
-
-# Backup details
+kubectl get bkp -A
 kubectl describe backup orders-backup-20260120 -n my-team
-
-# Watch backup progress
 kubectl get bkp -n my-team -w
 
-# Check backup path and size
+# Path and size of the last run
 kubectl get bkp orders-backup-20260120 -n my-team \
   -o jsonpath='{.status.path}{"\n"}{.status.size}'
 
-# Find associated Job
-kubectl get jobs -n dbtether -l dbtether.io/backup-name=orders-backup-20260120
+# The Job lives in the operator's namespace, not the Backup's
+kubectl get jobs -n dbtether -l dbtether.io/backup=orders-backup-20260120
 ```
 
 ## Examples
@@ -235,22 +199,6 @@ spec:
   storageRef:
     name: production-backups
   filenameTemplate: "pre-migration-{{ .Timestamp }}-{{ .RunID }}.sql.gz"
-```
-
-### Short Job Retention
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: Backup
-metadata:
-  name: test-backup
-  namespace: dev-team
-spec:
-  databaseRef:
-    name: test-db
-  storageRef:
-    name: dev-backups
-  ttlAfterCompletion: 1h  # Keep the finished Job for 1 hour
 ```
 
 ### Cross-namespace Database Reference
@@ -292,94 +240,76 @@ spec:
 
 ### Format
 
-Backups are created using `pg_dump` with the following settings:
-- **Format:** Plain SQL
-- **Compression:** gzip (`.sql.gz`)
-- **Encoding:** UTF-8
+`pg_dump --format=plain --no-owner --no-acl`, piped through gzip. `--no-owner --no-acl` is why a restore has to re-apply ownership and grants itself — see [Grants after the restore](restore.md#grants-after-the-restore).
 
 ### Client version
 
-Backup Jobs run the bundled `pg_dump` matching the source server's major version, or the oldest bundled one above it. The image bundles the PostgreSQL 16, 17 and 18 clients; a newer server fails the Job with a message naming the majors.
+Backup Jobs run the bundled `pg_dump` matching the source server's major version, or the oldest bundled one above it. The image bundles the PostgreSQL 16, 17 and 18 clients; a newer server fails the Job with `no pg_dump for a server on major <N>` naming the bundled majors.
 
 ### S3 Object Tags
 
-When uploading to S3, the operator adds metadata tags (best-effort):
+Uploads to S3 carry these tags, best-effort:
 
 | Tag | Value |
 |-----|-------|
-| `dbtether.io/backup-name` | Backup resource name |
-| `dbtether.io/backup-namespace` | Backup namespace |
-| `dbtether.io/database` | Database name |
-| `dbtether.io/cluster` | DBCluster name |
-| `dbtether.io/created-by` | `dbtether-operator` |
+| `database` | PostgreSQL database name |
+| `cluster` | DBCluster name |
+| `backup-name` | Backup resource name |
+| `namespace` | Backup namespace |
+| `timestamp` | Run timestamp, `YYYYMMDD-HHMMSS` |
+| `created-by` | `dbtether` |
 
-> **Note:** Tags require `s3:PutObjectTagging` permission. If missing, backup succeeds without tags.
+Tagging needs `s3:PutObjectTagging`. Without it the upload is retried untagged and the backup still succeeds.
 
 ## Troubleshooting
 
-### Phase: Pending (stuck)
+### Phase: Pending, message: "database &lt;name&gt; is not ready (phase: &lt;phase&gt;)"
 
-1. Check if Database exists and is Ready:
-   ```bash
-   kubectl get database orders-db -n my-team
-   ```
-
-2. Check if BackupStorage exists and is Ready:
-   ```bash
-   kubectl get backupstorage production-backups
-   ```
-
-3. Check operator logs:
-   ```bash
-   kubectl logs -n dbtether deployment/dbtether -f
-   ```
-
-### Phase: Failed, message: "backup throttled"
-
-Too many concurrent backups for this cluster. The backup will be automatically retried in 30 seconds.
-
-### Phase: Failed, message: "upload failed: failed to upload to S3: ..."
-
-Check IAM permissions. See [BackupStorage Troubleshooting](backupstorage.md#troubleshooting).
-
-### Finding the Backup File
+A dependency is not usable yet. The same shape covers `database <name> not found`, `cluster <name> not found`, `cluster <name> is not connected`, `backup storage <name> not found` and `backup storage <name> is not ready (phase: <phase>)`. Fix the named resource; the Backup starts on its own.
 
 ```bash
-# Get the full path
-kubectl get bkp my-backup -n my-team -o jsonpath='{.status.path}'
-# Output: s3://my-bucket/production/orders_db/20260120-143022-a1b2c3d4.sql.gz
-
-# Download from S3
-aws s3 cp "$(kubectl get bkp my-backup -n my-team -o jsonpath='{.status.path}')" ./backup.sql.gz
+kubectl get database orders-db -n my-team
+kubectl get backupstorage production-backups
 ```
 
-### Checking Backup Job Logs
+### Phase: Pending, message: "waiting for other backups to complete (active: 3/3)"
+
+The DBCluster is at its concurrent-job limit. Retried every 30 seconds; raise `backup.maxConcurrentPerCluster` if the queue never drains.
+
+### Phase: Pending, message: "failed to create job: ..."
+
+The API server rejected the Job — usually a quota, an admission policy, or invalid pod labels/annotations supplied through the chart's `backup.podLabels` / `backup.podAnnotations`.
+
+### Phase: Failed, message: "backup job failed: ..."
+
+The Job itself failed; `status.failureMessage` holds what the container reported and `status.failureReason` the Kubernetes condition (`BackoffLimitExceeded`, `DeadlineExceeded`). `upload failed: failed to upload to S3: ...` here means IAM — see [BackupStorage troubleshooting](backupstorage.md#troubleshooting). Pull the logs:
 
 ```bash
-# Find the job
-JOB=$(kubectl get bkp my-backup -n my-team -o jsonpath='{.status.jobName}')
-
-# Get logs
-kubectl logs -n dbtether job/$JOB
-
-# Or use lastPodName from status
 POD=$(kubectl get bkp my-backup -n my-team -o jsonpath='{.status.lastPodName}')
 kubectl logs -n dbtether $POD
 ```
 
-### Viewing Kubernetes Events
+### Phase: Failed, message: "backup job not found"
 
-The operator emits events for backup lifecycle:
+The Job was deleted before its result was recorded — a TTL that elapsed while the operator was down, or a manual delete. Whether the file reached storage is unknown; check the bucket, then re-run by changing [`trigger`](#trigger).
+
+### Finding the Backup File
 
 ```bash
-# Events for a specific backup
-kubectl get events -n my-team --field-selector involvedObject.name=my-backup
+kubectl get bkp my-backup -n my-team -o jsonpath='{.status.path}'
+# s3://my-bucket/production/orders_db/20260120-143022-a1b2c3d4.sql.gz
 
-# Events: BackupStarted, BackupCompleted, BackupFailed
+aws s3 cp "$(kubectl get bkp my-backup -n my-team -o jsonpath='{.status.path}')" ./backup.sql.gz
 ```
 
-| Event | Reason | Description |
-|-------|--------|-------------|
+### Events
+
+```bash
+kubectl get events -n my-team --field-selector involvedObject.name=my-backup
+```
+
+| Type | Reason | Meaning |
+|------|--------|---------|
 | Normal | `BackupStarted` | Backup job created |
 | Normal | `BackupCompleted` | Backup finished successfully |
-| Warning | `BackupFailed` | Backup failed (includes reason and message) |
+| Warning | `BackupFailed` | Backup failed (carries reason and message) |

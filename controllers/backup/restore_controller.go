@@ -711,36 +711,34 @@ func (r *RestoreReconciler) finishGranting(ctx context.Context, restore *databas
 	}
 
 	if len(failures) > 0 {
-		return r.handleUserGrantFailures(ctx, restore, specHash, failures)
+		return r.handleGrantFailures(ctx, restore, specHash, failures)
 	}
 
 	logger.Info("restore completed successfully", "duration", restoreDuration(restore))
 	return r.updateStatusCompleted(ctx, restore, specHash, "restore completed successfully")
 }
 
-// handleUserGrantFailures retries the full user set — ApplyPrivileges is idempotent,
-// so users that already succeeded are cheap to redo — until the attempt budget is
-// spent, then completes with the offenders named.
-func (r *RestoreReconciler) handleUserGrantFailures(
+// Retries the whole round, not just the failed subjects, since every step is idempotent.
+func (r *RestoreReconciler) handleGrantFailures(
 	ctx context.Context,
 	restore *databasesv1alpha1.Restore,
 	specHash string,
-	failures []userGrantFailure,
+	failures []grantFailure,
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	attempts := restore.Status.GrantAttempts + 1
 	err := joinGrantFailures(failures)
-	users := failedGrantUsers(failures)
+	subjects := failedGrantSubjects(failures)
 
 	if attempts >= grantAttemptLimit {
-		logger.Error(err, "giving up on re-applying grants after restore", "attempts", attempts, "users", users)
-		r.recordGrantsSkipped(restore, fmt.Sprintf("retries exhausted for %s", users))
+		logger.Error(err, "giving up on re-applying grants after restore", "attempts", attempts, "subjects", subjects)
+		r.recordGrantsSkipped(restore, fmt.Sprintf("retries exhausted for %s", subjects))
 		return r.updateStatusCompleted(ctx, restore, specHash,
-			fmt.Sprintf("restore completed; grants not re-applied for: %s", users))
+			fmt.Sprintf("restore completed; grants not re-applied for: %s", subjects))
 	}
 
-	logger.Error(err, "failed to re-apply grants for some users after restore", "attempts", attempts, "users", users)
+	logger.Error(err, "failed to re-apply grants after restore", "attempts", attempts, "subjects", subjects)
 	if statusErr := r.patchGrantingProgress(ctx, restore, attempts,
 		fmt.Sprintf("restore succeeded, retrying grants: %v", err)); statusErr != nil {
 		return ctrl.Result{}, statusErr
@@ -780,12 +778,11 @@ func (r *RestoreReconciler) recordGrantsSkipped(restore *databasesv1alpha1.Resto
 
 // pg_restore imports as the cluster admin with --no-owner --no-acl, and
 // onConflict=drop recreates the database — both wipe existing grants.
-// A returned error means the step could not run at all; per-user failures come
-// back in the slice instead, so one unservable user does not starve the rest.
+// A returned error means the round could not run; per-subject failures come back in the slice so one bad subject does not starve the rest.
 func (r *RestoreReconciler) regrantDatabaseUsers(
 	ctx context.Context,
 	restore *databasesv1alpha1.Restore,
-) ([]userGrantFailure, error) {
+) ([]grantFailure, error) {
 	var db databasesv1alpha1.Database
 	if err := r.Get(ctx, types.NamespacedName{
 		Name:      restore.Spec.Target.DatabaseRef.Name,
@@ -796,17 +793,6 @@ func (r *RestoreReconciler) regrantDatabaseUsers(
 		}
 		return nil, fmt.Errorf("failed to get target database %s: %w", restore.Spec.Target.DatabaseRef.Name, err)
 	}
-
-	var users databasesv1alpha1.DatabaseUserList
-	if err := r.List(ctx, &users, client.MatchingFields{
-		controllers.DatabaseUserDatabaseRefIndex: controllers.DatabaseUserDatabaseRefKey(db.Namespace, db.Name),
-	}); err != nil {
-		return nil, fmt.Errorf("failed to list database users: %w", err)
-	}
-	if len(users.Items) == 0 {
-		return nil, nil
-	}
-	ownerWinner := controllers.ElectOwner(users.Items, db.Namespace, db.Name)
 
 	var cluster databasesv1alpha1.DBCluster
 	if err := r.Get(ctx, types.NamespacedName{Name: db.Spec.ClusterRef.Name}, &cluster); err != nil {
@@ -821,7 +807,29 @@ func (r *RestoreReconciler) regrantDatabaseUsers(
 		return nil, fmt.Errorf("failed to connect to cluster %s: %w", cluster.Name, err)
 	}
 
-	return applyRestoredGrants(ctx, pgClient, users.Items, &db, ownerWinner), nil
+	var failures []grantFailure
+
+	// A recreated database has the default ACL, no ownership marker and no extensions, and no reconcile fixes that for hours.
+	if _, step, err := controllers.ApplyDatabaseSpec(ctx, pgClient, db.Status.DatabaseName, &db); err != nil {
+		// The users still get their grants: a budget that runs out here must not leave PUBLIC revoked and nobody else able to connect.
+		failures = append(failures, grantFailure{
+			subject: "database " + db.Name,
+			err:     fmt.Errorf("failed to re-apply database spec (%s) for %s: %w", step, db.Name, err),
+		})
+	}
+
+	var users databasesv1alpha1.DatabaseUserList
+	if err := r.List(ctx, &users, client.MatchingFields{
+		controllers.DatabaseUserDatabaseRefIndex: controllers.DatabaseUserDatabaseRefKey(db.Namespace, db.Name),
+	}); err != nil {
+		return nil, fmt.Errorf("failed to list database users: %w", err)
+	}
+	if len(users.Items) == 0 {
+		return failures, nil
+	}
+
+	return append(failures, applyRestoredGrants(ctx, pgClient, users.Items, &db,
+		controllers.ElectOwner(users.Items, db.Namespace, db.Name))...), nil
 }
 
 func applyRestoredGrants(
@@ -830,10 +838,10 @@ func applyRestoredGrants(
 	users []databasesv1alpha1.DatabaseUser,
 	db *databasesv1alpha1.Database,
 	ownerWinner *databasesv1alpha1.DatabaseUser,
-) []userGrantFailure {
+) []grantFailure {
 	logger := log.FromContext(ctx)
 
-	var failures []userGrantFailure
+	var failures []grantFailure
 	for i := range users {
 		user := &users[i]
 
@@ -867,9 +875,9 @@ func applyRestoredGrants(
 		// be visible in this controller's cache yet.
 		exists, err := pgClient.UserExists(ctx, grants.Username)
 		if err != nil {
-			failures = append(failures, userGrantFailure{
-				username: grants.Username,
-				err:      fmt.Errorf("failed to check role %s: %w", grants.Username, err),
+			failures = append(failures, grantFailure{
+				subject: grants.Username,
+				err:     fmt.Errorf("failed to check role %s: %w", grants.Username, err),
 			})
 			continue
 		}
@@ -879,11 +887,8 @@ func applyRestoredGrants(
 			continue
 		}
 
-		if err := pgClient.ApplyPrivileges(ctx, grants.Username, db.Status.DatabaseName, grants.Privileges, grants.AdditionalGrants); err != nil {
-			failures = append(failures, userGrantFailure{
-				username: grants.Username,
-				err:      fmt.Errorf("failed to re-apply privileges for user %s: %w", grants.Username, err),
-			})
+		if err := controllers.ApplyUserGrants(ctx, pgClient, db.Status.DatabaseName, grants); err != nil {
+			failures = append(failures, grantFailure{subject: grants.Username, err: err})
 			continue
 		}
 		logger.Info("re-applied grants after restore",
@@ -893,14 +898,14 @@ func applyRestoredGrants(
 	return failures
 }
 
-type userGrantFailure struct {
-	username string
-	err      error
+type grantFailure struct {
+	subject string
+	err     error
 }
 
 // joinGrantFailures flattens the round's failures onto one line, because the result
 // ends up in status.message where newlines are unreadable.
-func joinGrantFailures(failures []userGrantFailure) error {
+func joinGrantFailures(failures []grantFailure) error {
 	messages := make([]string, 0, len(failures))
 	for _, failure := range failures {
 		messages = append(messages, failure.err.Error())
@@ -908,10 +913,10 @@ func joinGrantFailures(failures []userGrantFailure) error {
 	return stderrors.New(strings.Join(messages, "; "))
 }
 
-func failedGrantUsers(failures []userGrantFailure) string {
+func failedGrantSubjects(failures []grantFailure) string {
 	names := make([]string, 0, len(failures))
 	for _, failure := range failures {
-		names = append(names, failure.username)
+		names = append(names, failure.subject)
 	}
 	return strings.Join(names, ", ")
 }

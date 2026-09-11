@@ -52,7 +52,7 @@ spec:
 | `rotation.days` | int | ❌ | — | Password rotation interval in days (1-365) |
 | `connectionLimit` | int | ❌ | `-1` | Max concurrent connections (`-1` = unlimited, `>= 1` to cap; `0` is rejected) |
 | `idleInTransactionTimeout` | duration | ❌ | — | Abort sessions idle inside a transaction for longer than this (min `1ms`). Unset clears the role-level override |
-| `deletionPolicy` | enum | ❌ | `Delete` | What to do with user when resource is deleted |
+| `deletionPolicy` | enum | ❌ | `Delete` | `Delete` drops the PostgreSQL role with the resource; `Retain` leaves it |
 | `secret` | object | ❌ | — | Secret configuration (see below) |
 | `secretGeneration` | enum | ❌ | `primary` | How to generate secrets: `primary` or `perDatabase` |
 
@@ -87,42 +87,39 @@ All databases must be on the same DBCluster, and each may be listed only once. A
 
 ## username
 
-**Optional.** If not specified, derived from `metadata.name` with dashes (`-`) converted to underscores (`_`).
+If not specified, derived from `metadata.name` with dashes (`-`) converted to underscores (`_`).
 
 | Resource Name | username (spec) | PostgreSQL Name |
 |---------------|-----------------|-----------------|
 | `my-app-user` | (not set) | `my_app_user` |
 | `my-app-user` | `custom_user` | `custom_user` |
 
-| Constraint | Value |
-|------------|-------|
-| Pattern | `^[a-z_][a-z0-9_]*$` |
-| Max length | 63 |
+An explicit `username` must match `^[a-z_][a-z0-9_]*$` and be at most 63 characters.
 
 ## privileges
 
-Preset privilege levels applied to the `public` schema:
+Presets applied to the `public` schema:
 
 | Preset | Permissions |
 |--------|-------------|
-| `readonly` | `SELECT` on all tables, `USAGE` on schema |
-| `readwrite` | readonly + `INSERT`, `UPDATE`, `DELETE`, sequence usage |
+| `readonly` | `USAGE` on schema, `SELECT` on all tables |
+| `readwrite` | readonly + `INSERT`, `UPDATE`, `DELETE`, sequence `USAGE`/`SELECT` |
 | `admin` | readwrite + `CREATE` on schema, `TRUNCATE`, `REFERENCES`, `TRIGGER` |
-| `owner` | admin + ownership of the objects in `public` (enables `ALTER TABLE`, constraints, `ALTER TYPE ... ADD VALUE`); the schema itself stays with the cluster admin |
+| `owner` | admin + ownership of the objects in `public` (enables `ALTER TABLE`, constraints, `ALTER TYPE ... ADD VALUE`, `pg_restore`) |
 
-Can be set at spec level (default for all databases) or per-database.
+Each preset also sets matching `ALTER DEFAULT PRIVILEGES`, so objects created later are covered without a re-grant.
 
-**Note on `owner` privilege:**
-- Only one DatabaseUser holds `owner` on a Database: the oldest by creation time wins, ties broken by namespace then name
-- Every other claimant gets `admin` there and reports `Failed`
-- A DatabaseUser that is being deleted, or whose spec fails validation, is not a candidate
-- The grant pass after a restore applies the same rule
-- Transfers ownership of the tables, sequences, views, materialized views, types and routines in `public` that the user does not already own; objects belonging to an extension are left with the extension owner
-- The operator grants itself membership in the user's role before transferring ownership and before reassigning it on deletion; that membership is permanent and goes away only with the role (`DROP ROLE`)
-- The multirange of a range type stays with its creator on PostgreSQL 16 and is dropped together with the range type
-- The `public` schema itself stays owned by the cluster admin; the user creates objects in it through the `CREATE` grant it gets from `admin`, and cannot `ALTER SCHEMA` or `DROP SCHEMA public`
-- Required for operations like `ALTER TABLE ... ADD CONSTRAINT`, `ALTER TYPE ... ADD VALUE`, or running `pg_restore`
-- On user deletion or when a database is removed from access list, ownership is automatically reassigned back to the master user
+Set at spec level (the default for all databases) or per-database.
+
+Every reconcile resets the user's grants on the `public` schema itself (`REVOKE ALL ON SCHEMA public`) before re-applying the preset, so a hand-made `GRANT ... ON SCHEMA public` does not survive. Hand-made table grants are not revoked, but they are not tracked either and a [restore](restore.md#grants-after-the-restore) will not bring them back — put them in `additionalGrants`.
+
+### `owner`
+
+Only one DatabaseUser can hold `owner` on a Database. The oldest by creation time wins, ties broken by namespace then name; a user being deleted or with an invalid spec is not a candidate. Every other claimant gets `admin` on that database instead, marks it `Failed` in `status.databases`, and keeps reconciling its role, secret, rotation and other databases normally. The [grant pass after a restore](restore.md#grants-after-the-restore) runs the same election.
+
+Ownership transfer covers the tables, sequences, views, materialized views, types and routines in `public` that the user does not already own; objects belonging to an extension stay with the extension owner. The `public` schema itself remains owned by the cluster admin — the user creates in it through the `CREATE` grant that comes with `admin`, and cannot `ALTER SCHEMA` or `DROP SCHEMA public`.
+
+To transfer objects, the operator grants itself membership in the user's role. That membership is permanent and disappears only with the role. On deletion, or when a database is dropped from the access list, ownership is reassigned back to the operator's role.
 
 ## additionalGrants
 
@@ -138,91 +135,49 @@ spec:
 
 | Field | Constraints |
 |-------|-------------|
-| `tables` | At least one entry. Each must match `^[a-zA-Z_][a-zA-Z0-9_]*$`, max 63 chars. Validated at admission to block null bytes and unicode tricks before they reach SQL composition. |
-| `privileges` | At least one entry. Enum: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`, `USAGE`. Re-checked in the controller before SQL composition. |
+| `tables` | At least one entry. Each must match `^[a-zA-Z_][a-zA-Z0-9_]*$`, max 63 chars. |
+| `privileges` | At least one entry, from `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`, `USAGE`. |
+
+Both are enforced at admission and re-checked in the controller before any SQL is composed.
 
 ## connectionLimit
 
-PostgreSQL `CONNECTION LIMIT` for the role.
-
-| Value | Meaning |
-|-------|---------|
-| `-1` (default) | Unlimited |
-| `>= 1` | Cap concurrent connections at this number |
-| `0` | **Rejected** — the integer zero-value can't be distinguished from "unset", so it's explicitly disallowed |
+PostgreSQL `CONNECTION LIMIT` for the role: `-1` (default) for unlimited, `>= 1` to cap. `0` is rejected at admission — the integer zero-value cannot be told apart from "unset", so it would silently lock the role out.
 
 ## idleInTransactionTimeout
 
-Sets `idle_in_transaction_session_timeout` on the role. Sessions that remain idle inside an open transaction for longer than this are aborted server-side.
+Sets `idle_in_transaction_session_timeout` on the role. Sessions idle inside an open transaction longer than this are aborted server-side — worth setting for pooled connections (PgBouncer transaction mode) where a stuck transaction holds locks indefinitely.
 
 ```yaml
 spec:
   idleInTransactionTimeout: 30s
 ```
 
-- Minimum: `1ms`. PostgreSQL's `0` (disabled) cannot be expressed — leave the field unset instead, which clears any role-level override.
-- Useful for long-lived connection pools (PgBouncer transaction mode) where a stuck transaction can hold locks indefinitely.
+Minimum `1ms`. PostgreSQL's `0` (disabled) cannot be expressed; leave the field unset, which clears any role-level override.
 
 ## secretGeneration
 
-Controls how secrets are created for multiple databases:
-
 | Mode | Behavior |
 |------|----------|
-| `primary` (default) | Single secret with first database as primary, includes `databases` field listing all |
-| `perDatabase` | Separate secret for each database (same password, different `database` field) |
+| `primary` (default) | One secret, named `<name>-credentials`, carrying the first database |
+| `perDatabase` | One secret per database, named `<name>-<database>-credentials`, all sharing one password |
 
-### primary mode (default)
-
-Creates one secret with:
-- `database`: first database name
-- `databases`: comma-separated list of all databases (only for `template: raw` with >1 database)
+In `primary` mode with `template: raw` and more than one database, the secret gains a `databases` key — a comma-separated list of every PostgreSQL database name. It is informational, always spelled `databases` regardless of template, and absent for every other template.
 
 ```yaml
-# Secret with raw template and multiple databases:
-# airbyte-service-credentials
+# primary + raw, three databases
 data:
   host: cluster.endpoint
   port: "5432"
-  database: airbyte_db         # first database
+  database: airbyte_db                                      # first database
   databases: airbyte_db,temporal_db,temporal_visibility_db  # informational
   username: airbyte_service
   password: <generated>
-
-# Secret with POSTGRES template (no databases field):
-data:
-  POSTGRES_HOST: cluster.endpoint
-  POSTGRES_PORT: "5432"
-  POSTGRES_DATABASE: airbyte_db
-  POSTGRES_USER: airbyte_service
-  POSTGRES_PASSWORD: <generated>
 ```
 
-### perDatabase mode
-
-Creates one secret per database:
-
-```yaml
-spec:
-  databases:
-    - name: airbyte-db
-    - name: temporal-db
-  secretGeneration: perDatabase
-  secret:
-    template: POSTGRES
-```
-
-Creates secrets:
-- `airbyte-service-airbyte-db-credentials` with `POSTGRES_DATABASE: airbyte_db`
-- `airbyte-service-temporal-db-credentials` with `POSTGRES_DATABASE: temporal_db`
-
-All secrets share the same password.
-
-The secret name comes from the Database name alone, so the listed Databases must have distinct names.
+`perDatabase` names secrets from the Database resource name alone, so two Databases sharing a name across namespaces would collide — that is rejected. It also forbids `secret.name` and any `onConflict` other than `Fail`, both at admission.
 
 ## secret
-
-Secret configuration for customizing the generated credentials:
 
 ```yaml
 secret:
@@ -239,45 +194,36 @@ secret:
 
 ### Key Templates
 
-| Template | host | port | database | user | password |
-|----------|------|------|----------|------|----------|
-| `raw` (default) | `host` | `port` | `database` | `user` | `password` |
+| Template | host | port | database | username | password |
+|----------|------|------|----------|----------|----------|
+| `raw` (default) | `host` | `port` | `database` | `username` | `password` |
 | `DB` | `DB_HOST` | `DB_PORT` | `DB_NAME` | `DB_USER` | `DB_PASSWORD` |
 | `DATABASE` | `DATABASE_HOST` | `DATABASE_PORT` | `DATABASE_NAME` | `DATABASE_USER` | `DATABASE_PASSWORD` |
 | `POSTGRES` | `POSTGRES_HOST` | `POSTGRES_PORT` | `POSTGRES_DATABASE` | `POSTGRES_USER` | `POSTGRES_PASSWORD` |
-| `custom` | custom | custom | custom | custom | custom |
-| `dsn` | — | — | — | — | — |
+| `custom` | from `keys`, falling back to the `raw` name | | | | |
+| `dsn` | — single `dsn` key — | | | |
 
-The `dsn` template produces a single key `dsn` with a full PostgreSQL connection string: `postgres://user:password@host:port/database`. Useful for applications like ORY Hydra that expect a DSN.
+`dsn` produces one key holding `postgres://user:password@host:port/database`, for consumers like ORY Hydra that want a connection string.
 
-**Note:** The `databases` field (comma-separated list of all databases) is only added when:
-- `secretGeneration` is `primary` (default)
-- `template` is `raw` or not specified
-- User has access to more than 1 database
-
-This field is always named `databases` (not template-specific) and is informational only.
+Templates and `keys` are recomputed from the spec every reconcile, so changing them rewrites the secret on the next pass. Renaming the **password** key is the exception: the old value cannot be found under the new name, so a fresh password is generated and set in PostgreSQL. The role keeps working, but every consumer must re-read the secret.
 
 ### onConflict
 
-Controls behavior when a secret with the specified name already exists:
+Applies when a secret of that name already exists and is not owned by this DatabaseUser:
 
 | Policy | Behavior |
 |--------|----------|
-| `Fail` (default) | Error if secret exists and is not owned by this DatabaseUser |
-| `Adopt` | Take ownership, regenerate credentials, overwrite secret data |
-| `Merge` | Take ownership, add/update our keys while keeping existing keys |
+| `Fail` (default) | Report an error, touch nothing |
+| `Adopt` | Take ownership, regenerate credentials, overwrite the secret's data |
+| `Merge` | Take ownership, overlay our keys, leave foreign keys in place |
+
+`Merge` is recorded on the produced secret, so once adopted under `Merge` later reconciles keep overlaying even if `onConflict` is removed from the spec. To get back to full-replace semantics, switch to `Adopt` or delete the secret.
 
 ## Database Isolation
 
-**Critical security feature:** Users can ONLY connect to their assigned databases.
+Each reconcile resolves the databases the user should reach, revokes `CONNECT` on every other database it currently holds, grants `CONNECT` on the listed ones and applies the per-database preset. Removing a database from the list therefore removes the access — no separate cleanup step.
 
-For each reconcile:
-1. Get list of databases user currently has access to
-2. Revoke access from databases NOT in the spec
-3. Grant access to databases IN the spec
-4. Apply privileges per database
-
-This ensures users cannot access databases they shouldn't, even if database list changes.
+A revoke that fails is ignored — the reconcile still reports `Ready`. And revoking the user's own `CONNECT` is not enough on its own: the role still reaches the database through `PUBLIC` unless that Database sets [`revokePublicConnect`](database.md#revokepublicconnect).
 
 ## Status
 
@@ -288,13 +234,12 @@ This ensures users cannot access databases they shouldn't, even if database list
 | `clusterName` | string | DBCluster this user belongs to |
 | `username` | string | PostgreSQL username |
 | `databases` | array | Per-database access status |
+| `databasesSummary` | string | Printer-column form, e.g. `db1 (+2)` |
 | `secretName` | string | Primary secret name |
 | `passwordUpdatedAt` | timestamp | When password was last created or rotated |
 | `observedGeneration` | int64 | Which spec version has been processed |
 
-### databases status
-
-Each database has its own status:
+A user can be `Failed` overall while most of its databases are fine — `status.databases` is where the per-database truth lives:
 
 ```yaml
 status:
@@ -312,42 +257,7 @@ status:
 
 ## Examples
 
-### Simple single database user
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: DatabaseUser
-metadata:
-  name: orders-api
-  namespace: team-alpha
-spec:
-  database:
-    name: orders-db
-  privileges: readwrite
-```
-
-### Multiple databases with different privileges
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: DatabaseUser
-metadata:
-  name: airbyte-service
-  namespace: platform
-spec:
-  databases:
-    - name: airbyte-db
-      privileges: readwrite
-    - name: temporal-db
-      privileges: readwrite
-    - name: temporal-visibility-db
-      privileges: readonly
-  privileges: readonly
-  password:
-    length: 24
-```
-
-### Multiple databases with separate secrets per database
+### Separate secrets per database
 
 ```yaml
 apiVersion: dbtether.io/v1alpha1
@@ -366,10 +276,7 @@ spec:
     template: POSTGRES
 ```
 
-Creates three secrets:
-- `airbyte-service-airbyte-db-credentials`
-- `airbyte-service-temporal-db-credentials`
-- `airbyte-service-temporal-visibility-db-credentials`
+Creates `airbyte-service-airbyte-db-credentials`, `airbyte-service-temporal-db-credentials` and `airbyte-service-temporal-visibility-db-credentials`, all with the same password.
 
 ### Cross-namespace database reference
 
@@ -407,19 +314,12 @@ spec:
 ## kubectl Commands
 
 ```bash
-# List all users
 kubectl get databaseusers -A
-
-# User details
 kubectl describe databaseuser my-app-readonly -n my-team
 
-# Get credentials
-kubectl get secret my-app-readonly-credentials -n my-team -o yaml
-
-# Decode password
 kubectl get secret my-app-readonly-credentials -n my-team -o jsonpath='{.data.password}' | base64 -d
 
-# Trigger password rotation (delete secret)
+# Force a new password: the operator regenerates and re-applies it in PostgreSQL
 kubectl delete secret my-app-readonly-credentials -n my-team
 ```
 
@@ -447,7 +347,34 @@ spec:
     name: db1
 ```
 
-### Phase: Failed, message: "validation error: database <namespace>/<name> is listed more than once"
+### Rejected on apply: "spec.secret.name cannot be set when secretGeneration=perDatabase"
+
+Per-database secret names are derived from the Database name, so a fixed name would make every database write to the same secret. The companion rule rejects `onConflict` other than `Fail` in that mode:
+
+```yaml
+# Wrong
+spec:
+  secretGeneration: perDatabase
+  secret:
+    name: shared-secret
+    onConflict: Merge
+
+# Correct
+spec:
+  secretGeneration: perDatabase
+  secret:
+    template: POSTGRES
+```
+
+### Phase: Pending, message: "waiting for Database '&lt;name&gt;'"
+
+No Database with that name in the resolved namespace. `waiting for Database '<name>' to be ready` means it exists but is not `Ready`; `waiting for DBCluster '<name>'` and `waiting for DBCluster '<name>' to be connected` are the same shape one level up. All of them clear on their own once the dependency is fixed. After 10 minutes the phase flips to `Failed` with `timeout: ... (pending for over 10 minutes)`.
+
+```bash
+kubectl get database -A
+```
+
+### Phase: Failed, message: "validation error: database &lt;namespace&gt;/&lt;name&gt; is listed more than once"
 
 `databases` names the same Database twice. An entry without `namespace` resolves to the DatabaseUser's own — `my-team` here — so both entries are one reference:
 
@@ -466,7 +393,7 @@ spec:
       privileges: readwrite
 ```
 
-### Phase: Failed, message: "validation error: per-database secrets need distinct Database names: \<name\> is referenced from \<ns1\> and \<ns2\>"
+### Phase: Failed, message: "validation error: per-database secrets need distinct Database names: &lt;name&gt; is referenced from &lt;ns1&gt; and &lt;ns2&gt;"
 
 With `secretGeneration: perDatabase` the secret name comes from the Database name alone, so two Databases sharing a name across namespaces write to one secret. Drop one, or use `secretGeneration: primary`:
 
@@ -486,29 +413,20 @@ spec:
     - name: orders
 ```
 
-### Phase: Failed, message: "all databases must be on the same cluster"
+### Phase: Failed, message: "all databases must be on the same cluster: 'db1' is on 'cluster-a', but 'db2' is on 'cluster-b'"
 
-All databases in `databases` must reference the same DBCluster. Create separate DatabaseUser resources for databases on different clusters.
+One user is one PostgreSQL role on one cluster. Split into a DatabaseUser per cluster.
 
-### Phase: Failed, message: "Database not found"
+### Phase: Failed, message: "owner conflict: DatabaseUser &lt;ns&gt;/&lt;name&gt; already holds privileges=owner on Database &lt;ns&gt;/&lt;name&gt;; only one owner per database"
 
-Check that database resource exists:
-```bash
-kubectl get database -A
-```
-
-### Phase: Failed, message: "owner conflict: ..."
-
-Two DatabaseUsers claim `owner` on the same Database; the older one keeps it. The other gets `admin` there and marks that database `Failed` in `status.databases`, with the same message at the top level; its role, secret, other databases and rotation keep reconciling.
-
-The message names the holder. Lower the reporting user to `admin`:
+Two DatabaseUsers claim `owner` on the same Database; the older one keeps it and the message names it. The reporting user already has `admin` there and works — to clear the status, either lower it:
 
 ```yaml
 spec:
   privileges: admin
 ```
 
-Or delete the one that should not own the objects:
+or delete the claimant that should not own the objects:
 
 ```bash
 kubectl delete databaseuser <name> -n <namespace>
@@ -516,9 +434,14 @@ kubectl delete databaseuser <name> -n <namespace>
 
 Either way the reporting DatabaseUser recovers on its own.
 
+### Phase: Failed, message: "secret error: ... already exists and is not owned by this DatabaseUser"
+
+A secret of that name exists and belongs to something else. Rename it with `secret.name`, delete the existing secret, or set `secret.onConflict` to `Adopt` or `Merge`.
+
 ### User has access to unexpected databases
 
-Check operator logs for isolation warnings:
+Usually inherited from `PUBLIC`; set [`revokePublicConnect`](database.md#revokepublicconnect) on the Database. The operator logs each one it sees, at debug level — set `logging.level: debug` in the chart to get them:
+
 ```bash
-kubectl logs -n dbtether-system deployment/dbtether-controller | grep "unexpected database"
+kubectl logs -n dbtether deployment/dbtether | grep "unexpected database"
 ```

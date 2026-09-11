@@ -2,14 +2,6 @@
 
 A Kubernetes operator for managing PostgreSQL databases in external clusters (AWS RDS, Aurora, Azure Database, GCP Cloud SQL, or any PostgreSQL-compatible database).
 
-## Features
-
-- **Database Lifecycle Management** — Create, update, and delete databases via Kubernetes CRDs
-- **User Management** — Automatic credential generation with rotation support
-- **Backup & Restore** — Scheduled backups with retention policies, point-in-time restore
-- **Multi-Cloud Storage** — S3, GCS, and Azure Blob Storage support with cloud-native authentication
-- **GitOps Ready** — Declarative configuration, idempotent operations
-
 ## Installation
 
 ```bash
@@ -18,13 +10,13 @@ helm upgrade -i dbtether oci://ghcr.io/certainty3452/charts/dbtether -n dbtether
 
 ## Upgrading
 
-Helm installs the CRDs from `crds/` once and never upgrades them on subsequent `helm upgrade` runs (this is a Helm limitation, not specific to this chart). Before upgrading, apply the new chart version's CRDs directly:
+Helm installs the CRDs from `crds/` once and never upgrades them on subsequent `helm upgrade` runs — a Helm limitation, not specific to this chart. Apply the new version's CRDs first:
 
 ```bash
 helm show crds oci://ghcr.io/certainty3452/charts/dbtether --version <chart version> | kubectl apply --server-side --force-conflicts -f -
 ```
 
-kubectl 1.27 and newer rejects an unknown field, older clients drop it silently; `--force-conflicts` is needed because the CRD fields are owned by Helm.
+`--force-conflicts` is required because Helm owns the CRD fields from the original install.
 
 ## CRDs Overview
 
@@ -144,9 +136,10 @@ spec:
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `replicaCount` | Number of operator replicas | `1` |
+| `replicaCount` | Number of operator replicas; > 1 needs `leaderElection.enabled` | `1` |
 | `image.repository` | Operator image | `ghcr.io/certainty3452/dbtether` |
-| `image.tag` | Image tag | `0.9.0` |
+| `image.tag` | Image tag | `0.9.1` |
+| `serviceAccount.annotations` | ServiceAccount annotations — where the IRSA / Workload Identity binding goes | `{}` |
 | `resources.requests.cpu` | CPU request | `100m` |
 | `resources.requests.memory` | Memory request | `128Mi` |
 | `resources.limits.cpu` | CPU limit | `500m` |
@@ -155,9 +148,14 @@ spec:
 | `logging.level` | Log level (debug, info, warn, error) | `info` |
 | `logging.format` | Log format (json, console) | `json` |
 | `backup.maxConcurrentPerCluster` | Max concurrent backups per cluster | `3` |
+| `backup.resources.requests.memory` | Memory request for backup/restore job pods | `384Mi` |
+| `backup.resources.limits.memory` | Memory limit for backup/restore job pods | `1Gi` |
 | `backup.podAnnotations` | Annotations for backup job pods (e.g., Karpenter protection) | `{}` |
 | `backup.podLabels` | Labels for backup job pods | `{}` |
 | `backup.jobLabels` | Labels for backup Job objects | `{}` |
+| `extraEnv` | Extra env vars on the operator pod — sources for `DBCluster.spec.credentialsFromEnv`, and `DB_SSLMODE` (default `require`), which applies to the operator and to backup/restore jobs | `[]` |
+
+Backup job memory is driven by upload buffers and the Go runtime, not by database size; raise it for schemas with 100k+ objects.
 
 ### Cloud Authentication
 
@@ -194,7 +192,7 @@ helm uninstall dbtether -n dbtether
 kubectl delete namespace dbtether
 ```
 
-> **Note:** CRDs are not deleted automatically. To remove them:
+> **Note:** CRDs are not deleted automatically. Delete the `Database`, `DatabaseUser`, `Backup`, `BackupSchedule` and `Restore` resources **before** uninstalling — each carries a finalizer that only the operator removes, so deleting them afterwards leaves them stuck in `Terminating` and blocks the CRD deletion below.
 > ```bash
 > kubectl delete crd dbclusters.dbtether.io databases.dbtether.io \
 >   databaseusers.dbtether.io backupstorages.dbtether.io \
@@ -204,6 +202,5 @@ kubectl delete namespace dbtether
 ## Links
 
 - [GitHub Repository](https://github.com/certainty3452/dbtether)
-- [Documentation](https://github.com/certainty3452/dbtether#readme)
+- [Documentation](https://github.com/certainty3452/dbtether/tree/main/docs)
 - [Issues](https://github.com/certainty3452/dbtether/issues)
-

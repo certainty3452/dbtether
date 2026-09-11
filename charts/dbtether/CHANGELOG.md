@@ -2,6 +2,13 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.9.1] - 2026-09-11
+
+### Fixed
+- After a restore that replaced the database (`onConflict: drop`), the database was left open to every role of the cluster and looked unowned until the next periodic reconcile; the restore now re-applies the database settings (ownership, public access, extensions) as soon as the data is in
+- Users of a replaced database lost their connection right when that reconcile ran; the restore now re-grants every user's access and privileges
+- A database whose public access could not be revoked, including when the operator is not its owner, was reported as ready; it is now reported as failed
+
 ## [0.9.0] - 2026-09-10
 
 ### Breaking

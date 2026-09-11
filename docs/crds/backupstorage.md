@@ -4,6 +4,7 @@ Defines a storage destination for database backups (S3, GCS, Azure).
 
 **API Version:** `dbtether.io/v1alpha1`  
 **Kind:** `BackupStorage`  
+**Short name:** `bs`  
 **Scope:** Cluster
 
 ## Example
@@ -32,47 +33,29 @@ spec:
 | `gcs` | object | ❌* | — | GCS storage configuration |
 | `azure` | object | ❌* | — | Azure Blob storage configuration |
 | `pathTemplate` | string | ❌ | `{{ .ClusterName }}/{{ .DatabaseName }}` | Directory path template |
-| `credentialsSecretRef` | object | ❌ | — | Secret with storage credentials |
+| `credentialsSecretRef` | object | ❌ | — | Secret with S3 credentials; `name` and `namespace` are both required |
 
-**\* Note:** Exactly one of `s3`, `gcs`, or `azure` must be specified.
-
-### S3 Configuration
+\* Exactly one provider. Admission rejects a spec with none of the three, and with `credentialsSecretRef` alongside `gcs` or `azure`; more than one provider is caught by the controller instead.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `s3.bucket` | string | ✅ | S3 bucket name |
 | `s3.region` | string | ✅ | AWS region (e.g., `eu-central-1`) |
 | `s3.endpoint` | string | ❌ | Custom endpoint (for S3-compatible storage) |
-
-### GCS Configuration
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
 | `gcs.bucket` | string | ✅ | GCS bucket name |
 | `gcs.project` | string | ✅ | GCP project ID |
-
-### Azure Configuration
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
 | `azure.container` | string | ✅ | Azure Blob container name |
 | `azure.storageAccount` | string | ✅ | Azure storage account name |
 
 ## pathTemplate
 
-Template for the directory structure where backups are stored.
-
-**Available variables:**
+The directory part of every object key; the filename comes from the Backup's [`filenameTemplate`](backup.md#filenametemplate).
 
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `.ClusterName` | Name of the DBCluster | `production` |
 | `.DatabaseName` | PostgreSQL database name | `orders_db` |
-| `.Year` | Current year (4 digits) | `2026` |
-| `.Month` | Current month (2 digits) | `01` |
-| `.Day` | Current day (2 digits) | `20` |
-
-**Examples:**
+| `.Year` `.Month` `.Day` | UTC date at backup time, zero-padded | `2026` `01` `20` |
 
 | Template | Result |
 |----------|--------|
@@ -80,11 +63,11 @@ Template for the directory structure where backups are stored.
 | `backups/{{ .Year }}/{{ .Month }}/{{ .ClusterName }}` | `backups/2026/01/production/` |
 | `{{ .ClusterName }}/{{ .DatabaseName }}/{{ .Year }}-{{ .Month }}-{{ .Day }}` | `production/orders_db/2026-01-20/` |
 
+**A date variable disables BackupSchedule retention.** Backup Jobs substitute `.Year` / `.Month` / `.Day`, but the retention pass rebuilds the prefix knowing only `.ClusterName` and `.DatabaseName`, so it lists `backups/<no value>/<no value>/production`, matches nothing, and deletes nothing — without reporting an error. Keep dates out of `pathTemplate` on any storage a schedule with `retention` writes to; put them in the Backup's `filenameTemplate` instead.
+
 ## Authentication
 
-### Cloud-Native Auth (Recommended)
-
-If `credentialsSecretRef` is not specified, the operator uses cloud-native authentication:
+Without `credentialsSecretRef` the operator and its Jobs use the ServiceAccount's cloud identity:
 
 | Provider | Method |
 |----------|--------|
@@ -92,15 +75,12 @@ If `credentialsSecretRef` is not specified, the operator uses cloud-native authe
 | GCP GCS | Workload Identity |
 | Azure | Managed Identity or Workload Identity |
 
-**AWS IRSA example:**
 ```yaml
-# ServiceAccount annotation
+# ServiceAccount annotation for IRSA
 eks.amazonaws.com/role-arn: arn:aws:iam::123456789:role/backup-role
 ```
 
-### Secret-based Auth
-
-For explicit credentials, create a Secret and reference it:
+`credentialsSecretRef` is S3-only, and the Secret must carry `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. BackupStorage is cluster-scoped, so the reference needs an explicit `namespace`.
 
 ```yaml
 apiVersion: v1
@@ -130,22 +110,17 @@ spec:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `phase` | enum | Current resource state (`Ready`, `Failed`) |
-| `message` | string | Detailed message |
+| `phase` | enum | `Ready` or `Failed` |
+| `message` | string | `storage reachable`, or the validation/probe error |
 | `provider` | string | Detected provider (`s3`, `gcs`, `azure`) |
-| `lastValidation` | time | Last time the storage was validated |
+| `lastValidation` | time | When the status was last written |
 | `observedGeneration` | int64 | Which spec version has been processed |
-
-## Status Phases
-
-| Phase | Description |
-|-------|-------------|
-| `Ready` | Spec validated and the bucket/container is reachable with current credentials |
-| `Failed` | Configuration error or reachability probe failed (see `message`) |
 
 ## Reachability probe
 
-On every reconcile (and at least every 30 minutes) the operator issues a single low-cost call against the bucket / container — `HeadBucket` for S3, `Bucket.Attrs` for GCS, `Container.GetProperties` for Azure. The intent is to surface misconfigured credentials, wrong region, missing bucket, or revoked IAM **immediately** at `kubectl apply` time, not an hour later when the first backup job fails.
+On every reconcile, and at least every 30 minutes, the operator issues one low-cost call against the bucket or container, using the same auth path the backup Jobs will use. It surfaces bad credentials, a wrong region, a missing bucket or revoked IAM at `kubectl apply` time instead of an hour later in a backup Job's logs. The call has a 15-second budget; `Ready` requeues after 30 minutes, `Failed` after 60 seconds.
+
+A `Failed` BackupStorage blocks *new* backup Jobs; Jobs already running are untouched.
 
 ### Required permissions
 
@@ -155,31 +130,13 @@ On every reconcile (and at least every 30 minutes) the operator issues a single 
 | GCS | `Bucket.Attrs` | `storage.buckets.get` on the bucket |
 | Azure Blob | `Container.GetProperties` | container-level Read (covered by `Storage Blob Data Reader` / `Contributor`) |
 
-These are in addition to the write-path grants (`s3:PutObject` / `storage.objects.create` / Blob Data Contributor) needed for actual backups — see [IAM Policy (AWS S3)](#iam-policy-aws-s3) below.
-
-### What the probe does NOT verify
-
-The probe checks **auth + bucket existence**, not **write access**. A role with `ListBucket` but no `PutObject` will pass the probe and fail at first backup. Keep the IAM policies in this doc as the source of truth for the full set of permissions.
-
-### Transient failures
-
-A probe failure flips status to `Failed` and blocks *new* backup jobs (existing jobs continue uninterrupted). Transient cloud errors auto-recover within 60 seconds. Persistent failures requeue every 60 seconds; successful state requeues every 30 minutes.
-
-### credentialsSecretRef
-
-Only honored when `s3` is configured. The CRD admission rule rejects `credentialsSecretRef` together with `gcs` or `azure` — those providers must authenticate via Workload Identity / Managed Identity. When using `credentialsSecretRef` on S3, the Secret must contain `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` keys; the operator reads them to build the probe client matching what subsequent jobs will use.
+The probe checks auth and bucket existence, not write access: a role with `ListBucket` and no `PutObject` reports `Ready` and fails at the first backup. The IAM policy below is the full set.
 
 ## kubectl Commands
 
 ```bash
-# List all backup storages
-kubectl get backupstorage
-kubectl get bs  # short name
-
-# Storage details
+kubectl get bs
 kubectl describe backupstorage production-backups
-
-# Check status
 kubectl get bs production-backups -o jsonpath='{.status.phase}'
 ```
 
@@ -210,7 +167,7 @@ spec:
   gcs:
     bucket: company-pg-backups
     project: my-gcp-project
-  pathTemplate: "{{ .ClusterName }}/{{ .DatabaseName }}/{{ .Year }}"
+  pathTemplate: "{{ .ClusterName }}/{{ .DatabaseName }}"
 ```
 
 ### Azure with Managed Identity
@@ -245,7 +202,7 @@ spec:
 
 ## IAM Policy (AWS S3)
 
-Minimum IAM permissions for IRSA:
+Backups need write and list; retention needs delete; restore needs read.
 
 ```json
 {
@@ -268,7 +225,8 @@ Minimum IAM permissions for IRSA:
 }
 ```
 
-**Optional** (for object tagging):
+Object tagging is optional and best-effort — without it the upload is retried untagged:
+
 ```json
 {
   "Effect": "Allow",
@@ -280,29 +238,40 @@ Minimum IAM permissions for IRSA:
 }
 ```
 
-> **Note:** S3 tagging is best-effort. If `s3:PutObjectTagging` permission is missing, backup will succeed without tags.
-
 ## Troubleshooting
 
-### Phase: Failed, message: "no storage provider specified"
+### Rejected on apply: "one of s3, gcs, or azure must be specified"
 
-Ensure exactly one of `s3`, `gcs`, or `azure` is configured:
+No provider block. Add exactly one:
 
 ```yaml
+# Wrong
 spec:
-  s3:  # Must specify one provider
+  pathTemplate: "{{ .ClusterName }}/{{ .DatabaseName }}"
+
+# Correct
+spec:
+  s3:
     bucket: my-bucket
     region: eu-central-1
 ```
 
-### Phase: Failed, message: "multiple storage providers specified"
+### Rejected on apply: "credentialsSecretRef is only supported with S3; GCS and Azure must use Workload Identity / Managed Identity"
 
-Only one provider can be active. Remove extra providers.
+Drop `credentialsSecretRef` and give the operator's ServiceAccount the cloud identity instead.
 
-### Backup fails with "AccessDenied"
+### Phase: Failed, message: "only one of s3, gcs, or azure can be specified"
 
-1. Check IAM role/policy permissions
-2. Verify IRSA annotation on ServiceAccount
-3. Check if bucket policy allows access
-4. Verify `credentialsSecretRef` points to valid secret
+Two provider blocks are set. Split them into two BackupStorage resources.
 
+### Phase: Failed, message: "s3 bucket \"&lt;name&gt;\" not reachable: ..."
+
+The probe's `HeadBucket` failed. `403` means the identity lacks `s3:ListBucket` or a bucket policy denies it; `404`/`NoSuchBucket` means a wrong name; `301`/`PermanentRedirect` means a wrong `region`. GCS and Azure report the same shape (`gcs bucket ... not reachable`, `azure container ... not reachable`), with `does not exist` when the provider says so outright.
+
+### Phase: Failed, message: "failed to build storage client: credentialsSecretRef ..."
+
+The Secret could not be read. The three variants name the cause: `credentialsSecretRef.namespace is required for cluster-scoped BackupStorage`, `credentialsSecretRef <ns>/<name> not found`, `credentialsSecretRef <ns>/<name> missing AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY`.
+
+### Storage is Ready but backups fail with AccessDenied
+
+The probe only proves list access. Add the write-path permission from the IAM policy above — `s3:PutObject`, `storage.objects.create`, or `Storage Blob Data Contributor` — to the same identity.

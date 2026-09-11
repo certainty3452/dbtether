@@ -3,6 +3,7 @@ package backup
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -1158,13 +1159,50 @@ type recordedApplyPrivilegesCall struct {
 	AdditionalGrants           []postgres.TableGrant
 }
 
+type recordedConnectCall struct {
+	Username, Database string
+}
+
+type recordedExtensionsCall struct {
+	Database   string
+	Extensions []string
+}
+
 // recordingPGClient wraps postgres.MockClient (which doesn't track
 // ApplyPrivileges calls) to record invocations without touching the shared mock.
 type recordingPGClient struct {
 	*postgres.MockClient
-	calls     []recordedApplyPrivilegesCall
-	applyErr  error            // blanket failure for every call, unless overridden below
-	failUsers map[string]error // per-username override, for exercising partial-failure rounds
+	calls           []recordedApplyPrivilegesCall
+	connectCalls    []recordedConnectCall
+	extensionsCalls []recordedExtensionsCall
+	sequence        []string         // "ensure:<db>" / "revoke:<db>" / "extensions:<db>" / "connect:<user>" / "apply:<user>", in call order
+	applyErr        error            // blanket failure for every call, unless overridden below
+	failUsers       map[string]error // per-username override, for exercising partial-failure rounds
+	connectErr      error
+	revokeErr       error
+	extensionsErr   error
+}
+
+func (m *recordingPGClient) EnsureDatabaseWithOwner(ctx context.Context, name, ownerNamespace, ownerName string, forceAdopt bool) (bool, error) {
+	m.sequence = append(m.sequence, "ensure:"+name)
+	return m.MockClient.EnsureDatabaseWithOwner(ctx, name, ownerNamespace, ownerName, forceAdopt)
+}
+
+func (m *recordingPGClient) RevokePublicConnect(ctx context.Context, name string) error {
+	m.sequence = append(m.sequence, "revoke:"+name)
+	if m.revokeErr != nil {
+		return m.revokeErr
+	}
+	return m.MockClient.RevokePublicConnect(ctx, name)
+}
+
+func (m *recordingPGClient) EnsureExtensions(ctx context.Context, dbName string, extensions []string) error {
+	m.extensionsCalls = append(m.extensionsCalls, recordedExtensionsCall{Database: dbName, Extensions: extensions})
+	m.sequence = append(m.sequence, "extensions:"+dbName)
+	if m.extensionsErr != nil {
+		return m.extensionsErr
+	}
+	return m.MockClient.EnsureExtensions(ctx, dbName, extensions)
 }
 
 func (m *recordingPGClient) ApplyPrivileges(ctx context.Context, username, database, preset string, additionalGrants []postgres.TableGrant) error {
@@ -1174,10 +1212,20 @@ func (m *recordingPGClient) ApplyPrivileges(ctx context.Context, username, datab
 		Preset:           preset,
 		AdditionalGrants: additionalGrants,
 	})
+	m.sequence = append(m.sequence, "apply:"+username)
 	if err, ok := m.failUsers[username]; ok {
 		return err
 	}
 	return m.applyErr
+}
+
+func (m *recordingPGClient) GrantDatabaseAccess(ctx context.Context, username, database string) error {
+	m.connectCalls = append(m.connectCalls, recordedConnectCall{Username: username, Database: database})
+	m.sequence = append(m.sequence, "connect:"+username)
+	if m.connectErr != nil {
+		return m.connectErr
+	}
+	return m.MockClient.GrantDatabaseAccess(ctx, username, database)
 }
 
 // singleClientCache is a minimal ClientCacheInterface that always returns the
@@ -1321,6 +1369,10 @@ func TestRestoreReconciler_RegrantsGrantsOnSuccess(t *testing.T) {
 		{Tables: []string{"orders"}, Privileges: []postgres.TablePrivilege{"SELECT"}},
 	}, pg.calls[0].AdditionalGrants)
 
+	assert.Equal(t, []recordedConnectCall{{Username: "app_user", Database: "my_database_pg"}}, pg.connectCalls)
+	assert.Equal(t, []string{"ensure:my_database_pg", "connect:app_user", "apply:app_user"}, pg.sequence,
+		"the database itself is converged first, then each user's CONNECT before the privileges")
+
 	var updated dbtether.Restore
 	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
 	assert.Equal(t, "Completed", updated.Status.Phase)
@@ -1378,6 +1430,15 @@ func TestRestoreReconciler_RegrantsOwnerToWinnerAdminToLoser(t *testing.T) {
 		presets[call.Username] = call.Preset
 	}
 	assert.Equal(t, map[string]string{"owner_holder": "owner", "owner_loser": "admin"}, presets)
+
+	assert.ElementsMatch(t, []recordedConnectCall{
+		{Username: "owner_holder", Database: "my_database_pg"},
+		{Username: "owner_loser", Database: "my_database_pg"},
+	}, pg.connectCalls, "the election loser is lowered to admin but still has to be able to connect")
+	for _, username := range []string{"owner_holder", "owner_loser"} {
+		assert.Less(t, slices.Index(pg.sequence, "connect:"+username), slices.Index(pg.sequence, "apply:"+username),
+			"CONNECT must precede the privileges for %s", username)
+	}
 }
 
 func TestRestoreReconciler_RegrantFailureKeepsGranting(t *testing.T) {
@@ -1415,9 +1476,49 @@ func TestRestoreReconciler_RegrantFailureKeepsGranting(t *testing.T) {
 	var updated dbtether.Restore
 	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
 	assert.Equal(t, "Granting", updated.Status.Phase, "phase must not advance to Completed when re-granting fails")
-	assert.Equal(t, "restore succeeded, retrying grants: failed to re-apply privileges for user app_user: permission denied for database my_database_pg", updated.Status.Message)
+	assert.Equal(t, "restore succeeded, retrying grants: failed to apply privileges for user app_user: permission denied for database my_database_pg", updated.Status.Message)
 	assert.Equal(t, updated.Status.SpecHash, r.computeSpecHash(&updated),
 		"Granting must carry the spec hash so a retry past the job's TTL resumes instead of failing")
+}
+
+func TestRestoreReconciler_ConnectRegrantFailureKeepsGranting(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+
+	user := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "readwrite"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, user).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient(), connectErr: errors.New("database \"my_database_pg\" does not exist")}
+	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	result, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err, "grant retries are paced via RequeueAfter, not a returned error")
+	assert.Equal(t, grantRetryDelay, result.RequeueAfter)
+
+	require.Len(t, pg.connectCalls, 1)
+	assert.Empty(t, pg.calls, "a user that cannot connect is a failure, not a candidate for the privilege pass")
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Granting", updated.Status.Phase)
+	assert.Equal(t, "restore succeeded, retrying grants: failed to grant database access for user app_user: database \"my_database_pg\" does not exist", updated.Status.Message)
+	assert.Equal(t, int32(1), updated.Status.GrantAttempts)
 }
 
 func TestRestoreReconciler_RegrantSkipsUsersWithoutRole(t *testing.T) {
@@ -1449,6 +1550,7 @@ func TestRestoreReconciler_RegrantSkipsUsersWithoutRole(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Empty(t, pg.calls, "the role does not exist yet, so the user's own reconcile is what creates and grants it")
+	assert.Empty(t, pg.connectCalls, "GRANT CONNECT to a role that does not exist errors out")
 
 	var updated dbtether.Restore
 	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
@@ -1554,8 +1656,9 @@ func TestRestoreReconciler_RegrantSkipsUserWithInvalidSpec(t *testing.T) {
 	assert.Equal(t, "Completed", updated.Status.Phase)
 }
 
-func TestRestoreReconciler_RegrantSkipsPgConnectionWhenNoUsers(t *testing.T) {
+func TestRestoreReconciler_AppliesDatabaseSpecWithoutUsers(t *testing.T) {
 	restore, job, db, cluster, secret := newRegrantFixture()
+	db.Spec.RevokePublicConnect = true
 
 	scheme := newRestoreTestScheme()
 	fakeClient := fake.NewClientBuilder().
@@ -1574,11 +1677,242 @@ func TestRestoreReconciler_RegrantSkipsPgConnectionWhenNoUsers(t *testing.T) {
 	_, err := r.Reconcile(context.Background(), req)
 	require.NoError(t, err)
 
-	assert.Equal(t, 0, cache.getCalls, "no DatabaseUser references the target DB, so no PG connection should be requested")
+	assert.Equal(t, 1, cache.getCalls, "the recreated database still has to be converged even with no users on it")
+	assert.Equal(t, []string{"ensure:my_database_pg", "revoke:my_database_pg"}, pg.sequence)
 
 	var updated dbtether.Restore
 	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
 	assert.Equal(t, "Completed", updated.Status.Phase)
+}
+
+func TestRestoreReconciler_ReAppliesDatabaseSpecBeforeGrants(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+	db.Spec.RevokePublicConnect = true
+	db.Spec.Extensions = []string{"pg_trgm"}
+
+	user := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "readwrite"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, user).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient()}
+	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{
+		"ensure:my_database_pg", "revoke:my_database_pg", "extensions:my_database_pg",
+		"connect:app_user", "apply:app_user",
+	}, pg.sequence, "ownership, public access and extensions are the database's own state and come before any user's grants")
+	assert.Equal(t, []recordedExtensionsCall{{Database: "my_database_pg", Extensions: []string{"pg_trgm"}}}, pg.extensionsCalls)
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Completed", updated.Status.Phase)
+}
+
+func TestRestoreReconciler_KeepsPublicConnectWhenSpecDoesNot(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+	db.Spec.RevokePublicConnect = false
+
+	user := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "readwrite"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, user).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{MockClient: postgres.NewMockClient()}
+	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err)
+
+	assert.NotContains(t, pg.sequence, "revoke:my_database_pg", "the restore must not tighten an ACL the Database spec leaves open")
+	assert.Equal(t, []string{"ensure:my_database_pg", "connect:app_user", "apply:app_user"}, pg.sequence)
+}
+
+func TestRestoreReconciler_DatabaseSpecFailureKeepsGranting(t *testing.T) {
+	restore, job, db, cluster, secret := newRegrantFixture()
+	db.Spec.Extensions = []string{"pg_trgm"}
+
+	user := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "readwrite"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, user).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	pg := &recordingPGClient{
+		MockClient:    postgres.NewMockClient(),
+		extensionsErr: errors.New(`extension "pg_trgm" is not available`),
+	}
+	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
+	cache := &singleClientCache{pgClient: pg}
+
+	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	result, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err, "database-level retries are paced via RequeueAfter, just like the user grants")
+	assert.Equal(t, grantRetryDelay, result.RequeueAfter)
+
+	require.Len(t, pg.connectCalls, 1, "a failing database step must not hold the users' grants hostage")
+	require.Len(t, pg.calls, 1)
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
+	assert.Equal(t, "Granting", updated.Status.Phase)
+	assert.Equal(t, int32(1), updated.Status.GrantAttempts, "a database-level failure spends one attempt from the same budget")
+	assert.Equal(t,
+		`restore succeeded, retrying grants: failed to re-apply database spec (extensions) for my-database: extension "pg_trgm" is not available`,
+		updated.Status.Message)
+}
+
+func drainGrantAttempts(t *testing.T, r *RestoreReconciler, pg *recordingPGClient, req reconcile.Request) {
+	t.Helper()
+
+	for round := 1; round < grantAttemptLimit; round++ {
+		result, err := r.Reconcile(context.Background(), req)
+		require.NoError(t, err, "round %d", round)
+		assert.Equal(t, grantRetryDelay, result.RequeueAfter, "round %d must requeue", round)
+
+		var mid dbtether.Restore
+		require.NoError(t, r.Get(context.Background(), req.NamespacedName, &mid))
+		require.Equal(t, "Granting", mid.Status.Phase, "round %d", round)
+		require.Equal(t, int32(round), mid.Status.GrantAttempts, "round %d", round)
+		require.Len(t, pg.connectCalls, round, "round %d must still re-grant CONNECT to the users", round)
+		require.Len(t, pg.calls, round, "round %d must still re-apply the users' privileges", round)
+	}
+
+	_, err := r.Reconcile(context.Background(), req)
+	require.NoError(t, err, "the budget is spent, so the last round completes instead of retrying")
+	require.Len(t, pg.connectCalls, grantAttemptLimit, "the last round serves the users too")
+	require.Len(t, pg.calls, grantAttemptLimit)
+}
+
+func newDatabaseStepRestore(t *testing.T, pg *recordingPGClient, specifyDatabase func(*dbtether.Database)) (*RestoreReconciler, *record.FakeRecorder) {
+	t.Helper()
+
+	restore, job, db, cluster, secret := newRegrantFixture()
+	specifyDatabase(db)
+
+	user := &dbtether.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "app-ns"},
+		Spec: dbtether.DatabaseUserSpec{
+			Database: &dbtether.DatabaseAccess{Name: "my-database", Privileges: "readwrite"},
+		},
+		Status: dbtether.DatabaseUserStatus{Phase: "Ready"},
+	}
+
+	scheme := newRestoreTestScheme()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(restore, job, db, cluster, secret, user).
+		WithStatusSubresource(&dbtether.Restore{}).
+		WithIndex(&dbtether.DatabaseUser{}, controllers.DatabaseUserDatabaseRefIndex, indexDatabaseUserRefsForTest).
+		Build()
+
+	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
+	recorder := record.NewFakeRecorder(10)
+
+	return &RestoreReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Namespace:     "dbtether",
+		PGClientCache: &singleClientCache{pgClient: pg},
+		Recorder:      recorder,
+	}, recorder
+}
+
+func TestRestoreReconciler_ExtensionsFailureCompletesWithUsersServed(t *testing.T) {
+	pg := &recordingPGClient{
+		MockClient:    postgres.NewMockClient(),
+		extensionsErr: errors.New(`extension "pg_trgm" is not available`),
+	}
+	r, recorder := newDatabaseStepRestore(t, pg, func(db *dbtether.Database) {
+		db.Spec.Extensions = []string{"pg_trgm"}
+	})
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	drainGrantAttempts(t, r, pg, req)
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), req.NamespacedName, &updated))
+	assert.Equal(t, "Completed", updated.Status.Phase)
+	assert.Equal(t, "restore completed; grants not re-applied for: database my-database", updated.Status.Message)
+
+	select {
+	case event := <-recorder.Events:
+		assert.Contains(t, event, EventReasonRestoreGrantsSkipped)
+		assert.Contains(t, event, "retries exhausted for database my-database")
+	default:
+		t.Fatal("expected a Warning event to be recorded")
+	}
+}
+
+func TestRestoreReconciler_RevokePublicConnectFailureCompletesWithUsersServed(t *testing.T) {
+	pg := &recordingPGClient{
+		MockClient: postgres.NewMockClient(),
+		revokeErr:  errors.New("permission denied for database my_database_pg"),
+	}
+	r, recorder := newDatabaseStepRestore(t, pg, func(db *dbtether.Database) {
+		db.Spec.RevokePublicConnect = true
+	})
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
+	drainGrantAttempts(t, r, pg, req)
+
+	var updated dbtether.Restore
+	require.NoError(t, r.Get(context.Background(), req.NamespacedName, &updated))
+	assert.Equal(t, "Completed", updated.Status.Phase)
+	assert.Equal(t, "restore completed; grants not re-applied for: database my-database", updated.Status.Message)
+
+	select {
+	case event := <-recorder.Events:
+		assert.Contains(t, event, EventReasonRestoreGrantsSkipped)
+		assert.Contains(t, event, "retries exhausted for database my-database")
+	default:
+		t.Fatal("expected a Warning event to be recorded")
+	}
 }
 
 func TestRestoreReconciler_GrantingSurvivesJobGC(t *testing.T) {

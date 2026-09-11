@@ -212,13 +212,6 @@ func (r *DatabaseUserReconciler) getUsername(user *databasesv1alpha1.DatabaseUse
 	return UsernameForUser(user)
 }
 
-func (r *DatabaseUserReconciler) getDatabaseNameFromSpec(db *databasesv1alpha1.Database) string {
-	if db.Spec.DatabaseName != "" {
-		return db.Spec.DatabaseName
-	}
-	return strings.ReplaceAll(db.Name, "-", "_")
-}
-
 func (r *DatabaseUserReconciler) getSecretName(user *databasesv1alpha1.DatabaseUser) string {
 	if user.Spec.Secret != nil && user.Spec.Secret.Name != "" {
 		return user.Spec.Secret.Name
@@ -329,7 +322,7 @@ func (r *DatabaseUserReconciler) buildSecretData(user *databasesv1alpha1.Databas
 
 	primaryDB := ""
 	if len(databases) > 0 {
-		primaryDB = r.getDatabaseNameFromSpec(databases[0])
+		primaryDB = DatabaseNameFor(databases[0])
 	}
 
 	if user.Spec.Secret != nil && user.Spec.Secret.Template == "dsn" {
@@ -347,7 +340,7 @@ func (r *DatabaseUserReconciler) buildSecretData(user *databasesv1alpha1.Databas
 	if r.shouldIncludeDatabasesList(user, len(databases)) {
 		dbNames := make([]string, len(databases))
 		for i, db := range databases {
-			dbNames[i] = r.getDatabaseNameFromSpec(db)
+			dbNames[i] = DatabaseNameFor(db)
 		}
 		data["databases"] = []byte(strings.Join(dbNames, ","))
 	}
@@ -358,7 +351,7 @@ func (r *DatabaseUserReconciler) buildPerDatabaseSecretData(user *databasesv1alp
 	cluster *databasesv1alpha1.DBCluster, db *databasesv1alpha1.Database,
 	username, password string) map[string][]byte {
 
-	dbName := r.getDatabaseNameFromSpec(db)
+	dbName := DatabaseNameFor(db)
 
 	if user.Spec.Secret != nil && user.Spec.Secret.Template == "dsn" {
 		return map[string][]byte{"dsn": []byte(buildDSN(cluster, username, password, dbName))}
@@ -622,7 +615,7 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 	username := r.getUsername(user)
 	dbNames := make([]string, len(databases))
 	for i, db := range databases {
-		dbNames[i] = r.getDatabaseNameFromSpec(db)
+		dbNames[i] = DatabaseNameFor(db)
 	}
 	baseStatus := statusUpdate{ClusterName: cluster.Name, Username: username}
 
@@ -655,7 +648,7 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 		return r.setStatus(ctx, user, &baseStatus)
 	}
 
-	dbStatuses, applyFailures := r.applyPerDatabasePrivileges(ctx, pgClient, user, username, databases, conflicts)
+	dbStatuses, applyFailures := r.applyPerDatabasePrivileges(ctx, pgClient, user, databases, conflicts)
 
 	if err := r.syncRuntimeParams(ctx, pgClient, user, username); err != nil {
 		baseStatus.Phase = "Failed"
@@ -711,14 +704,14 @@ func (r *DatabaseUserReconciler) syncPostgresUser(ctx context.Context, pgClient 
 }
 
 func (r *DatabaseUserReconciler) applyPerDatabasePrivileges(ctx context.Context, pgClient postgres.ClientInterface,
-	user *databasesv1alpha1.DatabaseUser, username string, databases []*databasesv1alpha1.Database,
+	user *databasesv1alpha1.DatabaseUser, databases []*databasesv1alpha1.Database,
 	conflicts ownerConflicts) (dbStatuses []databasesv1alpha1.DatabaseAccessStatus, applyFailures []string) {
 
 	dbStatuses = make([]databasesv1alpha1.DatabaseAccessStatus, len(databases))
 	dbAccesses := user.Spec.GetDatabases()
 
 	for i, db := range databases {
-		dbName := r.getDatabaseNameFromSpec(db)
+		dbName := DatabaseNameFor(db)
 		grants := ResolveUserGrants(user, dbAccesses[i])
 		lost := conflicts.lossFor(db.Namespace, db.Name)
 		if lost != "" {
@@ -736,7 +729,7 @@ func (r *DatabaseUserReconciler) applyPerDatabasePrivileges(ctx context.Context,
 			status.Phase = "Failed"
 			status.Message = lost
 		}
-		if err := pgClient.ApplyPrivileges(ctx, username, dbName, grants.Privileges, grants.AdditionalGrants); err != nil {
+		if err := ApplyUserGrants(ctx, pgClient, dbName, grants); err != nil {
 			status.Phase = "Failed"
 			status.Message = appendStatusMessage(status.Message, err.Error())
 			applyFailures = append(applyFailures, dbName)
@@ -1356,7 +1349,7 @@ func (r *DatabaseUserReconciler) getClusterAndDatabasesForDeletion(ctx context.C
 		if clusterName == "" {
 			clusterName = db.Spec.ClusterRef.Name
 		}
-		databaseNames = append(databaseNames, r.getDatabaseNameFromSpec(&db))
+		databaseNames = append(databaseNames, DatabaseNameFor(&db))
 	}
 
 	return clusterName, databaseNames

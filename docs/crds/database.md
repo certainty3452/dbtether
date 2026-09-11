@@ -31,104 +31,64 @@ spec:
 | `clusterRef.name` | string | ✅ | — | Name of the DBCluster resource |
 | `databaseName` | string | ❌ | `metadata.name` | Database name in PostgreSQL (see below) |
 | `extensions` | []string | ❌ | `[]` | List of PostgreSQL extensions to install |
-| `deletionPolicy` | enum | ❌ | `Retain` | What to do with the database when resource is deleted |
+| `deletionPolicy` | enum | ❌ | `Retain` | `Retain` or `Delete` — what to do with the database when the resource is deleted |
 | `revokePublicConnect` | bool | ❌ | `false` | Revoke CONNECT from PUBLIC role for isolation |
+
+The DBCluster must be reachable through `credentialsSecretRef`; a cluster that only sets `credentialsFromEnv` cannot back a Database.
 
 ## databaseName
 
-**Optional.** If not specified, the database name is derived from `metadata.name` with dashes (`-`) converted to underscores (`_`).
+If not specified, the database name is derived from `metadata.name` with dashes (`-`) converted to underscores (`_`). The resolved name is reported in `status.databaseName`.
 
 | Resource Name | databaseName (spec) | PostgreSQL Name |
 |---------------|---------------------|-----------------|
 | `my-app-db` | (not set) | `my_app_db` |
 | `my-app-db` | `custom_name` | `custom_name` |
 
-Use explicit `databaseName` only when you need a different name than the resource name.
+An explicit `databaseName` must match `^[a-z_][a-z0-9_]*$` and be at most 63 characters; admission rejects anything else.
 
-Database name must follow PostgreSQL naming rules:
-
-| Constraint | Value |
-|------------|-------|
-| Pattern | `^[a-z_][a-z0-9_]*$` |
-| Max length | 63 |
-
-**Examples:**
 - ✅ Valid: `my_app`, `users_v2`, `_internal`, `app123`
 - ❌ Invalid: `My-App` (uppercase, hyphen), `123db` (starts with number), `user@db` (special char)
 
+The derived form is not checked against that pattern, so an uppercase `metadata.name` reaches PostgreSQL as-is.
+
 ## deletionPolicy
 
-Determines what happens to the PostgreSQL database when the Kubernetes resource is deleted.
-
 | Policy | Behavior on `kubectl delete database` |
-|--------|-------------------------------|
-| `Retain` | Database **stays** in PostgreSQL. Resource deleted, data preserved. |
-| `Delete` | Database **is dropped** from PostgreSQL (`DROP DATABASE`). **Data is lost!** |
+|--------|---------------------------------------|
+| `Retain` (default) | Database **stays** in PostgreSQL. The operator clears its ownership marker so another Database resource can adopt it. |
+| `Delete` | Operator terminates open connections, then runs `DROP DATABASE IF EXISTS`. **Data is lost.** |
 
-### When to use Retain (default)
-- Production databases
-- Data that cannot be lost
-- Importing existing databases
+Use `Retain` for production data and when importing an existing database; use `Delete` for feature-branch and test databases that should disappear with their namespace.
 
-### When to use Delete
-- Feature branch databases
-- Test environments
-- Temporary databases
-
-**⚠️ Warning:** Before deleting with `deletionPolicy: Delete`:
-1. Ensure there are no active connections
-2. Create a backup if needed
-3. Operator will execute `DROP DATABASE IF EXISTS`
+With `Delete`, the finalizer holds the resource until the drop succeeds — if PostgreSQL is unreachable the Kubernetes object stays until it can be dropped, rather than leaving an orphaned database behind.
 
 ## revokePublicConnect
 
-Controls database isolation by revoking `CONNECT` privilege from the `PUBLIC` role.
+In PostgreSQL the `PUBLIC` role holds `CONNECT` on every database by default, so any role can connect to any database without an explicit grant. Setting this to `true` runs:
 
-| Value | Behavior |
-|-------|----------|
-| `false` (default) | All PostgreSQL users can connect (standard PostgreSQL/AWS behavior) |
-| `true` | Only users with explicit `GRANT CONNECT` can access the database |
-
-**SQL executed when `true`:**
 ```sql
 REVOKE CONNECT ON DATABASE <dbname> FROM PUBLIC;
 ```
 
-**Why this matters:** In PostgreSQL, the `PUBLIC` role (which all users inherit) has `CONNECT` privilege on all databases by default. This means any user can connect to any database, even without explicit grants. Setting `revokePublicConnect: true` ensures only `DatabaseUser` resources with explicit access can connect.
+after which only roles with an explicit `GRANT CONNECT` — i.e. the `DatabaseUser` resources pointing at this Database — can connect.
 
-**When to use `true`:**
-- New databases that need strict isolation
-- Multi-tenant environments
-- Security-sensitive applications
+The operator verifies the revoke took effect. `REVOKE` is silently a no-op when the operator's role does not own the database, so a failure here means an adopted legacy database whose PostgreSQL owner is someone else.
 
-**When to keep `false` (default):**
-- Adopting existing databases where applications rely on PUBLIC access
-- Shared databases accessed by many users without explicit grants
-- Legacy systems
+Leave it `false` when adopting an existing database whose applications rely on PUBLIC access.
 
 ## extensions
 
-Operator creates extensions inside the database:
+Each entry is created inside the database as a quoted identifier:
 
 ```sql
-CREATE EXTENSION IF NOT EXISTS uuid-ossp;
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 ```
 
-### Popular extensions
+Common choices: `uuid-ossp` (UUID generation), `pg_trgm` (fuzzy search), `postgis` (geospatial), `hstore` (key-value), `btree_gin` / `btree_gist` (index types for scalars), `tablefunc` (crosstab), `pgcrypto` (cryptographic functions).
 
-| Extension | Description |
-|-----------|-------------|
-| `uuid-ossp` | UUID generation (`uuid_generate_v4()`) |
-| `pg_trgm` | Trigram matching for fuzzy search |
-| `postgis` | Geospatial data |
-| `hstore` | Key-value storage |
-| `btree_gin` | GIN indexes for scalar types |
-| `btree_gist` | GiST indexes for scalar types |
-| `tablefunc` | Crosstab and other functions |
-| `pgcrypto` | Cryptographic functions |
-
-**Important:** Extension must be available in PostgreSQL. For Aurora/RDS — check supported extensions in AWS docs.
+The extension must be installable on the server. On Aurora/RDS check the supported-extensions list for your engine version; some need `rds_superuser`.
 
 ## Status
 
@@ -136,59 +96,47 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 |-------|------|-------------|
 | `phase` | enum | Current resource state |
 | `message` | string | Detailed message |
+| `databaseName` | string | Resolved PostgreSQL database name |
 | `observedGeneration` | int64 | Which spec version has been processed |
+| `ownershipTracked` | bool | `false` when the operator could not mark the database as its own — see [Ownership](#ownership) |
 
 ## Status Phases
 
 | Phase | Description |
 |-------|-------------|
-| `Pending` | Initial state |
-| `Waiting` | Waiting for DBCluster to become `Connected` |
+| `Pending` | The referenced DBCluster resource does not exist |
+| `Waiting` | DBCluster exists but is not `Connected` |
 | `Creating` | Creating the database |
 | `Ready` | Database is ready for use |
 | `Failed` | Error (see `message`) |
-| `Deleting` | Deleting database (when `deletionPolicy: Delete`) |
+| `Deleting` | Resource is being deleted |
+
+A resource that stays in `Pending` or `Waiting` for more than 10 minutes flips to `Failed` with `timeout: <message> (pending for over 10 minutes)`.
 
 ## Behavior
 
 ### Idempotency
-If database already exists in PostgreSQL:
-- Operator does **not** try to recreate it
-- Status becomes `Ready`
-- Extensions are applied (if not already installed)
+An existing database is adopted, not recreated: the phase goes to `Ready` and extensions are applied on top. This is what makes importing an existing database and re-syncing from Git safe.
 
-This allows:
-- Importing existing databases
-- Safe retry on errors
-- GitOps workflow
+### Ownership
+The operator records `namespace/name` in the database's PostgreSQL comment and refuses to reconcile a database already claimed by a different Database resource:
 
-### Finalizers
-Operator adds finalizer `dbtether.io/finalizer`:
-- Ensures `DROP DATABASE` executes before resource deletion
-- Prevents "orphaned" databases when `deletionPolicy: Delete`
+```
+database my_app is owned by team-a/my-app-db, cannot be claimed by team-b/my-app-db (use annotation dbtether.io/force-adopt to override)
+```
 
-### Fail-fast
-If DBCluster is not in `Connected` status:
-- Database resource transitions to `Waiting`
-- Retry every 10 seconds
-- Does not attempt to create database until cluster is available
+Setting `dbtether.io/force-adopt: "true"` on the Database transfers the claim.
 
-### Transient Errors
-On temporary errors (network, timeout):
-- Status `Failed` with message "(will retry)"
-- Retry after 30 seconds
+Writing the comment requires being the PostgreSQL owner of the database. For an adopted database owned by another role the marker cannot be written, `status.ownershipTracked` becomes `false`, and two Database resources can then point at the same PostgreSQL database without the operator noticing. To enable tracking: `ALTER DATABASE <name> OWNER TO <operator_user>`.
+
+### Retries
+A missing DBCluster requeues after 30 s, an unconnected one after 20 s. Every failure against PostgreSQL is reported as `Failed` with `transient error (will retry): <message>` and requeued after 60 s, so a Database recovers on its own once the cluster comes back.
 
 ## kubectl Commands
 
 ```bash
-# List all databases
 kubectl get databases -A
-kubectl get database -n my-namespace
-
-# Database details
 kubectl describe database my-app-db -n my-namespace
-
-# Check status
 kubectl get database my-app-db -n my-namespace -o jsonpath='{.status.phase}'
 ```
 
@@ -226,7 +174,7 @@ spec:
   deletionPolicy: Delete   # will be deleted with namespace/PR
 ```
 
-### Full-featured database
+### Isolated database
 
 ```yaml
 apiVersion: dbtether.io/v1alpha1
@@ -234,49 +182,55 @@ kind: Database
 metadata:
   name: analytics-db
   namespace: data-team
-  labels:
-    team: data
-    environment: production
 spec:
   clusterRef:
     name: analytics-cluster
   databaseName: analytics
+  revokePublicConnect: true   # only its DatabaseUsers can connect
   extensions:
     - uuid-ossp
-    - pg_trgm
     - btree_gin
-    - tablefunc
-    - hstore
   deletionPolicy: Retain
 ```
 
 ## Troubleshooting
 
-### Phase: Waiting
+Operator logs for every case below:
 
-DBCluster is not ready:
 ```bash
-kubectl get dbcluster <cluster-name> -o jsonpath='{.status.phase}'
+kubectl logs -n dbtether deployment/dbtether -f
 ```
 
-### Phase: Failed, message: "DBCluster not found"
+### Phase: Pending, message: "waiting for DBCluster '&lt;name&gt;'"
 
-Check that `clusterRef.name` matches a DBCluster name:
+No DBCluster with that name exists — `clusterRef.name` is a typo, or the cluster has not been applied yet. DBCluster is cluster-scoped, so there is no namespace to get wrong:
+
 ```bash
 kubectl get dbcluster
 ```
 
-### Phase: Failed, message: "failed to create database"
+### Phase: Waiting, message: "waiting for DBCluster '&lt;name&gt;' to be connected"
 
-1. Check that database name is valid (lowercase, no special chars)
-2. Check user privileges (`CREATEDB`)
-3. Check operator logs:
-   ```bash
-   kubectl logs -n postgres-db-operator deployment/postgres-db-operator -f
-   ```
+The DBCluster exists but is not `Connected`. Fix the cluster first — see [DBCluster troubleshooting](dbcluster.md#troubleshooting).
 
-### Phase: Failed, message: "failed to create extensions"
+### Phase: Failed, message: "connection error: ..."
 
-1. Check that extension is available in PostgreSQL
-2. For Aurora — check supported extensions in AWS docs
-3. Some extensions require `rds_superuser` role
+The operator could not build a client for the cluster: the credentials Secret is missing, lacks `username`/`password`, or the DBCluster uses `credentialsFromEnv` instead of `credentialsSecretRef`.
+
+### Phase: Failed, message: "transient error (will retry): failed to create database: ..."
+
+`CREATE DATABASE` failed. Check that the operator's role has `CREATEDB`, and that the name is valid for PostgreSQL.
+
+If the message ends in `is owned by <ns>/<name>, cannot be claimed by ...`, another Database resource already claims that PostgreSQL database. Point one of them at a different `databaseName`, or add `dbtether.io/force-adopt: "true"` to the resource that should win.
+
+### Phase: Failed, message: "transient error (will retry): failed to create extensions: ..."
+
+The extension is not available on the server, or creating it needs a role the operator does not have (`rds_superuser` on RDS/Aurora). The database itself is already created; only the extension step is retrying.
+
+### Phase: Failed, message: "transient error (will retry): failed to revoke public connect: public connect on database &lt;name&gt; could not be revoked (not owner)"
+
+`revokePublicConnect: true` on a database the operator's role does not own. PostgreSQL accepts the `REVOKE` and changes nothing. Either hand the database over — `ALTER DATABASE <name> OWNER TO <operator_user>` — or drop the field.
+
+### Phase: Failed, message: "timeout: ... (pending for over 10 minutes)"
+
+The resource waited more than 10 minutes for its DBCluster. The original wait message is kept in the text; fix that cause and the Database returns on the next reconcile.
