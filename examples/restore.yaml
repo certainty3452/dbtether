@@ -1,4 +1,3 @@
-# Option 1: Restore from the latest backup of a database (RECOMMENDED)
 apiVersion: dbtether.io/v1alpha1
 kind: Restore
 metadata:
@@ -6,18 +5,14 @@ metadata:
   namespace: default
 spec:
   source:
-    # Automatically find the latest completed backup for this database
     latestFrom:
       databaseRef:
         name: orders-db
-      # namespace: default  # optional, defaults to same namespace
   target:
     databaseRef:
       name: orders-db-restored
   onConflict: drop
-
 ---
-# Option 2: Restore from a specific Backup CRD
 apiVersion: dbtether.io/v1alpha1
 kind: Restore
 metadata:
@@ -25,20 +20,13 @@ metadata:
   namespace: default
 spec:
   source:
-    # Reference to an existing completed Backup
     backupRef:
       name: orders-backup-20260120-1400
-      # namespace: default  # optional, defaults to same namespace
   target:
     databaseRef:
       name: orders-db-restored
-  # How to handle existing data:
-  # - fail: abort if database is not empty (default)
-  # - drop: drop and recreate database before restore
   onConflict: fail
-
 ---
-# Option 3: Restore from a direct path in storage
 apiVersion: dbtether.io/v1alpha1
 kind: Restore
 metadata:
@@ -46,17 +34,14 @@ metadata:
   namespace: default
 spec:
   source:
-    # Direct path to backup file
     path: "microservices/orders_db/20260120-140000.sql.gz"
     storageRef:
       name: company-s3-backup
   target:
     databaseRef:
       name: orders-db-restored
-  onConflict: drop  # Drop existing database and restore clean
-
+  onConflict: drop
 ---
-# Cross-namespace restore (e.g., restore prod backup to dev)
 apiVersion: dbtether.io/v1alpha1
 kind: Restore
 metadata:
@@ -64,14 +49,12 @@ metadata:
   namespace: dev
 spec:
   source:
-    # Latest backup from prod database
     latestFrom:
       databaseRef:
         name: prod-orders-db
-      namespace: prod  # cross-namespace lookup
+      namespace: prod
   target:
     databaseRef:
       name: dev-database
   onConflict: drop
-  ttlAfterCompletion: 1h  # Keep the finished restore Job for 1 hour (Job TTL, not CR deletion)
-
+  ttlAfterCompletion: 1h

@@ -41,6 +41,7 @@ func TestElectOwner(t *testing.T) {
 		users       []databasesv1alpha1.DatabaseUser
 		dbNamespace string
 		dbName      string
+		allowed     []string
 		want        string
 	}{
 		{
@@ -110,6 +111,7 @@ func TestElectOwner(t *testing.T) {
 			},
 			dbNamespace: "team-a",
 			dbName:      "orders",
+			allowed:     []string{"team-b"},
 			want:        "zzz",
 		},
 		{
@@ -206,7 +208,25 @@ func TestElectOwner(t *testing.T) {
 			},
 			dbNamespace: "shared",
 			dbName:      "orders",
+			allowed:     []string{"team-b"},
 			want:        "remote-owner",
+		},
+		{
+			name: "claimant from a namespace the Database does not allow is ignored",
+			users: []databasesv1alpha1.DatabaseUser{
+				ownerTestUser("team-b", "intruder", older, &databasesv1alpha1.DatabaseUserSpec{
+					Database:   &databasesv1alpha1.DatabaseAccess{Name: "orders", Namespace: "team-a"},
+					Privileges: "owner",
+				}),
+				ownerTestUser("team-a", "local-owner", newer, &databasesv1alpha1.DatabaseUserSpec{
+					Database:   &databasesv1alpha1.DatabaseAccess{Name: "orders"},
+					Privileges: "owner",
+				}),
+			},
+			dbNamespace: "team-a",
+			dbName:      "orders",
+			allowed:     []string{"team-c"},
+			want:        "local-owner",
 		},
 		{
 			name: "claimant setting both database and databases yields to the next candidate",
@@ -261,7 +281,11 @@ func TestElectOwner(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := ElectOwner(tt.users, tt.dbNamespace, tt.dbName)
+			db := &databasesv1alpha1.Database{
+				ObjectMeta: metav1.ObjectMeta{Namespace: tt.dbNamespace, Name: tt.dbName},
+				Spec:       databasesv1alpha1.DatabaseSpec{AllowedNamespaces: tt.allowed},
+			}
+			got := ElectOwner(tt.users, db)
 			if tt.want == "" {
 				if got != nil {
 					t.Fatalf("ElectOwner() = %s/%s, want nil", got.Namespace, got.Name)

@@ -13,37 +13,69 @@ import (
 	"github.com/certainty3452/dbtether/pkg/postgres"
 )
 
-// GetPostgresClient resolves a DBCluster's admin credentials and returns a cached
-// client connected to its "postgres" database. Shared by every controller that
-// talks to a cluster so they all key the cache the same way.
+// One entry point so every controller keys the client cache the same way.
 func GetPostgresClient(
 	ctx context.Context,
-	c client.Client,
+	c client.Reader,
 	cache postgres.ClientCacheInterface,
 	cluster *databasesv1alpha1.DBCluster,
 ) (postgres.ClientInterface, error) {
-	var secret corev1.Secret
-	if err := c.Get(ctx, types.NamespacedName{
-		Name:      cluster.Spec.CredentialsSecretRef.Name,
-		Namespace: cluster.Spec.CredentialsSecretRef.Namespace,
-	}, &secret); err != nil {
-		return nil, fmt.Errorf("failed to get credentials secret: %w", err)
+	config, err := ClusterConfig(ctx, c, cluster)
+	if err != nil {
+		return nil, err
 	}
+	return cache.Get(ctx, cluster.Name, config)
+}
 
-	username := string(secret.Data["username"])
-	password := string(secret.Data["password"])
-	if username == "" || password == "" {
-		return nil, fmt.Errorf("credentials secret must contain 'username' and 'password' keys")
+func ClusterConfig(ctx context.Context, c client.Reader, cluster *databasesv1alpha1.DBCluster) (postgres.Config, error) {
+	username, password, err := clusterCredentials(ctx, c, cluster)
+	if err != nil {
+		return postgres.Config{}, err
 	}
-
-	return cache.Get(ctx, cluster.Name, postgres.Config{
+	return postgres.Config{
 		Host:     cluster.Spec.Endpoint,
 		Port:     cluster.Spec.Port,
 		Username: username,
 		Password: password,
 		Database: "postgres",
 		SSLMode:  OperatorSSLMode(),
-	})
+	}, nil
+}
+
+func clusterCredentials(ctx context.Context, c client.Reader, cluster *databasesv1alpha1.DBCluster) (username, password string, err error) {
+	switch {
+	case cluster.Spec.CredentialsFromEnv != nil:
+		return credentialsFromEnv(cluster.Spec.CredentialsFromEnv)
+	case cluster.Spec.CredentialsSecretRef != nil:
+		return credentialsFromSecret(ctx, c, cluster.Spec.CredentialsSecretRef)
+	default:
+		return "", "", fmt.Errorf("either credentialsSecretRef or credentialsFromEnv must be specified")
+	}
+}
+
+func credentialsFromEnv(cfg *databasesv1alpha1.CredentialsFromEnv) (username, password string, err error) {
+	username = os.Getenv(cfg.Username)
+	if username == "" {
+		return "", "", fmt.Errorf("environment variable %s not set or empty", cfg.Username)
+	}
+	password = os.Getenv(cfg.Password)
+	if password == "" {
+		return "", "", fmt.Errorf("environment variable %s not set or empty", cfg.Password)
+	}
+	return username, password, nil
+}
+
+func credentialsFromSecret(ctx context.Context, c client.Reader, ref *databasesv1alpha1.SecretReference) (username, password string, err error) {
+	var secret corev1.Secret
+	if err := c.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: ref.Namespace}, &secret); err != nil {
+		return "", "", fmt.Errorf("failed to get credentials secret: %w", err)
+	}
+	username = string(secret.Data["username"])
+	password = string(secret.Data["password"])
+	if username == "" || password == "" {
+		return "", "", fmt.Errorf("secret must contain 'username' and 'password' keys")
+	}
+	return username, password, nil
 }
 
 // The one reader of DB_SSLMODE: main.go configures the backup and restore Jobs from here too.

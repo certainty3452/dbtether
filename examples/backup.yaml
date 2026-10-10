@@ -1,5 +1,3 @@
-# Manual backup - creates a one-time backup job
-# Result path: s3://bucket/microservices/orders_db/20260119-143022.sql.gz
 apiVersion: dbtether.io/v1alpha1
 kind: Backup
 metadata:
@@ -10,23 +8,7 @@ spec:
     name: orders-db
   storageRef:
     name: company-s3
-  # Default filenameTemplate: "{{ .Timestamp }}.sql.gz"
-  # Available template variables:
-  #   {{ .ClusterName }}  - DBCluster name
-  #   {{ .DatabaseName }} - Database name
-  #   {{ .Year }}         - 4-digit year (2026)
-  #   {{ .Month }}        - 2-digit month (01-12)
-  #   {{ .Day }}          - 2-digit day (01-31)
-  #   {{ .Timestamp }}    - Full timestamp (20260119-143022)
-  #   {{ .RunID }}        - 8-char unique identifier for this backup run
-  #
-  # Custom example with RunID:
-  # filenameTemplate: "{{ .DatabaseName }}_{{ .Timestamp }}_{{ .RunID }}.sql.gz"
-  #
-  # Optional: auto-delete Job after completion (default: 1h)
-  # ttlAfterCompletion: 24h
 ---
-# Backup with custom TTL
 apiVersion: dbtether.io/v1alpha1
 kind: Backup
 metadata:
@@ -38,9 +20,8 @@ spec:
   storageRef:
     name: company-s3
   filenameTemplate: "{{ .DatabaseName }}_{{ .RunID }}.sql.gz"
-  ttlAfterCompletion: 168h  # Keep Job for 1 week
+  ttlAfterCompletion: 168h
 ---
-# Backup with custom job configuration (for large databases)
 apiVersion: dbtether.io/v1alpha1
 kind: Backup
 metadata:
@@ -51,8 +32,7 @@ spec:
     name: large-db
   storageRef:
     name: company-s3
-  # Job configuration for long-running backups
   jobConfig:
-    backoffLimit: 5              # Retry up to 5 times on failure
-    activeDeadlineSeconds: 7200  # 2 hour timeout (for large DBs)
-    ttlSecondsAfterFailed: 86400 # Keep failed Job for 24h for debugging
+    backoffLimit: 5
+    activeDeadlineSeconds: 7200
+    ttlSecondsAfterFailed: 86400

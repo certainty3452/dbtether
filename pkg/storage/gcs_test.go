@@ -41,7 +41,6 @@ func TestGCSConfig_Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Basic validation - bucket is required
 			hasRequired := tt.cfg.Bucket != ""
 			if hasRequired != tt.valid {
 				t.Errorf("expected valid=%v, got bucket=%q", tt.valid, tt.cfg.Bucket)

@@ -11,16 +11,13 @@ import (
 	"github.com/certainty3452/dbtether/pkg/postgres"
 )
 
-// UserGrants is the privilege set a DatabaseUser is supposed to hold on a single
-// database. Shared with the Restore controller so a restore re-applies exactly
-// what the DatabaseUser controller would apply.
+// Shared with the Restore controller so a restore re-applies exactly what DatabaseUser applies.
 type UserGrants struct {
 	Username         string
 	Privileges       string
 	AdditionalGrants []postgres.TableGrant
 }
 
-// ResolveUserGrants resolves the grants for one entry of the user's database list.
 func ResolveUserGrants(user *databasesv1alpha1.DatabaseUser, access databasesv1alpha1.DatabaseAccess) UserGrants {
 	return UserGrants{
 		Username:         UsernameForUser(user),
@@ -29,8 +26,6 @@ func ResolveUserGrants(user *databasesv1alpha1.DatabaseUser, access databasesv1a
 	}
 }
 
-// ResolveUserGrantsForDatabase resolves the grants the user holds on the Database
-// CR identified by namespace/name. ok is false when the user does not reference it.
 func ResolveUserGrantsForDatabase(user *databasesv1alpha1.DatabaseUser, namespace, name string) (grants UserGrants, ok bool) {
 	for _, access := range user.Spec.GetDatabases() {
 		if access.Name == name && databaseAccessNamespace(user, access) == namespace {
@@ -40,11 +35,11 @@ func ResolveUserGrantsForDatabase(user *databasesv1alpha1.DatabaseUser, namespac
 	return UserGrants{}, false
 }
 
-func ApplyUserGrants(ctx context.Context, pgClient postgres.ClientInterface, databaseName string, grants UserGrants) error {
+func ApplyUserGrants(ctx context.Context, pgClient postgres.ClientInterface, databaseName string, grants UserGrants, ownerRole string) error {
 	if err := pgClient.GrantDatabaseAccess(ctx, grants.Username, databaseName); err != nil {
 		return fmt.Errorf("failed to grant database access for user %s: %w", grants.Username, err)
 	}
-	if err := pgClient.ApplyPrivileges(ctx, grants.Username, databaseName, grants.Privileges, grants.AdditionalGrants); err != nil {
+	if err := pgClient.ApplyPrivileges(ctx, grants.Username, databaseName, grants.Privileges, ownerRole, grants.AdditionalGrants); err != nil {
 		return fmt.Errorf("failed to apply privileges for user %s: %w", grants.Username, err)
 	}
 	return nil
@@ -83,7 +78,6 @@ func ValidateUserSpec(user *databasesv1alpha1.DatabaseUser) error {
 	return nil
 }
 
-// UsernameForUser is the PostgreSQL role name backing a DatabaseUser.
 func UsernameForUser(user *databasesv1alpha1.DatabaseUser) string {
 	if user.Spec.Username != "" {
 		return user.Spec.Username

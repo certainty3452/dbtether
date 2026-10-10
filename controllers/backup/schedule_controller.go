@@ -5,8 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
 	"sort"
+	"strings"
 	"text/template"
 	"time"
 
@@ -16,11 +16,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	dbtether "github.com/certainty3452/dbtether/api/v1alpha1"
+	"github.com/certainty3452/dbtether/controllers"
 	pkgbackup "github.com/certainty3452/dbtether/pkg/backup"
 	"github.com/certainty3452/dbtether/pkg/storage"
 )
@@ -31,21 +33,19 @@ const (
 	LabelScheduleNS              = "dbtether.io/schedule-namespace"
 	AnnotationLastRetentionClean = "dbtether.io/last-retention-cleanup"
 
-	// RetentionCleanupDebounce is the minimum time between retention cleanups
 	RetentionCleanupDebounce = 60 * time.Second
+
+	schedulePendingRequeueDelay = 30 * time.Second
+
+	retentionCleanupTimeout = 10 * time.Minute
 )
 
 type BackupScheduleReconciler struct {
 	client.Client
 	Scheme    *runtime.Scheme
 	Log       *zap.SugaredLogger
-	Namespace string // operator namespace
+	Namespace string
 }
-
-// +kubebuilder:rbac:groups=dbtether.io,resources=backupschedules,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=dbtether.io,resources=backupschedules/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=dbtether.io,resources=backupschedules/finalizers,verbs=update
-// +kubebuilder:rbac:groups=dbtether.io,resources=backups,verbs=get;list;watch;create;update;patch;delete
 
 func (r *BackupScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.With("schedule", req.NamespacedName)
@@ -78,6 +78,12 @@ func (r *BackupScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return r.updateStatus(ctx, &schedule, "Failed", fmt.Sprintf("Invalid cron schedule: %v", err), nil, nil)
 	}
 
+	if msg, err := r.crossNamespaceProblem(ctx, &schedule); err != nil {
+		return ctrl.Result{}, err
+	} else if msg != "" {
+		return r.updateStatusWithRequeue(ctx, &schedule, "Pending", msg, nil, nil, schedulePendingRequeueDelay)
+	}
+
 	nextRun := r.calculateNextRun(&schedule, cronSchedule)
 
 	if time.Now().After(nextRun) || time.Now().Equal(nextRun) {
@@ -85,6 +91,18 @@ func (r *BackupScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	return r.scheduleNextRun(ctx, &schedule, nextRun, log)
+}
+
+// A same-namespace Database is left to the Backups, which wait for it themselves.
+func (r *BackupScheduleReconciler) crossNamespaceProblem(ctx context.Context, schedule *dbtether.BackupSchedule) (string, error) {
+	if controllers.DatabaseRefKey(schedule.Spec.DatabaseRef, schedule.Namespace).Namespace == schedule.Namespace {
+		return "", nil
+	}
+	_, err := getConsentedDatabase(ctx, r.Client, schedule.Spec.DatabaseRef, schedule.Namespace)
+	if isDependencyNotReady(err) {
+		return err.Error(), nil
+	}
+	return "", err
 }
 
 func (r *BackupScheduleReconciler) ensureScheduleFinalizer(ctx context.Context, schedule *dbtether.BackupSchedule) (*ctrl.Result, error) {
@@ -124,7 +142,6 @@ func (r *BackupScheduleReconciler) handleScheduledBackup(
 	backupName := r.generateBackupName(schedule, nextRun)
 	nextRunMeta := metav1.NewTime(nextRun)
 
-	// Check if backup already exists (race condition protection)
 	existingBackup := &dbtether.Backup{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: schedule.Namespace, Name: backupName}, existingBackup); err == nil {
 		log.Debugw("backup already exists for scheduled time", "backup", backupName, "scheduledTime", nextRun)
@@ -139,8 +156,11 @@ func (r *BackupScheduleReconciler) handleScheduledBackup(
 			log.Debugw("backup created by concurrent reconcile", "backup", backupName)
 			return r.updateStatusAfterBackup(ctx, schedule, cronSchedule, nextRun)
 		}
-		log.Errorw("failed to create backup", "error", err)
-		return r.updateStatus(ctx, schedule, "Failed", fmt.Sprintf("Failed to create backup: %v", err), nil, &nextRunMeta)
+		if errors.IsInvalid(err) {
+			log.Errorw("backup rejected by the API server", "error", err)
+			return r.updateStatus(ctx, schedule, "Failed", fmt.Sprintf("Failed to create backup: %v", err), nil, &nextRunMeta)
+		}
+		return ctrl.Result{}, err
 	}
 
 	log.Infow("scheduled backup created", "backup", backup.Name, "runId", backup.Status.RunID)
@@ -170,20 +190,18 @@ func (r *BackupScheduleReconciler) scheduleNextRun(
 		requeueAfter = time.Second
 	}
 
-	// Deep copy schedule for goroutine to avoid race condition
+	// Copy: the goroutine outlives this reconcile.
 	scheduleCopy := schedule.DeepCopy()
-	go r.runRetentionCleanup(context.Background(), scheduleCopy, log) //nolint:gosec // intentional: goroutine outlives request ctx
+	r.startRetentionCleanup(ctx, scheduleCopy, log)
 
 	nextRunMeta := metav1.NewTime(nextRun)
 	return r.updateStatusWithRequeue(ctx, schedule, "Active", "", nil, &nextRunMeta, requeueAfter)
 }
 
-// generateBackupName creates a deterministic backup name based on scheduled time.
-// Format: {schedule-name}-{YYYYMMDD-HHMM} to prevent race conditions.
+// Deterministic per scheduled time so concurrent reconciles collide on the name instead of duplicating.
 func (r *BackupScheduleReconciler) generateBackupName(schedule *dbtether.BackupSchedule, scheduledTime time.Time) string {
-	// Use scheduled time as suffix (deterministic for same schedule time)
 	timeSuffix := scheduledTime.UTC().Format("20060102-1504")
-	return fmt.Sprintf("%s-%s", schedule.Name, timeSuffix)
+	return fmt.Sprintf("%s-%s", boundedName(schedule.Name, validation.DNS1123SubdomainMaxLength-len(timeSuffix)-1), timeSuffix)
 }
 
 func (r *BackupScheduleReconciler) createBackup(ctx context.Context, schedule *dbtether.BackupSchedule, backupName string) (*dbtether.Backup, error) {
@@ -192,7 +210,7 @@ func (r *BackupScheduleReconciler) createBackup(ctx context.Context, schedule *d
 			Name:      backupName,
 			Namespace: schedule.Namespace,
 			Labels: map[string]string{
-				LabelScheduleName: schedule.Name,
+				LabelScheduleName: boundedLabelValue(schedule.Name),
 				LabelScheduleNS:   schedule.Namespace,
 			},
 		},
@@ -202,17 +220,14 @@ func (r *BackupScheduleReconciler) createBackup(ctx context.Context, schedule *d
 		},
 	}
 
-	// Inherit filename template if specified
 	if schedule.Spec.FilenameTemplate != "" {
 		backup.Spec.FilenameTemplate = schedule.Spec.FilenameTemplate
 	}
 
-	// Inherit job config if specified
 	if schedule.Spec.JobConfig != nil {
 		backup.Spec.JobConfig = schedule.Spec.JobConfig
 	}
 
-	// Set owner reference for garbage collection
 	if err := controllerutil.SetControllerReference(schedule, backup, r.Scheme); err != nil {
 		return nil, fmt.Errorf("failed to set owner reference: %w", err)
 	}
@@ -224,12 +239,23 @@ func (r *BackupScheduleReconciler) createBackup(ctx context.Context, schedule *d
 	return backup, nil
 }
 
+// The reconcile ctx is the manager ctx, so cleanup is cancelled on shutdown and leader loss.
+func (r *BackupScheduleReconciler) startRetentionCleanup(ctx context.Context, schedule *dbtether.BackupSchedule, log *zap.SugaredLogger) <-chan struct{} {
+	done := make(chan struct{})
+	cleanupCtx, cancel := context.WithTimeout(ctx, retentionCleanupTimeout)
+	go func() {
+		defer close(done)
+		defer cancel()
+		r.runRetentionCleanup(cleanupCtx, schedule, log)
+	}()
+	return done
+}
+
 func (r *BackupScheduleReconciler) runRetentionCleanup(ctx context.Context, schedule *dbtether.BackupSchedule, log *zap.SugaredLogger) {
 	if schedule.Spec.Retention == nil {
-		return // No retention policy configured
+		return
 	}
 
-	// Check debounce - skip if cleanup was run recently
 	if !r.shouldRunRetentionCleanup(schedule) {
 		log.Debugw("retention cleanup: skipping (debounce)", "schedule", schedule.Name)
 		return
@@ -241,29 +267,23 @@ func (r *BackupScheduleReconciler) runRetentionCleanup(ctx context.Context, sche
 		return
 	}
 
-	// Get resources needed for cleanup
 	storageClient, prefix, err := r.prepareRetentionCleanup(ctx, schedule, log)
 	if err != nil || storageClient == nil {
-		return // Error already logged
+		return
 	}
 	if closer, ok := storageClient.(io.Closer); ok {
 		defer func() { _ = closer.Close() }()
 	}
 
-	// Apply retention policy and delete old files
 	r.executeRetentionCleanup(ctx, storageClient, prefix, schedule, log)
 
-	// Also cleanup old Backup CRDs
 	r.cleanupBackupCRDs(ctx, schedule, log)
 }
 
 func (r *BackupScheduleReconciler) prepareRetentionCleanup(ctx context.Context, schedule *dbtether.BackupSchedule, log *zap.SugaredLogger) (storage.StorageClient, string, error) {
-	var db dbtether.Database
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      schedule.Spec.DatabaseRef.Name,
-		Namespace: schedule.Namespace,
-	}, &db); err != nil {
-		if !errors.IsNotFound(err) {
+	db, err := getConsentedDatabase(ctx, r.Client, schedule.Spec.DatabaseRef, schedule.Namespace)
+	if err != nil {
+		if !isDependencyNotReady(err) {
 			log.Warnw("retention cleanup: failed to get database", "error", err)
 		}
 		return nil, "", err
@@ -285,13 +305,13 @@ func (r *BackupScheduleReconciler) prepareRetentionCleanup(ctx context.Context, 
 		return nil, "", err
 	}
 
-	storageClient, err := r.newRetentionClient(ctx, &backupStorage)
+	storageClient, err := defaultStorageClientFactory(ctx, r.Client, &backupStorage)
 	if err != nil {
 		log.Warnw("retention cleanup: failed to create storage client", "provider", backupStorage.GetProvider(), "error", err)
 		return nil, "", err
 	}
 
-	prefix, err := r.buildStoragePath(&backupStorage, &cluster, &db)
+	prefix, err := r.buildStoragePath(&backupStorage, &cluster, db)
 	if err != nil {
 		log.Warnw("retention cleanup: failed to build storage path", "error", err)
 		return nil, "", err
@@ -300,26 +320,18 @@ func (r *BackupScheduleReconciler) prepareRetentionCleanup(ctx context.Context, 
 	return storageClient, prefix, nil
 }
 
-func (r *BackupScheduleReconciler) newRetentionClient(ctx context.Context, bs *dbtether.BackupStorage) (storage.StorageClient, error) {
-	var s3 *storage.S3Config
-	var gcs *storage.GCSConfig
-	var az *storage.AzureConfig
-	switch {
-	case bs.Spec.S3 != nil:
-		s3 = &storage.S3Config{Bucket: bs.Spec.S3.Bucket, Region: bs.Spec.S3.Region, Endpoint: bs.Spec.S3.Endpoint}
-	case bs.Spec.GCS != nil:
-		gcs = &storage.GCSConfig{Bucket: bs.Spec.GCS.Bucket, Project: bs.Spec.GCS.Project}
-	case bs.Spec.Azure != nil:
-		az = &storage.AzureConfig{Container: bs.Spec.Azure.Container, StorageAccount: bs.Spec.Azure.StorageAccount}
+// Two schedules on one database with the same filename template share these objects; retention cannot tell them apart.
+func (r *BackupScheduleReconciler) executeRetentionCleanup(ctx context.Context, storageClient storage.StorageClient, dbPath string, schedule *dbtether.BackupSchedule, log *zap.SugaredLogger) {
+	filenameTemplate := schedule.Spec.FilenameTemplate
+	if filenameTemplate == "" {
+		filenameTemplate = pkgbackup.DefaultFilenameTemplate
 	}
-	return storage.NewClient(ctx, s3, gcs, az, slog.Default())
-}
-
-func (r *BackupScheduleReconciler) executeRetentionCleanup(ctx context.Context, storageClient storage.StorageClient, prefix string, schedule *dbtether.BackupSchedule, log *zap.SugaredLogger) {
-	filenameFilter, err := pkgbackup.FilenameTemplateToRegex(schedule.Spec.FilenameTemplate)
+	filenameFilter, err := pkgbackup.FilenameTemplateToRegex(filenameTemplate)
 	if err != nil {
-		log.Warnw("retention cleanup: failed to build filename filter, proceeding without filter", "error", err)
+		log.Warnw("retention cleanup: invalid filename template, skipping object retention", "template", filenameTemplate, "error", err)
+		return
 	}
+	prefix := strings.TrimSuffix(dbPath, "/") + "/"
 
 	retentionManager := pkgbackup.NewRetentionManager(log)
 	toDelete, err := retentionManager.ApplyRetention(ctx, storageClient, prefix, schedule.Spec.Retention, filenameFilter)
@@ -338,8 +350,6 @@ func (r *BackupScheduleReconciler) executeRetentionCleanup(ctx context.Context, 
 	}
 }
 
-// cleanupBackupCRDs deletes old Backup CRDs based on retention policy.
-// Uses the same retention logic as S3 cleanup (keepLast, keepDaily, keepWeekly, keepMonthly).
 func (r *BackupScheduleReconciler) cleanupBackupCRDs(ctx context.Context, schedule *dbtether.BackupSchedule, log *zap.SugaredLogger) {
 	if schedule.Spec.Retention == nil {
 		return
@@ -354,12 +364,8 @@ func (r *BackupScheduleReconciler) cleanupBackupCRDs(ctx context.Context, schedu
 		return
 	}
 
-	// List all Backup CRDs created by this schedule
 	var backups dbtether.BackupList
-	if err := r.List(ctx, &backups,
-		client.InNamespace(schedule.Namespace),
-		client.MatchingLabels{LabelScheduleName: schedule.Name},
-	); err != nil {
+	if err := r.List(ctx, &backups, client.InNamespace(schedule.Namespace), scheduleBackupSelector(schedule)); err != nil {
 		log.Warnw("retention cleanup: failed to list backup CRDs", "error", err)
 		return
 	}
@@ -368,19 +374,16 @@ func (r *BackupScheduleReconciler) cleanupBackupCRDs(ctx context.Context, schedu
 		return
 	}
 
-	// Sort by creation time (newest first)
 	sort.Slice(backups.Items, func(i, j int) bool {
 		return backups.Items[i].CreationTimestamp.After(backups.Items[j].CreationTimestamp.Time)
 	})
 
-	// Calculate which backups to keep using same logic as S3 retention
-	keepSet := r.calculateBackupKeepSet(backups.Items, schedule.Spec.Retention, time.Now())
+	keepSet := r.calculateBackupKeepSet(backups.Items, schedule.Spec.Retention)
 
 	if len(keepSet) == len(backups.Items) {
 		return
 	}
 
-	// Delete CRDs not in keepSet (only completed ones)
 	deleted := 0
 	for i := range backups.Items {
 		backup := &backups.Items[i]
@@ -389,7 +392,6 @@ func (r *BackupScheduleReconciler) cleanupBackupCRDs(ctx context.Context, schedu
 			continue
 		}
 
-		// Only delete completed backups
 		if backup.Status.Phase != "Completed" && backup.Status.Phase != "Failed" {
 			continue
 		}
@@ -416,80 +418,15 @@ func (r *BackupScheduleReconciler) cleanupBackupCRDs(ctx context.Context, schedu
 	}
 }
 
-// calculateBackupKeepSet determines which Backup CRDs to keep based on retention policy.
-// Mirrors the logic in pkg/backup/retention.go for S3 files.
-//
-//nolint:gocyclo // retention policy logic requires checking multiple conditions
-func (r *BackupScheduleReconciler) calculateBackupKeepSet(
-	backups []dbtether.Backup,
-	policy *dbtether.RetentionPolicy,
-	now time.Time,
-) map[string]bool {
-	keep := make(map[string]bool)
-
-	// keepLast: keep the N most recent backups
-	if policy.KeepLast != nil && *policy.KeepLast > 0 {
-		for i := 0; i < *policy.KeepLast && i < len(backups); i++ {
-			keep[backups[i].Name] = true //nolint:gosec // i is bounded by len(backups)
-		}
+// backups must be sorted newest first.
+func (r *BackupScheduleReconciler) calculateBackupKeepSet(backups []dbtether.Backup, policy *dbtether.RetentionPolicy) map[string]bool {
+	files := make([]pkgbackup.BackupFile, len(backups))
+	for i := range backups {
+		files[i] = pkgbackup.BackupFile{Key: backups[i].Name, Timestamp: backups[i].CreationTimestamp.Time}
 	}
-
-	// keepDaily: keep first backup of each day for N days
-	if policy.KeepDaily != nil && *policy.KeepDaily > 0 {
-		cutoff := now.AddDate(0, 0, -*policy.KeepDaily)
-		seenDays := make(map[string]bool)
-		for i := range backups {
-			ts := backups[i].CreationTimestamp.Time
-			if ts.Before(cutoff) {
-				continue
-			}
-			dayKey := ts.Format("2006-01-02")
-			if !seenDays[dayKey] {
-				seenDays[dayKey] = true
-				keep[backups[i].Name] = true
-			}
-		}
-	}
-
-	// keepWeekly: keep first backup of each week for N weeks
-	if policy.KeepWeekly != nil && *policy.KeepWeekly > 0 {
-		cutoff := now.AddDate(0, 0, -*policy.KeepWeekly*7)
-		seenWeeks := make(map[string]bool)
-		for i := range backups {
-			ts := backups[i].CreationTimestamp.Time
-			if ts.Before(cutoff) {
-				continue
-			}
-			year, week := ts.ISOWeek()
-			weekKey := fmt.Sprintf("%d-W%02d", year, week)
-			if !seenWeeks[weekKey] {
-				seenWeeks[weekKey] = true
-				keep[backups[i].Name] = true
-			}
-		}
-	}
-
-	// keepMonthly: keep first backup of each month for N months
-	if policy.KeepMonthly != nil && *policy.KeepMonthly > 0 {
-		cutoff := now.AddDate(0, -*policy.KeepMonthly, 0)
-		seenMonths := make(map[string]bool)
-		for i := range backups {
-			ts := backups[i].CreationTimestamp.Time
-			if ts.Before(cutoff) {
-				continue
-			}
-			monthKey := ts.Format("2006-01")
-			if !seenMonths[monthKey] {
-				seenMonths[monthKey] = true
-				keep[backups[i].Name] = true
-			}
-		}
-	}
-
-	return keep
+	return pkgbackup.KeepSet(files, policy)
 }
 
-// shouldRunRetentionCleanup checks if enough time has passed since last cleanup
 func (r *BackupScheduleReconciler) shouldRunRetentionCleanup(schedule *dbtether.BackupSchedule) bool {
 	if schedule.Annotations == nil {
 		return true
@@ -502,21 +439,18 @@ func (r *BackupScheduleReconciler) shouldRunRetentionCleanup(schedule *dbtether.
 
 	lastCleanup, err := time.Parse(time.RFC3339, lastCleanupStr)
 	if err != nil {
-		return true // Invalid format, allow cleanup
+		return true
 	}
 
 	return time.Since(lastCleanup) >= RetentionCleanupDebounce
 }
 
-// updateRetentionCleanupAnnotation sets the last cleanup timestamp
 func (r *BackupScheduleReconciler) updateRetentionCleanupAnnotation(ctx context.Context, schedule *dbtether.BackupSchedule) error {
-	// Re-fetch to get latest version (avoid conflicts)
 	var current dbtether.BackupSchedule
 	if err := r.Get(ctx, client.ObjectKeyFromObject(schedule), &current); err != nil {
 		return err
 	}
 
-	// Double-check debounce with fresh data
 	if !r.shouldRunRetentionCleanup(&current) {
 		return fmt.Errorf("debounce check failed with fresh data")
 	}
@@ -531,7 +465,6 @@ func (r *BackupScheduleReconciler) updateRetentionCleanupAnnotation(ctx context.
 	return r.Patch(ctx, &current, patch)
 }
 
-// buildStoragePath builds the S3 prefix from the path template
 func (r *BackupScheduleReconciler) buildStoragePath(
 	backupStorage *dbtether.BackupStorage,
 	cluster *dbtether.DBCluster,
@@ -539,7 +472,6 @@ func (r *BackupScheduleReconciler) buildStoragePath(
 ) (string, error) {
 	pathTemplate := backupStorage.Spec.PathTemplate
 	if pathTemplate == "" {
-		// Default: ClusterName/DatabaseName
 		return fmt.Sprintf("%s/%s", cluster.Name, db.Status.DatabaseName), nil
 	}
 
@@ -563,12 +495,8 @@ func (r *BackupScheduleReconciler) buildStoragePath(
 
 func (r *BackupScheduleReconciler) handleDeletion(ctx context.Context, schedule *dbtether.BackupSchedule) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(schedule, scheduleFinalizerName) {
-		// Cleanup: delete all Backup CRDs created by this schedule
 		var backups dbtether.BackupList
-		if err := r.List(ctx, &backups,
-			client.InNamespace(schedule.Namespace),
-			client.MatchingLabels{LabelScheduleName: schedule.Name},
-		); err != nil {
+		if err := r.List(ctx, &backups, client.InNamespace(schedule.Namespace), scheduleBackupSelector(schedule)); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -608,11 +536,18 @@ func (r *BackupScheduleReconciler) updateStatusWithRequeue(
 	lastBackupTime, nextScheduledTime *metav1.Time,
 	requeueAfter time.Duration,
 ) (ctrl.Result, error) {
+	lastSuccessful, completed, err := r.completedBackupSummary(ctx, schedule)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	patch := client.MergeFrom(schedule.DeepCopy())
 
 	schedule.Status.Phase = phase
 	schedule.Status.Message = message
 	schedule.Status.ObservedGeneration = schedule.Generation
+	schedule.Status.LastSuccessfulBackup = lastSuccessful
+	schedule.Status.ManagedBackups = completed
 
 	if lastBackupTime != nil {
 		schedule.Status.LastBackupTime = lastBackupTime
@@ -629,6 +564,30 @@ func (r *BackupScheduleReconciler) updateStatusWithRequeue(
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *BackupScheduleReconciler) completedBackupSummary(ctx context.Context, schedule *dbtether.BackupSchedule) (lastSuccessful string, completed int, err error) {
+	var backups dbtether.BackupList
+	if err := r.List(ctx, &backups, client.InNamespace(schedule.Namespace), scheduleBackupSelector(schedule)); err != nil {
+		return "", 0, err
+	}
+	var latest *metav1.Time
+	for i := range backups.Items {
+		b := &backups.Items[i]
+		if b.Status.Phase != "Completed" {
+			continue
+		}
+		completed++
+		if b.Status.CompletedAt != nil && (latest == nil || b.Status.CompletedAt.After(latest.Time)) {
+			latest = b.Status.CompletedAt
+			lastSuccessful = b.Name
+		}
+	}
+	return lastSuccessful, completed, nil
+}
+
+func scheduleBackupSelector(schedule *dbtether.BackupSchedule) client.MatchingLabels {
+	return client.MatchingLabels{LabelScheduleName: boundedLabelValue(schedule.Name)}
 }
 
 func (r *BackupScheduleReconciler) SetupWithManager(mgr ctrl.Manager) error {

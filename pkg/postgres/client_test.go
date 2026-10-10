@@ -290,19 +290,19 @@ func assertTransferError(t *testing.T, err error, want []error, objects []string
 	}
 }
 
-func TestJoinAllowedPrivileges(t *testing.T) {
+func TestAllowedPrivileges(t *testing.T) {
 	tests := []struct {
 		name    string
 		input   []TablePrivilege
-		want    string
+		want    []string
 		wantErr bool
 		wantBad string
 	}{
-		{name: "single SELECT", input: []TablePrivilege{"SELECT"}, want: "SELECT"},
-		{name: "canonicalises case", input: []TablePrivilege{"select", "Insert"}, want: "SELECT, INSERT"},
-		{name: "trims whitespace", input: []TablePrivilege{" SELECT "}, want: "SELECT"},
+		{name: "single SELECT", input: []TablePrivilege{"SELECT"}, want: []string{"SELECT"}},
+		{name: "canonicalises case", input: []TablePrivilege{"select", "Insert"}, want: []string{"SELECT", "INSERT"}},
+		{name: "trims whitespace", input: []TablePrivilege{" SELECT "}, want: []string{"SELECT"}},
 		{name: "full allowlist", input: []TablePrivilege{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "USAGE"},
-			want: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, USAGE"},
+			want: []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "USAGE"}},
 		{name: "rejects SQL injection payload",
 			input: []TablePrivilege{"SELECT; CREATE ROLE evil SUPERUSER --"}, wantErr: true,
 			wantBad: "SELECT; CREATE ROLE evil SUPERUSER --"},
@@ -314,7 +314,7 @@ func TestJoinAllowedPrivileges(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := joinAllowedPrivileges(tt.input)
+			got, err := allowedPrivileges(tt.input)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got nil (result: %q)", got)
@@ -327,7 +327,7 @@ func TestJoinAllowedPrivileges(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if got != tt.want {
+			if !slices.Equal(got, tt.want) {
 				t.Fatalf("got %q, want %q", got, tt.want)
 			}
 		})
@@ -369,18 +369,12 @@ func TestIsTransientError(t *testing.T) {
 	}
 }
 
-// Concurrent cold Gets against an unreachable address (pgxpool connects lazily,
-// so no live Postgres is needed). Pointer identity of returned clients can't be
-// asserted: finding a cached-but-dead pool triggers legitimate Ping-evict-recreate.
-// What the double-checked lock prevents is racing creators discarding pools
-// without Close(), each leaking a background goroutine (see companion test).
+// Pointer identity is not asserted: a dead cached pool is legitimately evicted and recreated.
 func TestClientCache_Get_ConcurrentColdCache_NoLeakedPools(t *testing.T) {
 	cache := NewClientCache()
 	t.Cleanup(cache.Close)
 
 	config := Config{Host: "127.0.0.1", Port: 1, Username: "u", Password: "p", Database: "postgres"}
-	// Unique per run so this is a genuinely cold key - no other test's cached
-	// entry can interfere with the goroutine-count measurement below.
 	key := fmt.Sprintf("race-cluster-%d", time.Now().UnixNano())
 	const goroutines = 50
 
@@ -419,8 +413,7 @@ func TestClientCache_Get_ConcurrentColdCache_NoLeakedPools(t *testing.T) {
 	}
 }
 
-// Companion to the test above: an un-Closed pgxpool leaks its background
-// health-check goroutine indefinitely; Close() is what reclaims it.
+// An un-Closed pgxpool leaks its health-check goroutine until Close().
 func TestClientCache_Get_LeaksBackgroundGoroutineUntilClose(t *testing.T) {
 	runtime.GC()
 	before := runtime.NumGoroutine()
@@ -454,9 +447,7 @@ func TestClientCache_Get_LeaksBackgroundGoroutineUntilClose(t *testing.T) {
 	}
 }
 
-// pollGoroutineCount polls runtime.NumGoroutine() until cond holds or deadline
-// elapses, returning the last observed count. Fixed sleeps flake on loaded CI
-// runners — goroutines may need longer than the sleep to start or exit.
+// Fixed sleeps flake on loaded CI runners; goroutines may need longer to start or exit.
 func pollGoroutineCount(t *testing.T, deadline time.Duration, cond func(count int) bool) int {
 	t.Helper()
 	deadlineAt := time.Now().Add(deadline)

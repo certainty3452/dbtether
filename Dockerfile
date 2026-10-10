@@ -1,29 +1,22 @@
-# Build stage
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /workspace
 
-# Copy go mod files
 COPY go.mod go.mod
 COPY go.sum go.sum
 
-# Download dependencies
 RUN go mod download
 
-# Copy source code
 COPY main.go main.go
 COPY api/ api/
 COPY controllers/ controllers/
 COPY pkg/ pkg/
 
-# Build (TARGETARCH is set by buildx for multi-platform builds)
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -a -o manager main.go
 
-# Runtime stage with pg_dump
 FROM alpine:3.23
 
-# Each Job runs the client matching its server's major version.
 RUN apk upgrade --no-cache \
     && apk add --no-cache postgresql16-client postgresql17-client postgresql18-client \
     && rm -rf /var/cache/apk/*
@@ -32,7 +25,6 @@ WORKDIR /
 
 COPY --from=builder /workspace/manager .
 
-# Run as non-root
 RUN adduser -D -u 65532 nonroot
 USER 65532:65532
 

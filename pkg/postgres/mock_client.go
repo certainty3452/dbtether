@@ -6,7 +6,6 @@ import (
 	"sync"
 )
 
-// MockClient implements ClientInterface for testing
 type MockClient struct {
 	mu         sync.RWMutex
 	databases  map[string]bool
@@ -116,15 +115,13 @@ func (m *MockClient) EnsureDatabaseWithOwner(ctx context.Context, name, ownerNam
 
 	expectedOwner := ownerNamespace + "/" + ownerName
 
-	// Force adopt or no owner — claim it
 	if currentOwner == "" || forceAdopt {
 		m.mu.Lock()
 		m.dbOwners[name] = expectedOwner
 		m.mu.Unlock()
-		return true, nil // mock always succeeds at tracking
+		return true, nil
 	}
 
-	// Check if we are the owner
 	if currentOwner != expectedOwner {
 		return false, fmt.Errorf("database %s is owned by %s, cannot be claimed by %s (use annotation dbtether.io/force-adopt to override)",
 			name, currentOwner, expectedOwner)
@@ -352,26 +349,24 @@ func (m *MockClient) SyncDatabaseAccess(ctx context.Context, username string, al
 	if m.ShouldFail {
 		return m.FailError
 	}
-	// Get current access
 	currentAccess, err := m.GetUserDatabaseAccess(ctx, username)
 	if err != nil {
 		return err
 	}
 
-	// Build allowed set
 	allowed := make(map[string]bool, len(allowedDatabases))
 	for _, db := range allowedDatabases {
 		allowed[db] = true
 	}
 
-	// Revoke access to databases NOT in allowed list
 	for _, db := range currentAccess {
 		if !allowed[db] {
-			_ = m.RevokeDatabaseAccess(ctx, username, db)
+			if err := m.RevokeDatabaseAccess(ctx, username, db); err != nil {
+				return err
+			}
 		}
 	}
 
-	// Grant access to allowed databases
 	for _, db := range allowedDatabases {
 		if err := m.GrantDatabaseAccess(ctx, username, db); err != nil {
 			return err
@@ -381,9 +376,12 @@ func (m *MockClient) SyncDatabaseAccess(ctx context.Context, username string, al
 	return nil
 }
 
-func (m *MockClient) ApplyPrivileges(ctx context.Context, username, database, preset string, additionalGrants []TableGrant) error {
+func (m *MockClient) ApplyPrivileges(ctx context.Context, username, database, preset, ownerRole string, additionalGrants []TableGrant) error {
 	if m.ShouldFail {
 		return m.FailError
+	}
+	if _, ok := privilegePresets[preset]; !ok {
+		return fmt.Errorf("unknown privileges preset %q", preset)
 	}
 	return nil
 }
@@ -420,12 +418,8 @@ func (m *MockClient) ReassignOwnership(ctx context.Context, fromUser, database s
 	if m.ShouldFail {
 		return m.FailError
 	}
-	// Mock implementation: just succeed
-	// In real implementation, this transfers object ownership back to master
 	return nil
 }
-
-// Helper methods for tests
 
 func (m *MockClient) AddDatabase(name string) {
 	m.mu.Lock()
@@ -464,7 +458,6 @@ func (m *MockClient) LookupRoleParameter(username string, key RoleParam) (string
 	return v, ok
 }
 
-// MockClientCache implements ClientCacheInterface for testing
 type MockClientCache struct {
 	mu          sync.RWMutex
 	clients     map[string]*MockClient
@@ -504,8 +497,6 @@ func (m *MockClientCache) SetClient(clusterName string, client *MockClient) {
 	m.clients[clusterName] = client
 }
 
-// Ensure MockClientCache implements ClientCacheInterface
 var _ ClientCacheInterface = (*MockClientCache)(nil)
 
-// Ensure MockClient implements ClientInterface
 var _ ClientInterface = (*MockClient)(nil)

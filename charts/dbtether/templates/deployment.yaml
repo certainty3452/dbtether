@@ -40,13 +40,17 @@ spec:
             {{- if .Values.leaderElection.enabled }}
             - --leader-elect
             {{- end }}
-            - --metrics-bind-address=:{{ .Values.metrics.port }}
+            - --metrics-bind-address={{ if .Values.metrics.enabled }}:{{ .Values.metrics.port }}{{ else }}0{{ end }}
+            - --zap-log-level={{ .Values.logging.level }}
+            - --zap-encoder={{ .Values.logging.format }}
             - --health-probe-bind-address=:{{ .Values.health.port }}
             - --namespace={{ .Release.Namespace }}
           ports:
+            {{- if .Values.metrics.enabled }}
             - name: metrics
               containerPort: {{ .Values.metrics.port }}
               protocol: TCP
+            {{- end }}
             - name: health
               containerPort: {{ .Values.health.port }}
               protocol: TCP
@@ -65,6 +69,10 @@ spec:
           env:
             - name: OPERATOR_IMAGE
               value: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+            - name: OPERATOR_SERVICE_ACCOUNT
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.serviceAccountName
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

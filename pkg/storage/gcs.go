@@ -11,30 +11,22 @@ import (
 	"google.golang.org/api/iterator"
 )
 
-// GCSClient provides Google Cloud Storage operations
 type GCSClient struct {
 	client *gcs.Client
 	bucket string
 	logger *slog.Logger
 }
 
-// GCSConfig contains configuration for GCS client
 type GCSConfig struct {
 	Bucket  string
 	Project string
-	// Credentials via GOOGLE_APPLICATION_CREDENTIALS env var or Workload Identity
 }
 
-// NewGCSClient creates a new GCS client
 func NewGCSClient(ctx context.Context, cfg *GCSConfig, logger *slog.Logger) (*GCSClient, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	// Uses Application Default Credentials (ADC):
-	// - Workload Identity on GKE
-	// - GOOGLE_APPLICATION_CREDENTIALS env var
-	// - gcloud auth application-default login (local dev)
 	client, err := gcs.NewClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GCS client: %w", err)
@@ -47,7 +39,6 @@ func NewGCSClient(ctx context.Context, cfg *GCSConfig, logger *slog.Logger) (*GC
 	}, nil
 }
 
-// Upload uploads data to GCS
 func (c *GCSClient) Upload(ctx context.Context, key string, data io.Reader) error {
 	wc := c.client.Bucket(c.bucket).Object(key).NewWriter(ctx)
 	if _, err := io.Copy(wc, data); err != nil {
@@ -59,11 +50,9 @@ func (c *GCSClient) Upload(ctx context.Context, key string, data io.Reader) erro
 	return nil
 }
 
-// UploadWithTags uploads data with metadata labels
 func (c *GCSClient) UploadWithTags(ctx context.Context, key string, data io.Reader, tags *ObjectTags) error {
 	wc := c.client.Bucket(c.bucket).Object(key).NewWriter(ctx)
 
-	// Set metadata (GCS equivalent of tags)
 	if tags != nil {
 		wc.Metadata = map[string]string{
 			"database":    tags.Database,
@@ -84,7 +73,6 @@ func (c *GCSClient) UploadWithTags(ctx context.Context, key string, data io.Read
 	return nil
 }
 
-// Download downloads data from GCS
 func (c *GCSClient) Download(ctx context.Context, key string) (io.ReadCloser, error) {
 	rc, err := c.client.Bucket(c.bucket).Object(key).NewReader(ctx)
 	if err != nil {
@@ -104,7 +92,6 @@ func (c *GCSClient) Exists(ctx context.Context, key string) (bool, error) {
 	return true, nil
 }
 
-// Delete deletes an object from GCS
 func (c *GCSClient) Delete(ctx context.Context, key string) error {
 	if err := c.client.Bucket(c.bucket).Object(key).Delete(ctx); err != nil {
 		return fmt.Errorf("failed to delete from GCS: %w", err)
@@ -112,9 +99,7 @@ func (c *GCSClient) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// Reachable verifies bucket existence and access via Bucket.Attrs.
-// Returns ErrBucketNotExist for missing bucket; other errors are auth /
-// network / permission failures and should be surfaced verbatim.
+// Missing bucket gets a dedicated error; other failures are auth/network and surface verbatim.
 func (c *GCSClient) Reachable(ctx context.Context) error {
 	_, err := c.client.Bucket(c.bucket).Attrs(ctx)
 	if err != nil {
@@ -126,7 +111,6 @@ func (c *GCSClient) Reachable(ctx context.Context) error {
 	return nil
 }
 
-// List lists all objects with the given prefix
 func (c *GCSClient) List(ctx context.Context, prefix string) ([]StorageObject, error) {
 	var objects []StorageObject
 
@@ -150,7 +134,6 @@ func (c *GCSClient) List(ctx context.Context, prefix string) ([]StorageObject, e
 	return objects, nil
 }
 
-// Close closes the GCS client
 func (c *GCSClient) Close() error {
 	return c.client.Close()
 }

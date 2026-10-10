@@ -64,6 +64,13 @@ func listBackupJobs(t *testing.T, r *BackupReconciler) []batchv1.Job {
 
 func succeedJob(t *testing.T, r *BackupReconciler, job *batchv1.Job) {
 	t.Helper()
+	backup := &databasesv1alpha1.Backup{ObjectMeta: metav1.ObjectMeta{
+		Name: job.Labels[LabelBackupName], Namespace: job.Labels[LabelBackupNamespace],
+	}}
+	recorded := client.RawPatch(types.MergePatchType, []byte(`{"status":{"path":"`+job.Name+`.sql.gz"}}`))
+	if err := r.Status().Patch(context.Background(), backup, recorded); err != nil {
+		t.Fatalf(errUnexpectedError, err)
+	}
 	job.Status.Succeeded = 1
 	if err := r.Status().Update(context.Background(), job); err != nil {
 		t.Fatalf(errUnexpectedError, err)
@@ -137,6 +144,7 @@ func TestBackupReconciler_TriggerChangeStartsNewRun(t *testing.T) {
 	firstJobName := listBackupJobs(t, r)[0].Name
 
 	completed := getBackup(t, r, req)
+	firstRunID := completed.Status.RunID
 	retriggerBackup(t, r, &completed, "v2", 2)
 	reconcileOnce(t, r, req)
 
@@ -147,6 +155,9 @@ func TestBackupReconciler_TriggerChangeStartsNewRun(t *testing.T) {
 	updated := getBackup(t, r, req)
 	if updated.Status.JobName == firstJobName {
 		t.Errorf("expected a new job name, still %s", firstJobName)
+	}
+	if updated.Status.RunID == "" || updated.Status.RunID == firstRunID {
+		t.Errorf("expected a fresh RunID, got %q (first run %q)", updated.Status.RunID, firstRunID)
 	}
 	if updated.Status.Phase != "Running" {
 		t.Errorf(errExpectedPhase, "Running", updated.Status.Phase)
@@ -278,93 +289,49 @@ func TestBackupReconciler_LostJobKeepsRunStartStamps(t *testing.T) {
 	}
 }
 
-func TestBackupReconciler_AdoptsUnlabeledActiveJob(t *testing.T) {
-	backup := newTestBackup(testBackupName, testNamespace)
-	backup.Finalizers = []string{backupFinalizer}
-	backup.Generation = 1
-
-	orphan := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "backup-test-backup-orphan01",
-			Namespace: testOperatorNS,
-			Labels: map[string]string{
-				LabelBackupName:      testBackupName,
-				LabelBackupNamespace: testNamespace,
-			},
-		},
+func TestBackupReconciler_ActiveJobNotNamedInStatusIsNotAdopted(t *testing.T) {
+	orphans := map[string][]corev1.EnvVar{
+		"without RUN_ID": nil,
+		"with RUN_ID":    {{Name: "RUN_ID", Value: "orphanid1"}},
 	}
-
-	r := newTestReconciler(
-		backup,
-		newTestDatabase(testDBName, testNamespace, testClusterName),
-		newTestCluster(testClusterName),
-		newTestStorage(testStorageName),
-		newTestSecret(testSecretName, testOperatorNS),
-		orphan,
-	)
-	req := rerunRequest()
-
-	reconcileOnce(t, r, req)
-
-	if jobs := listBackupJobs(t, r); len(jobs) != 1 {
-		t.Fatalf("expected the active job to be adopted, got %d jobs", len(jobs))
-	}
-
-	adopted := getBackup(t, r, req)
-	if adopted.Status.JobName != orphan.Name {
-		t.Errorf("expected job %s to be adopted, got %s", orphan.Name, adopted.Status.JobName)
-	}
-	if adopted.Status.Phase != "Running" {
-		t.Errorf(errExpectedPhase, "Running", adopted.Status.Phase)
-	}
-	if adopted.Status.RunID != "" {
-		t.Errorf("expected empty RunID for a Job without RUN_ID, got %q", adopted.Status.RunID)
-	}
-	if adopted.Status.ObservedGeneration != adopted.Generation {
-		t.Errorf("expected observedGeneration %d, got %d", adopted.Generation, adopted.Status.ObservedGeneration)
-	}
-}
-
-func TestBackupReconciler_AdoptsActiveJobWithRunID(t *testing.T) {
-	backup := newTestBackup(testBackupName, testNamespace)
-	backup.Finalizers = []string{backupFinalizer}
-	backup.Generation = 1
-
-	orphan := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "backup-test-backup-orphan02",
-			Namespace: testOperatorNS,
-			Labels: map[string]string{
-				LabelBackupName:      testBackupName,
-				LabelBackupNamespace: testNamespace,
-			},
-		},
-		Spec: batchv1.JobSpec{
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{Name: "backup", Env: []corev1.EnvVar{{Name: "RUN_ID", Value: "orphanid1"}}},
-					},
+	for name, env := range orphans {
+		t.Run(name, func(t *testing.T) {
+			backup := newTestBackup(testBackupName, testNamespace)
+			backup.Finalizers = []string{backupFinalizer}
+			backup.Generation = 1
+			orphan := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "backup-test-backup-orphanid1",
+					Namespace: testOperatorNS,
+					Labels:    map[string]string{LabelBackupName: testBackupName, LabelBackupNamespace: testNamespace},
 				},
-			},
-		},
-	}
+				Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "backup", Env: env}},
+				}}},
+				Status: batchv1.JobStatus{Active: 1},
+			}
+			r := newRerunReconciler(backup)
+			if err := r.Create(context.Background(), orphan); err != nil {
+				t.Fatalf(errUnexpectedError, err)
+			}
+			req := rerunRequest()
 
-	r := newTestReconciler(
-		backup,
-		newTestDatabase(testDBName, testNamespace, testClusterName),
-		newTestCluster(testClusterName),
-		newTestStorage(testStorageName),
-		newTestSecret(testSecretName, testOperatorNS),
-		orphan,
-	)
-	req := rerunRequest()
+			reconcileOnce(t, r, req)
 
-	reconcileOnce(t, r, req)
-
-	adopted := getBackup(t, r, req)
-	if adopted.Status.RunID != "orphanid1" {
-		t.Errorf("expected RunID from the Job's RUN_ID env, got %q", adopted.Status.RunID)
+			run := getBackup(t, r, req)
+			if run.Status.JobName == orphan.Name || run.Status.RunID == "orphanid1" {
+				t.Errorf("a Job the status never named was adopted: jobName %q runId %q", run.Status.JobName, run.Status.RunID)
+			}
+			if run.Status.JobName != backupJobName(testBackupName, run.Status.RunID) {
+				t.Errorf("expected the run's own Job name, got %q for run %q", run.Status.JobName, run.Status.RunID)
+			}
+			if run.Status.Phase != "Running" || run.Status.ObservedGeneration != run.Generation {
+				t.Errorf("expected Running at generation %d, got %q at %d", run.Generation, run.Status.Phase, run.Status.ObservedGeneration)
+			}
+			if jobs := listBackupJobs(t, r); len(jobs) != 2 {
+				t.Errorf("expected the run's own Job next to the orphan, got %d jobs", len(jobs))
+			}
+		})
 	}
 }
 
@@ -374,7 +341,6 @@ func TestBackupReconciler_FinishedJobWithCurrentHashNotAdopted(t *testing.T) {
 	backup.Generation = 2
 	backup.Spec.Trigger = "v2"
 
-	currentHash := (&BackupReconciler{}).computeSpecHash(backup)
 	backup.Status.Phase = "Completed"
 	backup.Status.SpecHash = "stale-older-hash"
 	backup.Status.ObservedGeneration = 1
@@ -387,7 +353,7 @@ func TestBackupReconciler_FinishedJobWithCurrentHashNotAdopted(t *testing.T) {
 				LabelBackupName:      testBackupName,
 				LabelBackupNamespace: testNamespace,
 				LabelCluster:         testClusterName,
-				LabelSpecHash:        currentHash,
+				LabelRunID:           "finished1",
 			},
 		},
 		Status: batchv1.JobStatus{Succeeded: 1},
@@ -480,11 +446,15 @@ func completeBackupRunWithPath(t *testing.T, r *BackupReconciler, req reconcile.
 	if len(jobs) != 1 {
 		t.Fatalf(errExpectedOneJob, len(jobs))
 	}
-	job := &jobs[0]
-	job.Annotations = map[string]string{annotationBackupPath: path}
-	if err := r.Update(context.Background(), job); err != nil {
+	var backup databasesv1alpha1.Backup
+	if err := r.Get(context.Background(), req.NamespacedName, &backup); err != nil {
 		t.Fatalf(errUnexpectedError, err)
 	}
+	backup.Status.Path = path
+	if err := r.Status().Update(context.Background(), &backup); err != nil {
+		t.Fatalf(errUnexpectedError, err)
+	}
+	job := &jobs[0]
 	job.Status.Succeeded = 1
 	if err := r.Status().Update(context.Background(), job); err != nil {
 		t.Fatalf(errUnexpectedError, err)
@@ -501,7 +471,6 @@ func listBackupOwnedJobs(t *testing.T, r *BackupReconciler, name string) []batch
 	return jobs.Items
 }
 
-// saturateClusterThrottle creates unlabeled Jobs on testClusterName so the next reconcile throttles.
 func saturateClusterThrottle(t *testing.T, r *BackupReconciler) {
 	t.Helper()
 	for i := 0; i < DefaultMaxConcurrentJobsPerCluster; i++ {
@@ -519,7 +488,6 @@ func saturateClusterThrottle(t *testing.T, r *BackupReconciler) {
 	}
 }
 
-// clearClusterThrottle deletes only the synthetic blockers, leaving the backup's own Jobs alone.
 func clearClusterThrottle(t *testing.T, r *BackupReconciler) {
 	t.Helper()
 	var jobs batchv1.JobList
@@ -553,8 +521,6 @@ func assertPendingWithNewHash(t *testing.T, backup *databasesv1alpha1.Backup, ol
 	}
 }
 
-// TestBackupReconciler_MarkPending_Throttled covers marking a re-triggered, throttled backup Pending,
-// with either a stale finished Job from the previous run still around, or none at all.
 func TestBackupReconciler_MarkPending_Throttled(t *testing.T) {
 	tests := []struct {
 		name              string
@@ -706,8 +672,8 @@ func TestBackupReconciler_ControllerLabelsWinOverUserLabels(t *testing.T) {
 	backup.Finalizers = []string{backupFinalizer}
 
 	r := newRerunReconciler(backup)
-	r.JobLabels = map[string]string{LabelSpecHash: "user-override"}
-	r.PodLabels = map[string]string{LabelSpecHash: "user-override"}
+	r.JobLabels = map[string]string{LabelRunID: "user-override"}
+	r.PodLabels = map[string]string{LabelRunID: "user-override"}
 	req := rerunRequest()
 
 	reconcileOnce(t, r, req)
@@ -717,16 +683,15 @@ func TestBackupReconciler_ControllerLabelsWinOverUserLabels(t *testing.T) {
 		t.Fatalf(errExpectedOneJob, len(jobs))
 	}
 	job := jobs[0]
-	expectedHash := (&BackupReconciler{}).computeSpecHash(backup)
-	if job.Labels[LabelSpecHash] != expectedHash {
-		t.Errorf("expected controller-owned Job spec-hash label %q, got %q", expectedHash, job.Labels[LabelSpecHash])
+	runID := getBackup(t, r, req).Status.RunID
+	if runID == "" || job.Labels[LabelRunID] != runID {
+		t.Errorf("expected controller-owned Job run-id label %q, got %q", runID, job.Labels[LabelRunID])
 	}
-	if job.Spec.Template.Labels[LabelSpecHash] != expectedHash {
-		t.Errorf("expected controller-owned pod spec-hash label %q, got %q", expectedHash, job.Spec.Template.Labels[LabelSpecHash])
+	if job.Spec.Template.Labels[LabelRunID] != runID {
+		t.Errorf("expected controller-owned pod run-id label %q, got %q", runID, job.Spec.Template.Labels[LabelRunID])
 	}
 }
 
-// failBackupJob marks a Job Failed via the JobFailed condition, the same signal evaluateJobStatus reads.
 func failBackupJob(t *testing.T, r *BackupReconciler, job *batchv1.Job) {
 	t.Helper()
 	job.Status.Failed = 3
@@ -754,9 +719,6 @@ func completeActiveRun(t *testing.T, r *BackupReconciler, req reconcile.Request)
 	reconcileOnce(t, r, req)
 }
 
-// TestBackupReconciler_JobResolvedUnderChangedSpecRequeues covers a run whose spec changed while its Job was
-// still in flight, for each way that Job's outcome can resolve: it completes, it fails with structured info,
-// or it is lost outright. All three must still requeue immediately to pick up the new spec.
 func TestBackupReconciler_JobResolvedUnderChangedSpecRequeues(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -825,11 +787,8 @@ func TestBackupReconciler_JobResolvedUnderChangedSpecRequeues(t *testing.T) {
 	}
 }
 
-// jobCreateHook matches interceptor.Funcs.Create, letting tests script how the fake client's Job Create behaves.
 type jobCreateHook func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error
 
-// newJobCreateInterceptReconciler builds a reconciler around a fake client whose Job Create calls are routed
-// through createHook, plus a recorder tests can assert on if they need to.
 func newJobCreateInterceptReconciler(backup *databasesv1alpha1.Backup, createHook jobCreateHook) (*BackupReconciler, *record.FakeRecorder) {
 	scheme := newTestScheme()
 	recorder := record.NewFakeRecorder(10)
@@ -841,7 +800,7 @@ func newJobCreateInterceptReconciler(backup *databasesv1alpha1.Backup, createHoo
 		WithInterceptorFuncs(interceptor.Funcs{Create: createHook}).
 		Build()
 
-	return &BackupReconciler{Client: fakeClient, Scheme: scheme, Namespace: testOperatorNS, Image: testImage, Recorder: recorder}, recorder
+	return &BackupReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: testOperatorNS, Image: testImage, Recorder: recorder}, recorder
 }
 
 func TestBackupReconciler_JobCreationInvalid_TerminalFailure(t *testing.T) {
@@ -906,65 +865,37 @@ func TestBackupReconciler_JobCreationInvalid_TerminalFailure(t *testing.T) {
 	}
 }
 
-// AlreadyExists defers to the next reconcile's adoption instead of writing status.
-func TestBackupReconciler_JobCreationAlreadyExists_RequeuesWithoutStatusChange(t *testing.T) {
+// The Job name is derived from the reserved RunID, so a Job already under that name is this run's own.
+func TestBackupReconciler_JobCreationAlreadyExists_ContinuesWithReservedJob(t *testing.T) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 
-	alreadyExistsErr := apierrors.NewAlreadyExists(schema.GroupResource{Group: "batch", Resource: "jobs"}, "backup-test-backup")
-	var concurrentJobName string
+	creates := 0
 	r, _ := newJobCreateInterceptReconciler(backup, func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-		job, ok := obj.(*batchv1.Job)
-		if !ok {
+		if _, ok := obj.(*batchv1.Job); !ok {
 			return c.Create(ctx, obj, opts...)
 		}
-		// A concurrent reconcile's Job lands in the store (with the labels this reconcile would
-		// have used) while this reconcile's own Create observes AlreadyExists.
-		concurrent := &batchv1.Job{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "backup-test-backup-concurrent1",
-				Namespace: job.Namespace,
-				Labels:    job.Labels,
-			},
-		}
-		if err := c.Create(ctx, concurrent); err != nil {
+		creates++
+		if err := c.Create(ctx, obj.DeepCopyObject().(client.Object), opts...); err != nil {
 			return err
 		}
-		concurrentJobName = concurrent.Name
-		return alreadyExistsErr
+		return apierrors.NewAlreadyExists(schema.GroupResource{Group: "batch", Resource: "jobs"}, obj.GetName())
 	})
 	req := rerunRequest()
 
-	before := getBackup(t, r, req)
-
-	result, err := r.Reconcile(context.Background(), req)
-	if err != nil {
-		t.Fatalf(errUnexpectedError, err)
-	}
-	if result.RequeueAfter != rerunRequeueDelay {
-		t.Errorf("expected RequeueAfter=%v, got %v", rerunRequeueDelay, result.RequeueAfter)
-	}
-
-	after := getBackup(t, r, req)
-	if after.ResourceVersion != before.ResourceVersion {
-		t.Errorf("expected no status patch, resourceVersion moved %s -> %s", before.ResourceVersion, after.ResourceVersion)
-	}
-	if after.Status.Phase != "" {
-		t.Errorf("expected no status change, got phase %q", after.Status.Phase)
-	}
-
-	// The requeued reconcile finds the concurrent Job by label and adopts it instead of retrying Create.
+	reconcileOnce(t, r, req)
 	reconcileOnce(t, r, req)
 
-	adopted := getBackup(t, r, req)
-	if adopted.Status.JobName != concurrentJobName {
-		t.Errorf("expected the concurrent Job to be adopted, got jobName %q", adopted.Status.JobName)
+	run := getBackup(t, r, req)
+	if run.Status.Phase != "Running" {
+		t.Errorf(errExpectedPhase, "Running", run.Status.Phase)
 	}
-	if adopted.Status.Phase != "Running" {
-		t.Errorf(errExpectedPhase, "Running", adopted.Status.Phase)
+	jobs := listBackupJobs(t, r)
+	if len(jobs) != 1 || jobs[0].Name != run.Status.JobName {
+		t.Fatalf("expected exactly the reserved Job %q, got %d jobs", run.Status.JobName, len(jobs))
 	}
-	if jobs := listBackupJobs(t, r); len(jobs) != 1 {
-		t.Errorf("expected exactly 1 Job, got %d", len(jobs))
+	if creates != 1 {
+		t.Errorf("expected one create attempt, got %d", creates)
 	}
 }
 
@@ -991,6 +922,9 @@ func TestBackupReconciler_JobCreationErrorThenRecovers(t *testing.T) {
 	if pending.Status.Phase != "Pending" {
 		t.Fatalf(errExpectedPhase, "Pending", pending.Status.Phase)
 	}
+	if pending.Status.RunID == "" || pending.Status.StartedAt != nil {
+		t.Fatalf("expected the reservation kept without evidence of a Job, got %+v", pending.Status)
+	}
 
 	reconcileOnce(t, r, req)
 
@@ -1000,6 +934,13 @@ func TestBackupReconciler_JobCreationErrorThenRecovers(t *testing.T) {
 	}
 	if attempts != 2 {
 		t.Errorf("expected 2 job create attempts, got %d", attempts)
+	}
+	if running.Status.RunID != pending.Status.RunID {
+		t.Errorf("expected the reserved run %q to be retried, got %q", pending.Status.RunID, running.Status.RunID)
+	}
+	jobs := listBackupJobs(t, r)
+	if len(jobs) != 1 || jobs[0].Name != pending.Status.JobName {
+		t.Errorf("expected exactly the reserved Job %q, got %d jobs", pending.Status.JobName, len(jobs))
 	}
 }
 
@@ -1151,5 +1092,54 @@ func TestBackupReconciler_TriggerCycleReRunsWithSameHash(t *testing.T) {
 	}
 	if len(names) != 3 {
 		t.Errorf("expected 3 distinct job names, got %d", len(names))
+	}
+}
+
+// v1 -> v2 -> v1 with a Pending pass in between returns to v1's spec hash while v1's Job still lives until its TTL.
+func TestBackupReconciler_TriggerCycleThroughPendingTakesFreshBackup(t *testing.T) {
+	backup := newTestBackup(testBackupName, testNamespace)
+	backup.Finalizers = []string{backupFinalizer}
+	backup.Spec.Trigger = "v1"
+	backup.Generation = 1
+	r := newRerunReconciler(backup)
+	req := rerunRequest()
+	completeBackupRunWithPath(t, r, req, "c/app/first.sql.gz")
+	cur := getBackup(t, r, req)
+	firstJob := cur.Status.JobName
+
+	retriggerBackup(t, r, &cur, "v2", 2)
+	reconcileOnce(t, r, req)
+	completeActiveRun(t, r, req)
+	cur = getBackup(t, r, req)
+	if cur.Status.Phase != "Completed" {
+		t.Fatalf(errExpectedPhase, "Completed", cur.Status.Phase)
+	}
+
+	storage := &databasesv1alpha1.BackupStorage{ObjectMeta: metav1.ObjectMeta{Name: testStorageName}}
+	if err := r.Delete(context.Background(), storage); err != nil {
+		t.Fatalf(errUnexpectedError, err)
+	}
+	retriggerBackup(t, r, &cur, "v1", 3)
+	reconcileOnce(t, r, req)
+	if phase := getBackup(t, r, req).Status.Phase; phase != "Pending" {
+		t.Fatalf(errExpectedPhase, "Pending", phase)
+	}
+	if err := r.Create(context.Background(), newTestStorage(testStorageName)); err != nil {
+		t.Fatalf(errUnexpectedError, err)
+	}
+	reconcileOnce(t, r, req)
+
+	rerun := getBackup(t, r, req)
+	if rerun.Status.Phase != "Running" || rerun.Status.JobName == firstJob {
+		t.Fatalf("expected a fresh run, got phase %q job %q (v1's first Job %q)", rerun.Status.Phase, rerun.Status.JobName, firstJob)
+	}
+	completeActiveRun(t, r, req)
+
+	done := getBackup(t, r, req)
+	if done.Status.Phase != "Completed" || done.Status.Path != rerun.Status.JobName+".sql.gz" {
+		t.Errorf("expected the fresh run's backup, got phase %q path %q reason %q", done.Status.Phase, done.Status.Path, done.Status.FailureReason)
+	}
+	if jobs := listBackupJobs(t, r); len(jobs) != 3 {
+		t.Errorf("expected three Jobs, one per run, got %d", len(jobs))
 	}
 }

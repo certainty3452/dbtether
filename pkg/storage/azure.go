@@ -12,33 +12,22 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 )
 
-// AzureClient provides Azure Blob Storage operations
 type AzureClient struct {
 	client    *azblob.Client
 	container string
 	logger    *slog.Logger
 }
 
-// AzureConfig contains configuration for Azure Blob Storage client
 type AzureConfig struct {
 	Container      string
 	StorageAccount string
-	// Credentials via:
-	// - Azure Managed Identity (on AKS with Workload Identity)
-	// - AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_CLIENT_SECRET env vars
-	// - Azure CLI credentials (local dev)
 }
 
-// NewAzureClient creates a new Azure Blob Storage client
 func NewAzureClient(ctx context.Context, cfg *AzureConfig, logger *slog.Logger) (*AzureClient, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	// Uses DefaultAzureCredential which tries:
-	// 1. Environment credentials (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_CLIENT_SECRET)
-	// 2. Managed Identity (on Azure VMs, AKS, etc.)
-	// 3. Azure CLI credentials
 	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get Azure credentials: %w", err)
@@ -57,12 +46,10 @@ func NewAzureClient(ctx context.Context, cfg *AzureConfig, logger *slog.Logger) 
 	}, nil
 }
 
-// Upload streams data to Azure Blob Storage.
 func (c *AzureClient) Upload(ctx context.Context, key string, data io.Reader) error {
 	return c.UploadWithTags(ctx, key, data, nil)
 }
 
-// UploadWithTags streams data with optional metadata.
 func (c *AzureClient) UploadWithTags(ctx context.Context, key string, data io.Reader, tags *ObjectTags) error {
 	opts := &azblob.UploadStreamOptions{
 		BlockSize:   8 * 1024 * 1024,
@@ -89,7 +76,6 @@ func strPtr(s string) *string {
 	return &s
 }
 
-// Download downloads data from Azure Blob Storage
 func (c *AzureClient) Download(ctx context.Context, key string) (io.ReadCloser, error) {
 	resp, err := c.client.DownloadStream(ctx, c.container, key, nil)
 	if err != nil {
@@ -110,7 +96,6 @@ func (c *AzureClient) Exists(ctx context.Context, key string) (bool, error) {
 	return true, nil
 }
 
-// Delete deletes a blob from Azure Blob Storage
 func (c *AzureClient) Delete(ctx context.Context, key string) error {
 	_, err := c.client.DeleteBlob(ctx, c.container, key, nil)
 	if err != nil {
@@ -119,9 +104,7 @@ func (c *AzureClient) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// Reachable verifies container existence and access via GetProperties.
-// One HEAD-style call against the container; surfaces ContainerNotFound,
-// AuthenticationFailed, AuthorizationFailure, etc. verbatim.
+// Container errors (not found, auth) surface verbatim.
 func (c *AzureClient) Reachable(ctx context.Context) error {
 	containerClient := c.client.ServiceClient().NewContainerClient(c.container)
 	_, err := containerClient.GetProperties(ctx, nil)
@@ -134,7 +117,6 @@ func (c *AzureClient) Reachable(ctx context.Context) error {
 	return nil
 }
 
-// List lists all blobs with the given prefix
 func (c *AzureClient) List(ctx context.Context, prefix string) ([]StorageObject, error) {
 	var objects []StorageObject
 

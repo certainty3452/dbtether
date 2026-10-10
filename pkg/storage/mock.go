@@ -9,12 +9,10 @@ import (
 	"time"
 )
 
-// MockClient is an in-memory storage client for testing
 type MockClient struct {
 	mu      sync.RWMutex
 	objects map[string]*mockObject
 
-	// Error injection for testing error handling
 	UploadError    error
 	DownloadError  error
 	DeleteError    error
@@ -29,7 +27,6 @@ type mockObject struct {
 	lastModified time.Time
 }
 
-// NewMockClient creates a new in-memory mock storage client
 func NewMockClient() *MockClient {
 	return &MockClient{
 		objects: make(map[string]*mockObject),
@@ -128,9 +125,6 @@ func (m *MockClient) Reachable(ctx context.Context) error {
 	return m.ReachableError
 }
 
-// Helper methods for testing
-
-// AddObject adds an object directly to the mock storage
 func (m *MockClient) AddObject(key string, data []byte, lastModified time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -141,7 +135,6 @@ func (m *MockClient) AddObject(key string, data []byte, lastModified time.Time) 
 	}
 }
 
-// GetObject returns the raw data for a key (for test assertions)
 func (m *MockClient) GetObject(key string) ([]byte, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -153,7 +146,6 @@ func (m *MockClient) GetObject(key string) ([]byte, bool) {
 	return obj.data, true
 }
 
-// GetTags returns the tags for a key (for test assertions)
 func (m *MockClient) GetTags(key string) (*ObjectTags, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -165,7 +157,6 @@ func (m *MockClient) GetTags(key string) (*ObjectTags, bool) {
 	return obj.tags, true
 }
 
-// Count returns the number of objects in the mock storage
 func (m *MockClient) Count() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -173,7 +164,6 @@ func (m *MockClient) Count() int {
 	return len(m.objects)
 }
 
-// Clear removes all objects from the mock storage
 func (m *MockClient) Clear() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -181,7 +171,6 @@ func (m *MockClient) Clear() {
 	m.objects = make(map[string]*mockObject)
 }
 
-// Keys returns all keys in the mock storage
 func (m *MockClient) Keys() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -193,5 +182,4 @@ func (m *MockClient) Keys() []string {
 	return keys
 }
 
-// Verify MockClient implements StorageClient
 var _ StorageClient = (*MockClient)(nil)

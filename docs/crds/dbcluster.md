@@ -1,13 +1,10 @@
 # DBCluster
 
-Represents an external PostgreSQL cluster (Aurora, RDS, self-hosted).
+A connection to an external PostgreSQL server (Aurora, RDS, self-hosted). Cluster-scoped; short name `dbc`. Every Database and DatabaseUser points at one.
 
-**API Version:** `dbtether.io/v1alpha1`  
-**Kind:** `DBCluster`  
-**Scope:** Cluster (not namespaced)  
-**Short name:** `dbc`
+## Examples
 
-## Example
+Minimal:
 
 ```yaml
 apiVersion: dbtether.io/v1alpha1
@@ -16,6 +13,29 @@ metadata:
   name: my-cluster
 spec:
   endpoint: my-cluster.xxx.rds.amazonaws.com
+  credentialsSecretRef:
+    name: my-credentials
+    namespace: dbtether
+```
+
+With the Secret and an explicit port:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-credentials
+  namespace: dbtether
+stringData:
+  username: postgres_admin
+  password: super-secret
+---
+apiVersion: dbtether.io/v1alpha1
+kind: DBCluster
+metadata:
+  name: production
+spec:
+  endpoint: production.cluster-xxx.eu-central-1.rds.amazonaws.com
   port: 5432
   credentialsSecretRef:
     name: my-credentials
@@ -24,115 +44,52 @@ spec:
 
 ## Spec
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `endpoint` | string | ✅ | — | PostgreSQL cluster hostname (without port) |
-| `port` | int | ❌ | `5432` | PostgreSQL port (1-65535) |
-| `credentialsSecretRef` | object | ❌* | — | Reference to K8s Secret with credentials; `name` and `namespace` are both required |
-| `credentialsFromEnv` | object | ❌* | — | Names of ENV variables holding the credentials; `username` and `password` are both required |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `endpoint` | string | required | Server hostname, without port |
+| `port` | int | `5432` | 1-65535 |
+| `credentialsSecretRef.name` | string | | Secret with keys `username` and `password` (name and namespace both required) |
+| `credentialsSecretRef.namespace` | string | | Namespace of that Secret |
+| `credentialsFromEnv.username` | string | | Name of an operator-pod env var holding the username |
+| `credentialsFromEnv.password` | string | | Name of an operator-pod env var holding the password |
 
-\* At least one must be set. If both are, `credentialsFromEnv` wins and the operator logs that it ignored the Secret.
-
-## Credentials
-
-The Secret must carry two keys:
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: my-credentials
-  namespace: dbtether
-type: Opaque
-stringData:
-  username: postgres_admin
-  password: super-secret
-```
-
-The role needs `CREATEDB` to create databases — on Aurora/RDS this is normally the master user. Databases it creates are owned by it, which is what lets the operator write its ownership marker and revoke PUBLIC access.
-
-### credentialsFromEnv
-
-`credentialsFromEnv` names environment variables that the operator reads from its own pod — useful when External Secrets, a Vault Agent sidecar, or a CSI driver injects credentials as ENV rather than into a Secret the operator can read.
-
-```yaml
-spec:
-  endpoint: my-cluster.xxx.rds.amazonaws.com
-  credentialsFromEnv:
-    username: MY_CLUSTER_USERNAME  # ENV variable name, not the value
-    password: MY_CLUSTER_PASSWORD
-```
-
-Set the variables through Helm:
-
-```yaml
-extraEnv:
-  - name: MY_CLUSTER_USERNAME
-    valueFrom:
-      secretKeyRef:
-        name: external-secret
-        key: username
-  - name: MY_CLUSTER_PASSWORD
-    valueFrom:
-      secretKeyRef:
-        name: external-secret
-        key: password
-```
-
-**It only covers this resource's own health check.** Database, DatabaseUser, Backup and Restore all read `credentialsSecretRef` directly, so a cluster with `credentialsFromEnv` alone reports `Connected` while everything pointing at it fails. Set `credentialsSecretRef` if the cluster hosts anything.
+Set at least one credentials source. If both are set, `credentialsFromEnv` wins.
 
 ## Status
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `phase` | enum | `Pending`, `Connected`, or `Failed` |
-| `message` | string | Detailed status message |
-| `postgresVersion` | string | `SELECT version()` output, e.g. `PostgreSQL 16.11 on x86_64-pc-linux-gnu` |
-| `lastCheckTime` | timestamp | Time of last connection check |
-| `observedGeneration` | int64 | Which spec version has been processed |
+| Phase | Meaning |
+|-------|---------|
+| `Pending` | Waiting for the first reconcile |
+| `Connected` | Connection works; `status.postgresVersion` is set |
+| `Failed` | See `status.message` |
 
-## Status Phases
+## Notes
 
-| Phase | Description |
-|-------|-------------|
-| `Pending` | Initial state, waiting for first reconcile |
-| `Connected` | Successfully connected to the cluster |
-| `Failed` | Connection error (wrong credentials, unreachable endpoint) |
+- The role needs `CREATEDB`; on Aurora/RDS use the master user. It must own the databases it creates, so it can revoke `PUBLIC` access and write the ownership marker.
+- `credentialsFromEnv` suits credentials injected as env vars (External Secrets, Vault Agent). Pass them with the chart's `extraEnv`:
 
-## Behavior
+  ```yaml
+  extraEnv:
+    - name: MY_CLUSTER_PASSWORD
+      valueFrom:
+        secretKeyRef: {name: external-secret, key: password}
+  ```
 
-A connected cluster is re-checked every 5 minutes; a failed one retries every 30 seconds. The operator keeps one connection pool per DBCluster and closes it when the resource is deleted or a ping fails.
+  ```yaml
+  spec:
+    credentialsFromEnv:
+      username: MY_CLUSTER_USERNAME  # variable name, not the value
+      password: MY_CLUSTER_PASSWORD
+  ```
 
-Deleting a DBCluster does not touch any database in PostgreSQL. Database resources that referenced it fall back to `Pending` with `waiting for DBCluster '<name>'`, and reach `Failed` after 10 minutes of that.
-
-## kubectl Commands
-
-```bash
-kubectl get dbc
-kubectl describe dbcluster my-cluster
-kubectl get dbc my-cluster -o jsonpath='{.status.postgresVersion}'
-```
+- Backup and Restore Jobs read only `credentialsSecretRef`, see [BackupStorage](backupstorage.md#notes).
+- A connected cluster is re-checked every 5 minutes, a failed one every 30 seconds.
+- Deleting a DBCluster does not touch PostgreSQL. Its Databases fall back to `Pending` and reach `Failed` after 10 minutes.
 
 ## Troubleshooting
 
-### Phase: Failed, message: "connection failed: ..."
-
-The operator could not open a pool. Check reachability and that the operator pod's egress (security groups, NetworkPolicies) allows the endpoint:
-
-```bash
-nc -zv my-cluster.xxx.rds.amazonaws.com 5432
-```
-
-The quoted driver error distinguishes DNS failures, timeouts and rejected passwords.
-
-### Phase: Failed, message: "ping failed: ..."
-
-The pool opened but the server did not answer. The cached client is dropped, so the next reconcile reconnects from scratch. Persistent pings failures usually mean a failover in progress or a connection limit reached on the server.
-
-### Phase: Failed, message: "credentials error: ..."
-
-Either the Secret is missing (`secrets "my-credentials" not found`), it lacks a key (`secret must contain 'username' and 'password' keys`), or an ENV variable named by `credentialsFromEnv` is unset (`environment variable MY_CLUSTER_USERNAME not set or empty`).
-
-```bash
-kubectl get secret my-credentials -n dbtether -o jsonpath='{.data.username}' | base64 -d
-```
+| Message | Cause and fix |
+|---------|---------------|
+| `connection failed: ...` | Endpoint unreachable or login rejected. The driver error says which. Check security groups and NetworkPolicies for operator pod egress: `nc -zv <endpoint> 5432` |
+| `ping failed: ...` | The pool opened but the server did not answer: a failover or the connection limit. Retried automatically |
+| `credentials error: ...` | The Secret is missing or lacks `username`/`password`, or an env var named in `credentialsFromEnv` is unset |

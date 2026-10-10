@@ -85,11 +85,14 @@ spec:
                     properties:
                       databaseRef:
                         description: Reference to the Database to find the latest
-                          backup for
+                          backup for; its namespace defaults to namespace below
                         properties:
                           name:
                             type: string
                           namespace:
+                            description: Namespace of the Database. A namespace other
+                              than the referencing resource's must be listed in the
+                              Database's spec.allowedNamespaces.
                             type: string
                         required:
                         - name
@@ -115,6 +118,10 @@ spec:
                     - name
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: set exactly one of backupRef, latestFrom, path
+                  rule: '(has(self.backupRef) ? 1 : 0) + (has(self.latestFrom) ? 1
+                    : 0) + (has(self.path) ? 1 : 0) == 1'
               target:
                 description: Target database to restore into
                 properties:
@@ -124,6 +131,9 @@ spec:
                       name:
                         type: string
                       namespace:
+                        description: Namespace of the Database. A namespace other
+                          than the referencing resource's must be listed in the Database's
+                          spec.allowedNamespaces.
                         type: string
                     required:
                     - name
@@ -143,6 +153,9 @@ spec:
             - source
             - target
             type: object
+            x-kubernetes-validations:
+            - message: spec is immutable; create a new Restore
+              rule: self == oldSelf
           status:
             description: RestoreStatus defines the observed state of Restore
             properties:
@@ -153,13 +166,16 @@ spec:
                 description: Duration of the restore operation
                 type: string
               grantAttempts:
-                description: |-
-                  Number of failed grant re-apply rounds retried so far.
-                  Reset when Granting is entered after a successful restore Job.
+                description: Number of failed grant re-apply rounds so far.
                 format: int32
                 type: integer
               jobName:
                 description: Name of the Job created for this restore
+                type: string
+              jobSucceededAt:
+                description: Time the restore Job reported that the backup was restored
+                  into the target database.
+                format: date-time
                 type: string
               message:
                 description: Human-readable message about the current status
@@ -170,8 +186,7 @@ spec:
               phase:
                 description: |-
                   Current phase of the restore operation.
-                  Granting means the data landed but the target's DatabaseUsers do not hold
-                  their grants yet — the restore is not usable by them until Completed.
+                  Granting means the data is restored but the target's DatabaseUsers do not hold their grants yet.
                 enum:
                 - Pending
                 - Running

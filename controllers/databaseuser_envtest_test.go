@@ -131,7 +131,6 @@ var _ = Describe("DatabaseUser Controller", func() {
 				}, createdUser)
 			}, timeout, interval).Should(Succeed())
 
-			// Default is 16, but if 0 is stored, controller will use 16 internally
 			Expect(createdUser.Spec.Password.Length).Should(BeNumerically(">=", 0))
 
 			By(stepCleaningUp)
@@ -1222,7 +1221,6 @@ var _ = Describe("DatabaseUser Controller", func() {
 				}, createdUser)
 			}, timeout, interval).Should(Succeed())
 
-			// CRD default sets it to "primary" when not specified
 			Expect(createdUser.Spec.SecretGeneration).Should(SatisfyAny(BeEmpty(), Equal("primary")))
 
 			By(stepCleaningUp)
@@ -1646,8 +1644,7 @@ var _ = Describe("DatabaseUser Controller", func() {
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, origUser); err == nil && origUser.Status.PasswordUpdatedAt != nil {
 				origUpdatedAt = *origUser.Status.PasswordUpdatedAt
 			}
-			// metav1.Time strips to second precision — force the rename into a
-			// different second so PasswordUpdatedAt bump is observable.
+			// metav1.Time has second precision; the PasswordUpdatedAt bump must land in a later second.
 			time.Sleep(1100 * time.Millisecond)
 
 			By("renaming custom password key to a non-built-in name")

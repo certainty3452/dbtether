@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -11,12 +12,13 @@ import (
 	"go.uber.org/zap"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -69,17 +71,36 @@ func main() {
 
 	switch mode {
 	case "job":
-		runBackupJob()
+		if err := runBackupJobMode(context.Background()); err != nil {
+			writeTerminationMessage(terminationLogPath, err)
+			os.Exit(1)
+		}
 		return
 	case "restore":
-		runRestoreJob()
+		if err := runRestoreJobMode(context.Background()); err != nil {
+			writeTerminationMessage(terminationLogPath, err)
+			os.Exit(1)
+		}
 		return
 	default:
-		runController(metricsAddr, probeAddr, enableLeaderElection, operatorNamespace)
+		serviceAccount, err := operatorServiceAccountFromEnv()
+		if err != nil {
+			setupLog.Error(err, "invalid operator configuration")
+			os.Exit(1)
+		}
+		runController(metricsAddr, probeAddr, enableLeaderElection, operatorNamespace, serviceAccount)
 	}
 }
 
-func runController(metricsAddr, probeAddr string, enableLeaderElection bool, operatorNamespace string) {
+func operatorServiceAccountFromEnv() (string, error) {
+	serviceAccount := os.Getenv("OPERATOR_SERVICE_ACCOUNT")
+	if serviceAccount == "" {
+		return "", fmt.Errorf("OPERATOR_SERVICE_ACCOUNT must be set: backup and restore Jobs run under the operator's ServiceAccount")
+	}
+	return serviceAccount, nil
+}
+
+func runController(metricsAddr, probeAddr string, enableLeaderElection bool, operatorNamespace, serviceAccount string) {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
@@ -104,7 +125,7 @@ func runController(metricsAddr, probeAddr string, enableLeaderElection bool, ope
 	pgClientCache := postgres.NewClientCache()
 
 	setupMainControllers(mgr, pgClientCache)
-	setupBackupControllers(mgr, operatorNamespace, pgClientCache)
+	setupBackupControllers(mgr, operatorNamespace, serviceAccount, pgClientCache)
 	setupHealthChecks(mgr)
 
 	setupLog.Info("starting manager")
@@ -143,7 +164,7 @@ func setupMainControllers(mgr ctrl.Manager, pgClientCache postgres.ClientCacheIn
 	}
 }
 
-func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string, pgClientCache postgres.ClientCacheInterface) {
+func setupBackupControllers(mgr ctrl.Manager, operatorNamespace, serviceAccount string, pgClientCache postgres.ClientCacheInterface) {
 	if err := (&backup.BackupStorageReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -154,11 +175,10 @@ func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string, pgClient
 
 	operatorImage := os.Getenv("OPERATOR_IMAGE")
 	if operatorImage == "" {
-		operatorImage = "certainty3452/dbtether:latest"
+		operatorImage = "ghcr.io/certainty3452/dbtether:latest"
 	}
 	operatorSSLMode := controllers.OperatorSSLMode()
 
-	// Load configuration from YAML file (mounted from ConfigMap at /etc/dbtether/config.yaml)
 	cfg := config.LoadOrDefault(config.DefaultConfigPath)
 	setupLog.Info("loaded configuration",
 		"maxConcurrentPerCluster", cfg.Backup.MaxConcurrentPerCluster,
@@ -167,10 +187,12 @@ func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string, pgClient
 
 	if err := (&backup.BackupReconciler{
 		Client:               mgr.GetClient(),
+		APIReader:            mgr.GetAPIReader(),
 		Scheme:               mgr.GetScheme(),
 		Recorder:             mgr.GetEventRecorderFor("backup-controller"),
 		Image:                operatorImage,
 		Namespace:            operatorNamespace,
+		ServiceAccountName:   serviceAccount,
 		SSLMode:              operatorSSLMode,
 		MaxConcurrentBackups: cfg.Backup.MaxConcurrentPerCluster,
 		PodAnnotations:       cfg.Backup.PodAnnotations,
@@ -194,14 +216,17 @@ func setupBackupControllers(mgr ctrl.Manager, operatorNamespace string, pgClient
 	}
 
 	if err := (&backup.RestoreReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		Recorder:      mgr.GetEventRecorderFor("restore-controller"),
-		Image:         operatorImage,
-		Namespace:     operatorNamespace,
-		SSLMode:       operatorSSLMode,
-		PodResources:  cfg.Backup.Resources.ToK8sResources(),
-		PGClientCache: pgClientCache,
+		Client:             mgr.GetClient(),
+		APIReader:          mgr.GetAPIReader(),
+		Scheme:             mgr.GetScheme(),
+		Recorder:           mgr.GetEventRecorderFor("restore-controller"),
+		Image:              operatorImage,
+		Namespace:          operatorNamespace,
+		ServiceAccountName: serviceAccount,
+		SSLMode:            operatorSSLMode,
+		PodResources:       cfg.Backup.Resources.ToK8sResources(),
+		PGClientCache:      pgClientCache,
+		MaxConcurrentJobs:  cfg.Backup.MaxConcurrentPerCluster,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, errUnableToCreateController, "controller", "Restore")
 		os.Exit(1)
@@ -219,10 +244,14 @@ func setupHealthChecks(mgr ctrl.Manager) {
 	}
 }
 
-func runBackupJob() {
-	// All configuration comes from environment variables set by the controller
-	cfg := backuppkg.BackupConfig{
-		// Database connection
+type backupRunner func(context.Context, *backuppkg.BackupConfig) (*backuppkg.BackupResult, error)
+
+type backupResultRecorder func(context.Context, *backuppkg.BackupConfig, *backuppkg.BackupResult) error
+
+type backupStartRecorder func(context.Context, *backuppkg.BackupConfig) error
+
+func backupConfigFromEnv() *backuppkg.BackupConfig {
+	cfg := &backuppkg.BackupConfig{
 		Host:     getEnvRequired("DB_HOST"),
 		Port:     getEnvInt("DB_PORT", 5432),
 		Database: getEnvRequired("DB_NAME"),
@@ -230,43 +259,66 @@ func runBackupJob() {
 		Password: getEnvRequired("DB_PASSWORD"),
 		SSLMode:  getEnv("DB_SSLMODE", "require"),
 
-		// Storage
 		StorageType: getEnvRequired("STORAGE_TYPE"),
-		S3Config: storage.S3Config{
-			Bucket:    os.Getenv("S3_BUCKET"),
-			Region:    os.Getenv("S3_REGION"),
-			Endpoint:  os.Getenv("S3_ENDPOINT"),
-			AccessKey: os.Getenv("AWS_ACCESS_KEY_ID"),
-			SecretKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
-		},
 
-		// Templates
 		PathTemplate:     getEnv("PATH_TEMPLATE", "{{ .ClusterName }}/{{ .DatabaseName }}"),
-		FilenameTemplate: getEnv("FILENAME_TEMPLATE", "{{ .Timestamp }}.sql.gz"),
+		FilenameTemplate: getEnv("FILENAME_TEMPLATE", backuppkg.DefaultFilenameTemplate),
 
-		// Metadata for templates and tags
 		ClusterName:  getEnvRequired("CLUSTER_NAME"),
 		DatabaseName: getEnvRequired("DATABASE_NAME"),
-		BackupName:   getEnv("BACKUP_NAME", ""),
-		Namespace:    getEnv("BACKUP_NAMESPACE", ""),
+		BackupName:   getEnvRequired("BACKUP_NAME"),
+		Namespace:    getEnvRequired("BACKUP_NAMESPACE"),
 		RunID:        getEnvRequired("RUN_ID"),
 	}
 
+	switch cfg.StorageType {
+	case "s3":
+		cfg.S3Config = s3ConfigFromEnv()
+	case "gcs":
+		cfg.GCSConfig = gcsConfigFromEnv()
+	case "azure":
+		cfg.AzureConfig = azureConfigFromEnv()
+	}
+	return cfg
+}
+
+func runBackupJobMode(ctx context.Context) error {
+	cfg := backupConfigFromEnv()
+	c, err := newJobClient()
+	if err != nil {
+		return err
+	}
+	recordStart := func(ctx context.Context, cfg *backuppkg.BackupConfig) error {
+		return recordBackupStart(ctx, c, cfg)
+	}
+	recordResult := func(ctx context.Context, cfg *backuppkg.BackupConfig, result *backuppkg.BackupResult) error {
+		return recordBackupResult(ctx, c, cfg, result)
+	}
+	return runBackupJob(ctx, cfg, recordStart, backuppkg.RunBackup, recordResult)
+}
+
+func runBackupJob(ctx context.Context, cfg *backuppkg.BackupConfig, recordStart backupStartRecorder, run backupRunner, record backupResultRecorder) error {
 	setupLog.Info("starting backup job",
 		"database", cfg.Database,
 		"storage", cfg.StorageType,
 		"cluster", cfg.ClusterName,
+		"runId", cfg.RunID,
 	)
 
-	ctx := context.Background()
-	result, err := backuppkg.RunBackup(ctx, &cfg)
-	if err != nil {
-		setupLog.Error(err, "backup failed")
-		writeTerminationMessage(terminationLogPath, err)
-		os.Exit(1)
+	// The operator re-creates a missing Job only while its run shows no sign of a Job, so this must precede the dump.
+	if err := recordStart(ctx, cfg); err != nil {
+		err = fmt.Errorf("recording the start of run %s on Backup %s/%s failed: %w", cfg.RunID, cfg.Namespace, cfg.BackupName, err)
+		setupLog.Error(err, "backup not started")
+		return err
 	}
 
-	setupLog.Info("backup completed successfully",
+	result, err := run(ctx, cfg)
+	if err != nil {
+		setupLog.Error(err, "backup failed")
+		return err
+	}
+
+	setupLog.Info("backup uploaded",
 		"path", result.Path,
 		"size", formatBytes(result.Size),
 		"uncompressedSize", formatBytes(result.UncompressedSize),
@@ -274,16 +326,26 @@ func runBackupJob() {
 		"compressionRatio", fmt.Sprintf("%.1f%%", float64(result.Size)/float64(result.UncompressedSize)*100),
 	)
 
-	// Update Job annotations with results (for controller to read)
-	if err := updateJobAnnotations(ctx, result); err != nil {
-		setupLog.Error(err, "failed to update job annotations (non-fatal)")
-		// Non-fatal: backup succeeded, just can't report details back
+	// A Backup without its path cannot be restored from, so an unrecorded upload must fail the run.
+	if err := record(ctx, cfg, result); err != nil {
+		err = fmt.Errorf("backup uploaded to %s but recording it on Backup %s/%s failed: %w", result.Path, cfg.Namespace, cfg.BackupName, err)
+		setupLog.Error(err, "backup failed")
+		return err
 	}
+	return nil
 }
 
-func runRestoreJob() {
-	cfg := backuppkg.RestoreConfig{
-		// Database connection
+type restoreRunner func(context.Context, *backuppkg.RestoreConfig) error
+
+type restoreRecorder func(context.Context, restoreTarget) error
+
+type restoreTarget struct {
+	Key   types.NamespacedName
+	RunID string
+}
+
+func restoreConfigFromEnv() (*backuppkg.RestoreConfig, restoreTarget) {
+	cfg := &backuppkg.RestoreConfig{
 		Host:     getEnvRequired("DB_HOST"),
 		Port:     getEnvInt("DB_PORT", 5432),
 		Database: getEnvRequired("DB_NAME"),
@@ -291,56 +353,103 @@ func runRestoreJob() {
 		Password: getEnvRequired("DB_PASSWORD"),
 		SSLMode:  getEnv("DB_SSLMODE", "require"),
 
-		// Source
-		SourcePath: getEnvRequired("SOURCE_PATH"),
-
-		// Storage
+		SourcePath:  getEnvRequired("SOURCE_PATH"),
 		StorageType: getEnvRequired("STORAGE_TYPE"),
-
-		// Conflict handling
-		OnConflict: getEnv("ON_CONFLICT", "fail"),
+		OnConflict:  getEnv("ON_CONFLICT", "fail"),
 	}
 
-	// Configure storage based on type
 	switch cfg.StorageType {
 	case "s3":
-		cfg.S3Config = &storage.S3Config{
-			Bucket:    os.Getenv("S3_BUCKET"),
-			Region:    os.Getenv("S3_REGION"),
-			Endpoint:  os.Getenv("S3_ENDPOINT"),
-			AccessKey: os.Getenv("AWS_ACCESS_KEY_ID"),
-			SecretKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
-		}
+		s3 := s3ConfigFromEnv()
+		cfg.S3Config = &s3
 	case "gcs":
-		cfg.GCSConfig = &storage.GCSConfig{
-			Bucket:  os.Getenv("GCS_BUCKET"),
-			Project: os.Getenv("GCS_PROJECT"),
-		}
+		gcs := gcsConfigFromEnv()
+		cfg.GCSConfig = &gcs
 	case "azure":
-		cfg.AzureConfig = &storage.AzureConfig{
-			Container:      os.Getenv("AZURE_CONTAINER"),
-			StorageAccount: os.Getenv("AZURE_ACCOUNT"),
-		}
+		az := azureConfigFromEnv()
+		cfg.AzureConfig = &az
 	}
 
+	target := restoreTarget{
+		Key:   types.NamespacedName{Name: getEnvRequired("RESTORE_NAME"), Namespace: getEnvRequired("RESTORE_NAMESPACE")},
+		RunID: getEnvRequired("RUN_ID"),
+	}
+	return cfg, target
+}
+
+func runRestoreJobMode(ctx context.Context) error {
+	cfg, target := restoreConfigFromEnv()
+	c, err := newJobClient()
+	if err != nil {
+		return err
+	}
+	recordStart := func(ctx context.Context, target restoreTarget) error {
+		return recordRestoreStart(ctx, c, target)
+	}
+	recordResult := func(ctx context.Context, target restoreTarget) error {
+		return recordRestoreResult(ctx, c, target)
+	}
+	return runRestoreJob(ctx, cfg, target, recordStart, backuppkg.RunRestore, recordResult)
+}
+
+func runRestoreJob(ctx context.Context, cfg *backuppkg.RestoreConfig, target restoreTarget,
+	recordStart restoreRecorder, run restoreRunner, recordResult restoreRecorder) error {
 	setupLog.Info("starting restore job",
 		"database", cfg.Database,
 		"source", cfg.SourcePath,
 		"storage", cfg.StorageType,
 		"onConflict", cfg.OnConflict,
+		"runId", target.RunID,
 	)
 
-	ctx := context.Background()
-	if err := backuppkg.RunRestore(ctx, &cfg); err != nil {
+	// Until the start is recorded the operator may still create this run's Job anew, so the database stays untouched.
+	if err := recordStart(ctx, target); err != nil {
+		err = fmt.Errorf("recording the start of run %s on Restore %s failed: %w", target.RunID, target.Key, err)
+		setupLog.Error(err, "restore not started")
+		return err
+	}
+
+	if err := run(ctx, cfg); err != nil {
 		setupLog.Error(err, "restore failed")
-		writeTerminationMessage(terminationLogPath, err)
-		os.Exit(1)
+		return err
 	}
 
 	setupLog.Info("restore completed successfully",
 		"database", cfg.Database,
 		"source", cfg.SourcePath,
 	)
+
+	// The operator must still re-apply grants, and once the Job is gone this record is its only evidence of success.
+	if err := recordResult(ctx, target); err != nil {
+		err = fmt.Errorf("restored %s into database %s but recording it on Restore %s failed: %w", cfg.SourcePath, cfg.Database, target.Key, err)
+		setupLog.Error(err, "restore failed")
+		return err
+	}
+	return nil
+}
+
+func s3ConfigFromEnv() storage.S3Config {
+	return storage.S3Config{
+		Bucket:    os.Getenv("S3_BUCKET"),
+		Region:    os.Getenv("S3_REGION"),
+		Endpoint:  os.Getenv("S3_ENDPOINT"),
+		AccessKey: os.Getenv("AWS_ACCESS_KEY_ID"),
+		SecretKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+	}
+}
+
+func gcsConfigFromEnv() storage.GCSConfig {
+	return storage.GCSConfig{
+		Bucket:  os.Getenv("GCS_BUCKET"),
+		Project: os.Getenv("GCS_PROJECT"),
+	}
+}
+
+func azureConfigFromEnv() storage.AzureConfig {
+	return storage.AzureConfig{
+		Container:      os.Getenv("AZURE_CONTAINER"),
+		StorageAccount: os.Getenv("AZURE_ACCOUNT"),
+	}
 }
 
 func writeTerminationMessage(path string, cause error) {
@@ -377,7 +486,6 @@ func getEnvInt(key string, defaultVal int) int {
 	return i
 }
 
-// formatBytes formats bytes as human-readable string
 func formatBytes(bytes int64) string {
 	const unit = 1024
 	if bytes < unit {
@@ -391,49 +499,80 @@ func formatBytes(bytes int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-// updateJobAnnotations updates the Job with backup result annotations
-func updateJobAnnotations(ctx context.Context, result *backuppkg.BackupResult) error {
-	jobName := os.Getenv("JOB_NAME")
-	jobNamespace := os.Getenv("JOB_NAMESPACE")
-	if jobName == "" || jobNamespace == "" {
-		return fmt.Errorf("JOB_NAME or JOB_NAMESPACE not set")
-	}
+var errRunSuperseded = errors.New("run superseded")
 
+func recordBackupStart(ctx context.Context, c client.Client, cfg *backuppkg.BackupConfig) error {
+	return patchOwnRun(ctx, c, backupKey(cfg), cfg.RunID, backupRunID, func(b *databasesv1alpha1.Backup) {
+		if b.Status.StartedAt == nil {
+			now := metav1.Now()
+			b.Status.StartedAt = &now
+		}
+	})
+}
+
+func recordBackupResult(ctx context.Context, c client.Client, cfg *backuppkg.BackupConfig, result *backuppkg.BackupResult) error {
+	return patchOwnRun(ctx, c, backupKey(cfg), cfg.RunID, backupRunID, func(b *databasesv1alpha1.Backup) {
+		b.Status.Path = result.Path
+		b.Status.Size = formatBytes(result.Size)
+		b.Status.Duration = result.Duration.Round(time.Millisecond).String()
+	})
+}
+
+func recordRestoreStart(ctx context.Context, c client.Client, target restoreTarget) error {
+	return patchOwnRun(ctx, c, target.Key, target.RunID, restoreRunID, func(restore *databasesv1alpha1.Restore) {
+		if restore.Status.StartedAt == nil {
+			now := metav1.Now()
+			restore.Status.StartedAt = &now
+		}
+	})
+}
+
+func recordRestoreResult(ctx context.Context, c client.Client, target restoreTarget) error {
+	return patchOwnRun(ctx, c, target.Key, target.RunID, restoreRunID, func(restore *databasesv1alpha1.Restore) {
+		now := metav1.Now()
+		restore.Status.JobSucceededAt = &now
+	})
+}
+
+func backupKey(cfg *backuppkg.BackupConfig) types.NamespacedName {
+	return types.NamespacedName{Name: cfg.BackupName, Namespace: cfg.Namespace}
+}
+
+func backupRunID(b *databasesv1alpha1.Backup) string { return b.Status.RunID }
+
+func restoreRunID(restore *databasesv1alpha1.Restore) string { return restore.Status.RunID }
+
+// The resourceVersion precondition stops a write landing on a run that replaced this one after the RunID check.
+func patchOwnRun[T any, P interface {
+	*T
+	client.Object
+}](ctx context.Context, c client.Client, key types.NamespacedName, runID string, currentRunID func(P) string, mutate func(P)) error {
+	return retry.OnError(retry.DefaultBackoff, isRetryableRecordError, func() error {
+		current := P(new(T))
+		if err := c.Get(ctx, key, current); err != nil {
+			return err
+		}
+		if got := currentRunID(current); got != runID {
+			return fmt.Errorf("%w: %s now tracks run %q, not %q", errRunSuperseded, key, got, runID)
+		}
+		patch := client.MergeFromWithOptions(current.DeepCopyObject().(client.Object), client.MergeFromWithOptimisticLock{})
+		mutate(current)
+		return c.Status().Patch(ctx, current, patch)
+	})
+}
+
+func newJobClient() (client.Client, error) {
 	restConfig, err := ctrl.GetConfig()
 	if err != nil {
-		return fmt.Errorf("failed to get kubernetes config: %w", err)
+		return nil, fmt.Errorf("failed to get kubernetes config: %w", err)
 	}
-
-	clientset, err := kubernetes.NewForConfig(restConfig)
+	c, err := client.New(restConfig, client.Options{Scheme: scheme})
 	if err != nil {
-		return fmt.Errorf("failed to create kubernetes client: %w", err)
+		return nil, fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
+	return c, nil
+}
 
-	// Prepare patch with annotations
-	patch := fmt.Sprintf(`{"metadata":{"annotations":{
-		"dbtether.io/backup-path": %q,
-		"dbtether.io/backup-size": "%d",
-		"dbtether.io/backup-size-human": %q,
-		"dbtether.io/backup-uncompressed-size": "%d",
-		"dbtether.io/backup-duration": %q
-	}}}`,
-		result.Path,
-		result.Size,
-		formatBytes(result.Size),
-		result.UncompressedSize,
-		result.Duration.Round(time.Millisecond).String(),
-	)
-
-	_, err = clientset.BatchV1().Jobs(jobNamespace).Patch(
-		ctx,
-		jobName,
-		types.MergePatchType,
-		[]byte(patch),
-		metav1.PatchOptions{},
-	)
-	if err != nil {
-		return fmt.Errorf("failed to patch job: %w", err)
-	}
-
-	return nil
+func isRetryableRecordError(err error) bool {
+	return !errors.Is(err, errRunSuperseded) && !apierrors.IsNotFound(err) && !apierrors.IsForbidden(err) && !apierrors.IsInvalid(err)
 }

@@ -58,7 +58,7 @@ type BackupScheduleSpec struct {
 }
 
 type BackupScheduleStatus struct {
-	// +kubebuilder:validation:Enum=Active;Suspended;Failed
+	// +kubebuilder:validation:Enum=Active;Pending;Suspended;Failed
 	Phase string `json:"phase,omitempty"`
 
 	Message string `json:"message,omitempty"`
@@ -72,7 +72,7 @@ type BackupScheduleStatus struct {
 	// Next scheduled backup time
 	NextScheduledTime *metav1.Time `json:"nextScheduledTime,omitempty"`
 
-	// Number of backups managed by this schedule (in S3)
+	// Number of Completed Backups created by this schedule
 	ManagedBackups int `json:"managedBackups,omitempty"`
 
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`

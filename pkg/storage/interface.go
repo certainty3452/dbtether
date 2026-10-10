@@ -8,42 +8,29 @@ import (
 	"time"
 )
 
-// StorageObject represents a generic storage object
 type StorageObject struct {
 	Key          string
 	Size         int64
 	LastModified time.Time
 }
 
-// StorageClient is the interface for cloud storage operations
 type StorageClient interface {
-	// Upload uploads data to the given key
 	Upload(ctx context.Context, key string, body io.Reader) error
 
-	// UploadWithTags uploads data with metadata tags
 	UploadWithTags(ctx context.Context, key string, body io.Reader, tags *ObjectTags) error
 
-	// Download downloads data from the given key
 	Download(ctx context.Context, key string) (io.ReadCloser, error)
 
-	// Exists checks if the key exists
 	Exists(ctx context.Context, key string) (bool, error)
 
-	// Delete deletes the object at the given key
 	Delete(ctx context.Context, key string) error
 
-	// List lists all objects with the given prefix
 	List(ctx context.Context, prefix string) ([]StorageObject, error)
 
-	// Reachable verifies the bucket/container exists and the current credentials
-	// have access to it. Implementations use the cheapest call that exercises
-	// auth + resource resolution (S3 HeadBucket, GCS bucket Attrs, Azure container
-	// GetProperties). nil = reachable; any non-nil error should be surfaced to
-	// the user verbatim — credentials, region, name, or network are wrong.
+	// Any error is surfaced to the user verbatim.
 	Reachable(ctx context.Context) error
 }
 
-// Verify implementations satisfy the interface
 var (
 	_ StorageClient = (*S3Client)(nil)
 	_ StorageClient = (*GCSClient)(nil)
@@ -52,8 +39,7 @@ var (
 
 var ErrNoStorageBackend = errors.New("no storage backend configured")
 
-// NewClient builds the right StorageClient for whichever provider config is
-// non-nil. Pass exactly one non-nil config; more than one is undefined (S3 wins).
+// Pass exactly one non-nil config; with several, S3 wins.
 func NewClient(ctx context.Context, s3 *S3Config, gcs *GCSConfig, azure *AzureConfig, logger *slog.Logger) (StorageClient, error) {
 	switch {
 	case s3 != nil:

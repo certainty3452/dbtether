@@ -1,9 +1,15 @@
 package postgres
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"net"
+	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,7 +20,7 @@ import (
 	"github.com/lib/pq"
 )
 
-// Typed aliases force callsites to cast; allowlists below enforce the type at runtime.
+// Distinct types force callers to cast; the allowlists below validate at runtime.
 type RoleParam string
 type TablePrivilege string
 
@@ -56,7 +62,6 @@ type Client struct {
 	pool   *pgxpool.Pool
 }
 
-// ClientInterface defines all PostgreSQL operations for mocking in tests
 type ClientInterface interface {
 	Close()
 	Ping(ctx context.Context) error
@@ -84,84 +89,131 @@ type ClientInterface interface {
 	RevokeDatabaseAccess(ctx context.Context, username, database string) error
 	GetUserDatabaseAccess(ctx context.Context, username string) ([]string, error)
 	SyncDatabaseAccess(ctx context.Context, username string, allowedDatabases []string) error
-	ApplyPrivileges(ctx context.Context, username, database, preset string, additionalGrants []TableGrant) error
+	ApplyPrivileges(ctx context.Context, username, database, preset, ownerRole string, additionalGrants []TableGrant) error
 	VerifyDatabaseIsolation(ctx context.Context, username, allowedDatabase string) ([]string, error)
 	RevokePrivilegesInDatabase(ctx context.Context, username, database string) error
 	ReassignOwnership(ctx context.Context, fromUser, database string) error
 	EnsureRoleMembership(ctx context.Context, username string) error
 }
 
-// Ensure Client implements ClientInterface
 var _ ClientInterface = (*Client)(nil)
 
-// ClientCacheInterface allows mocking the client cache in tests
 type ClientCacheInterface interface {
 	Get(ctx context.Context, clusterName string, config Config) (ClientInterface, error)
 	Remove(clusterName string)
 	Close()
 }
 
-type ClientCache struct {
-	clients map[string]*Client
-	mu      sync.RWMutex
+// Callers hold a client for a whole reconcile without releasing it, so a replaced pool stays open this long.
+const retiredClientGrace = 5 * time.Minute
+
+const connectTimeout = 10 * time.Second
+
+type cachedClient struct {
+	client *Client
+	config Config
 }
 
-// Ensure ClientCache implements ClientCacheInterface
+type ClientCache struct {
+	mu      sync.Mutex
+	clients map[string]cachedClient
+	retired map[*Client]*time.Timer
+}
+
 var _ ClientCacheInterface = (*ClientCache)(nil)
 
 func NewClientCache() *ClientCache {
 	return &ClientCache{
-		clients: make(map[string]*Client),
+		clients: make(map[string]cachedClient),
+		retired: make(map[*Client]*time.Timer),
 	}
 }
 
 func (c *ClientCache) Get(ctx context.Context, clusterName string, config Config) (ClientInterface, error) {
-	c.mu.RLock()
-	cached, ok := c.clients[clusterName]
-	c.mu.RUnlock()
-
-	if ok {
+	if cached := c.lookup(clusterName, config); cached != nil {
 		if err := cached.Ping(ctx); err == nil {
 			return cached, nil
 		}
-		c.Remove(clusterName)
+		c.evict(clusterName, cached)
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Re-check under the write lock: a concurrent Get on a cold cache would
-	// otherwise store its own pool over ours and leak the loser's connections.
-	if cached, ok := c.clients[clusterName]; ok {
-		return cached, nil
+	// A concurrent cold Get may have stored a pool while we pinged; a second one would leak.
+	entry, ok := c.clients[clusterName]
+	if ok && entry.config == config {
+		return entry.client, nil
 	}
 
-	client, err := NewClient(ctx, config)
+	fresh, err := NewClient(ctx, config)
 	if err != nil {
 		return nil, err
 	}
-	c.clients[clusterName] = client
+	c.clients[clusterName] = cachedClient{client: fresh, config: config}
+	if ok {
+		c.retireLocked(entry.client)
+	}
+	return fresh, nil
+}
 
-	return client, nil
+func (c *ClientCache) lookup(clusterName string, config Config) *Client {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.clients[clusterName]
+	if !ok || entry.config != config {
+		return nil
+	}
+	return entry.client
+}
+
+// Only the client that failed the ping goes: another Get may already have replaced it with a healthy one.
+func (c *ClientCache) evict(clusterName string, client *Client) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.clients[clusterName]; ok && entry.client == client {
+		delete(c.clients, clusterName)
+		c.retireLocked(client)
+	}
+}
+
+func (c *ClientCache) retireLocked(client *Client) {
+	c.retired[client] = time.AfterFunc(retiredClientGrace, func() {
+		c.mu.Lock()
+		_, pending := c.retired[client]
+		delete(c.retired, client)
+		c.mu.Unlock()
+		if pending {
+			client.Close()
+		}
+	})
 }
 
 func (c *ClientCache) Remove(clusterName string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	if client, ok := c.clients[clusterName]; ok {
-		client.Close()
+	if entry, ok := c.clients[clusterName]; ok {
 		delete(c.clients, clusterName)
+		c.retireLocked(entry.client)
 	}
 }
 
 func (c *ClientCache) Close() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for name, client := range c.clients {
-		client.Close()
+	clients := make([]*Client, 0, len(c.clients)+len(c.retired))
+	for name, entry := range c.clients {
+		clients = append(clients, entry.client)
 		delete(c.clients, name)
+	}
+	for client, timer := range c.retired {
+		timer.Stop()
+		clients = append(clients, client)
+		delete(c.retired, client)
+	}
+	c.mu.Unlock()
+
+	for _, client := range clients {
+		client.Close()
 	}
 }
 
@@ -176,15 +228,11 @@ func NewClient(ctx context.Context, config Config) (*Client, error) {
 		config.SSLMode = "require"
 	}
 
-	connString := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		config.Host, config.Port, config.Username, config.Password, config.Database, config.SSLMode,
-	)
-
-	poolConfig, err := pgxpool.ParseConfig(connString)
+	poolConfig, err := pgxpool.ParseConfig(config.serverURL())
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse connection string: %w", err)
+		return nil, fmt.Errorf("failed to parse connection settings: %w", err)
 	}
+	config.applyCredentials(&poolConfig.ConnConfig.Config, config.Database)
 
 	poolConfig.MaxConns = 5
 	poolConfig.MinConns = 1
@@ -198,6 +246,22 @@ func NewClient(ctx context.Context, config Config) (*Client, error) {
 	}
 
 	return &Client{config: config, pool: pool}, nil
+}
+
+// Credentials bypass connection strings so no character is parsed as syntax or echoed in errors.
+func (c *Config) serverURL() string {
+	return (&url.URL{
+		Scheme:   "postgres",
+		Host:     net.JoinHostPort(c.Host, strconv.Itoa(c.Port)),
+		RawQuery: url.Values{"sslmode": {c.SSLMode}}.Encode(),
+	}).String()
+}
+
+func (c *Config) applyCredentials(cfg *pgconn.Config, database string) {
+	cfg.User = c.Username
+	cfg.Password = c.Password
+	cfg.Database = database
+	cfg.ConnectTimeout = connectTimeout
 }
 
 func (c *Client) Close() {
@@ -231,12 +295,10 @@ func (c *Client) DatabaseExists(ctx context.Context, name string) (bool, error) 
 	return exists, nil
 }
 
-// ownerComment formats the ownership comment for database metadata
 func ownerComment(namespace, name string) string {
 	return fmt.Sprintf("dbtether:%s/%s", namespace, name)
 }
 
-// parseOwnerComment extracts namespace and name from ownership comment
 func parseOwnerComment(comment string) (namespace, name string, ok bool) {
 	if !strings.HasPrefix(comment, "dbtether:") {
 		return "", "", false
@@ -255,35 +317,42 @@ func (c *Client) CreateDatabaseWithOwner(ctx context.Context, name, ownerNamespa
 		return fmt.Errorf("failed to create database %s: %w", name, err)
 	}
 
-	// Set ownership comment (best-effort — should work for newly created databases)
 	comment := ownerComment(ownerNamespace, ownerName)
 	commentQuery := fmt.Sprintf("COMMENT ON DATABASE %s IS %s",
 		pq.QuoteIdentifier(name), pq.QuoteLiteral(comment))
-	// Ignore error — ownership tracking is optional enhancement
 	_, _ = c.pool.Exec(ctx, commentQuery)
 
 	return nil
 }
 
 func (c *Client) GetDatabaseOwner(ctx context.Context, name string) (namespace, resourceName string, err error) {
-	query := `SELECT COALESCE(description, '') FROM pg_database d 
-		LEFT JOIN pg_shdescription s ON d.oid = s.objoid 
-		WHERE datname = $1`
-	var comment string
-	if err := c.pool.QueryRow(ctx, query, name).Scan(&comment); err != nil {
-		return "", "", fmt.Errorf("failed to get database comment: %w", err)
-	}
-	if comment == "" {
-		return "", "", nil // no owner set (legacy database)
+	comment, err := c.databaseComment(ctx, name)
+	if err != nil {
+		return "", "", err
 	}
 	ns, n, ok := parseOwnerComment(comment)
 	if !ok {
-		return "", "", nil // comment exists but not in our format
+		return "", "", nil
 	}
 	return ns, n, nil
 }
 
-// A REVOKE by a role that does not own the database answers with a warning and no error, and a NULL datacl is the default ACL, which grants PUBLIC CONNECT.
+func (c *Client) databaseComment(ctx context.Context, name string) (string, error) {
+	var comment string
+	err := c.pool.QueryRow(ctx,
+		`SELECT COALESCE(shobj_description(oid, 'pg_database'), '') FROM pg_database WHERE datname = $1`,
+		name,
+	).Scan(&comment)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to get database comment: %w", err)
+	}
+	return comment, nil
+}
+
+// REVOKE by a non-owner only warns, and a NULL datacl grants PUBLIC CONNECT.
 const publicConnectGrantedQuery = `
 	SELECT EXISTS (
 		SELECT 1 FROM pg_database d
@@ -294,9 +363,16 @@ const publicConnectGrantedQuery = `
 	)`
 
 func (c *Client) RevokePublicConnect(ctx context.Context, name string) error {
+	var granted bool
+	if err := c.pool.QueryRow(ctx, publicConnectGrantedQuery, name).Scan(&granted); err != nil {
+		return fmt.Errorf("failed to check public connect on %s: %w", name, err)
+	}
+	if !granted {
+		return nil
+	}
+
 	query := fmt.Sprintf("REVOKE CONNECT ON DATABASE %s FROM PUBLIC", pq.QuoteIdentifier(name))
-	_, err := c.pool.Exec(ctx, query)
-	if err != nil {
+	if _, err := c.pool.Exec(ctx, query); err != nil {
 		return fmt.Errorf("failed to revoke public connect on %s: %w", name, err)
 	}
 
@@ -317,41 +393,43 @@ func (c *Client) EnsureDatabaseWithOwner(ctx context.Context, name, ownerNamespa
 	}
 	if !exists {
 		err := c.CreateDatabaseWithOwner(ctx, name, ownerNamespace, ownerName)
-		return err == nil, err // new DB = ownership tracked if created successfully
+		return err == nil, err
 	}
 
-	// Database exists — check ownership
-	ns, n, err := c.GetDatabaseOwner(ctx, name)
+	comment, err := c.databaseComment(ctx, name)
 	if err != nil {
 		return false, err
 	}
-
-	expectedOwner := ownerComment(ownerNamespace, ownerName)
-
-	// No owner set (legacy) or forceAdopt — try to claim it (best-effort)
-	if ns == "" && n == "" || forceAdopt {
-		commentQuery := fmt.Sprintf("COMMENT ON DATABASE %s IS %s",
-			pq.QuoteIdentifier(name), pq.QuoteLiteral(expectedOwner))
-		if _, err := c.pool.Exec(ctx, commentQuery); err != nil {
-			// COMMENT requires being PostgreSQL owner of the database
-			// For legacy databases created by other users, this will fail — that's OK
-			// We continue without ownership tracking for such databases
-			return false, nil // best-effort: skip ownership tracking for legacy databases
-		}
-		return true, nil // ownership claimed successfully
+	ns, n, marked := parseOwnerComment(comment)
+	if comment != "" && !marked {
+		return false, fmt.Errorf("database %s has a foreign comment %q; dbtether only claims a database without a comment or with its own ownership marker",
+			name, comment)
 	}
 
-	// Check if we are the owner
+	desiredComment := ownerComment(ownerNamespace, ownerName)
+	if comment == desiredComment {
+		return true, nil
+	}
+
+	if !marked || forceAdopt {
+		commentQuery := fmt.Sprintf("COMMENT ON DATABASE %s IS %s",
+			pq.QuoteIdentifier(name), pq.QuoteLiteral(desiredComment))
+		// COMMENT needs PostgreSQL ownership; a database owned by another role stays untracked.
+		if _, err := c.pool.Exec(ctx, commentQuery); err != nil {
+			return false, nil
+		}
+		return true, nil
+	}
+
 	if ns != ownerNamespace || n != ownerName {
 		return false, fmt.Errorf("database %s is owned by %s/%s, cannot be claimed by %s/%s (use annotation dbtether.io/force-adopt to override)",
 			name, ns, n, ownerNamespace, ownerName)
 	}
 
-	return true, nil // already owned by us
+	return true, nil
 }
 
 func (c *Client) ClearDatabaseOwner(ctx context.Context, name string) error {
-	// Set comment to NULL to release ownership
 	query := fmt.Sprintf("COMMENT ON DATABASE %s IS NULL", pq.QuoteIdentifier(name))
 	if _, err := c.pool.Exec(ctx, query); err != nil {
 		return fmt.Errorf("failed to clear ownership of database %s: %w", name, err)
@@ -359,18 +437,28 @@ func (c *Client) ClearDatabaseOwner(ctx context.Context, name string) error {
 	return nil
 }
 
+// Superusers always pass; others need the database owner's privileges.
+const dropPermittedQuery = `SELECT pg_has_role(current_user, datdba, 'USAGE') FROM pg_database WHERE datname = $1`
+
 func (c *Client) DropDatabase(ctx context.Context, name string) error {
-	// Terminate active connections before dropping
-	terminateQuery := fmt.Sprintf(`
-		SELECT pg_terminate_backend(pid) 
-		FROM pg_stat_activity 
-		WHERE datname = %s AND pid <> pg_backend_pid()
-	`, pq.QuoteLiteral(name))
-	_, _ = c.pool.Exec(ctx, terminateQuery) // best-effort: ignore errors
+	var permitted bool
+	err := c.pool.QueryRow(ctx, dropPermittedQuery, name).Scan(&permitted)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to check permission to drop database %s: %w", name, err)
+	}
+	if !permitted {
+		return fmt.Errorf("cannot drop database %s: the operator role neither owns it nor has the privileges of its owner", name)
+	}
+
+	_, _ = c.pool.Exec(ctx,
+		"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+		name) // best-effort: DROP DATABASE reports the sessions that survive
 
 	query := fmt.Sprintf("DROP DATABASE IF EXISTS %s", pq.QuoteIdentifier(name))
-	_, err := c.pool.Exec(ctx, query)
-	if err != nil {
+	if _, err := c.pool.Exec(ctx, query); err != nil {
 		return fmt.Errorf("failed to drop database %s: %w", name, err)
 	}
 	return nil
@@ -381,7 +469,7 @@ func (c *Client) CreateExtension(ctx context.Context, dbName, extensionName stri
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.Close(ctx) }() // error on close is not actionable
+	defer func() { _ = conn.Close(ctx) }()
 
 	query := fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %s", pq.QuoteIdentifier(extensionName))
 	_, err = conn.Exec(ctx, query)
@@ -400,7 +488,7 @@ func (c *Client) EnsureExtensions(ctx context.Context, dbName string, extensions
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.Close(ctx) }() // error on close is not actionable
+	defer func() { _ = conn.Close(ctx) }()
 
 	for _, ext := range extensions {
 		query := fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %s", pq.QuoteIdentifier(ext))
@@ -412,11 +500,12 @@ func (c *Client) EnsureExtensions(ctx context.Context, dbName string, extensions
 }
 
 func (c *Client) connectToDatabase(ctx context.Context, dbName string) (*pgx.Conn, error) {
-	connString := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		c.config.Host, c.config.Port, c.config.Username, c.config.Password, dbName, c.config.SSLMode,
-	)
-	conn, err := pgx.Connect(ctx, connString)
+	connConfig, err := pgx.ParseConfig(c.config.serverURL())
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse connection settings: %w", err)
+	}
+	c.config.applyCredentials(&connConfig.Config, dbName)
+	conn, err := pgx.ConnectConfig(ctx, connConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database %s: %w", dbName, err)
 	}
@@ -424,11 +513,9 @@ func (c *Client) connectToDatabase(ctx context.Context, dbName string) (*pgx.Con
 }
 
 func IsTransientError(err error) bool {
-	// All connection errors are considered transient for retry purposes
 	return err != nil
 }
 
-// isDatabaseNotExistError checks if error is PostgreSQL "database does not exist" (SQLSTATE 3D000)
 func isDatabaseNotExistError(err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
@@ -437,7 +524,6 @@ func isDatabaseNotExistError(err error) bool {
 	return false
 }
 
-// isLockNotAvailableError checks if error is PostgreSQL "lock not available" (SQLSTATE 55P03)
 func isLockNotAvailableError(err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
@@ -445,8 +531,6 @@ func isLockNotAvailableError(err error) bool {
 	}
 	return false
 }
-
-// User management methods
 
 func (c *Client) UserExists(ctx context.Context, username string) (bool, error) {
 	var exists bool
@@ -590,20 +674,44 @@ func (c *Client) RevokeAllDatabaseAccess(ctx context.Context, username string) e
 	return nil
 }
 
+// Only a direct ACL entry counts: CONNECT inherited from PUBLIC or a role is not the grant dbtether manages.
+const directConnectQuery = `
+	SELECT d.datname FROM pg_database d, aclexplode(d.datacl) a
+	WHERE d.datistemplate = false
+	  AND a.privilege_type = 'CONNECT'
+	  AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = $1)`
+
+func (c *Client) hasDirectConnect(ctx context.Context, username, database string) (bool, error) {
+	var granted bool
+	err := c.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM (`+directConnectQuery+`) x WHERE x.datname = $2)`,
+		username, database,
+	).Scan(&granted)
+	if err != nil {
+		return false, fmt.Errorf("failed to read database access of %s on %s: %w", username, database, err)
+	}
+	return granted, nil
+}
+
 func (c *Client) GrantDatabaseAccess(ctx context.Context, username, database string) error {
+	granted, err := c.hasDirectConnect(ctx, username, database)
+	if err != nil {
+		return err
+	}
+	if granted {
+		return nil
+	}
 	query := fmt.Sprintf(
 		"GRANT CONNECT ON DATABASE %s TO %s",
 		pq.QuoteIdentifier(database),
 		pq.QuoteIdentifier(username),
 	)
-	_, err := c.pool.Exec(ctx, query)
-	if err != nil {
+	if _, err = c.pool.Exec(ctx, query); err != nil {
 		return fmt.Errorf("failed to grant database access: %w", err)
 	}
 	return nil
 }
 
-// RevokeDatabaseAccess revokes CONNECT privilege on a single database
 func (c *Client) RevokeDatabaseAccess(ctx context.Context, username, database string) error {
 	query := fmt.Sprintf(
 		"REVOKE CONNECT ON DATABASE %s FROM %s",
@@ -617,7 +725,6 @@ func (c *Client) RevokeDatabaseAccess(ctx context.Context, username, database st
 	return nil
 }
 
-// GetUserDatabaseAccess returns list of databases where user has CONNECT privilege
 func (c *Client) GetUserDatabaseAccess(ctx context.Context, username string) ([]string, error) {
 	query := `
 		SELECT datname FROM pg_database 
@@ -641,30 +748,43 @@ func (c *Client) GetUserDatabaseAccess(ctx context.Context, username string) ([]
 	return databases, nil
 }
 
-// SyncDatabaseAccess ensures user has access ONLY to the specified databases.
-// It grants access to allowed databases and revokes access from all others.
+func (c *Client) directConnectDatabases(ctx context.Context, username string) ([]string, error) {
+	rows, err := c.pool.Query(ctx, directConnectQuery, username)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user database access: %w", err)
+	}
+	defer rows.Close()
+
+	var databases []string
+	for rows.Next() {
+		var db string
+		if err := rows.Scan(&db); err != nil {
+			return nil, err
+		}
+		databases = append(databases, db)
+	}
+	return databases, rows.Err()
+}
+
 func (c *Client) SyncDatabaseAccess(ctx context.Context, username string, allowedDatabases []string) error {
-	// Get all databases where user currently has CONNECT
-	currentAccess, err := c.GetUserDatabaseAccess(ctx, username)
+	currentAccess, err := c.directConnectDatabases(ctx, username)
 	if err != nil {
 		return err
 	}
 
-	// Build allowed set for O(1) lookup
 	allowed := make(map[string]bool, len(allowedDatabases))
 	for _, db := range allowedDatabases {
 		allowed[db] = true
 	}
 
-	// Revoke access to databases NOT in allowed list (best-effort)
 	for _, db := range currentAccess {
 		if !allowed[db] {
-			// Best-effort: log but continue on error
-			_ = c.RevokeDatabaseAccess(ctx, username, db)
+			if err := c.RevokeDatabaseAccess(ctx, username, db); err != nil {
+				return err
+			}
 		}
 	}
 
-	// Grant access to allowed databases
 	for _, db := range allowedDatabases {
 		if err := c.GrantDatabaseAccess(ctx, username, db); err != nil {
 			return fmt.Errorf("failed to grant access to %s: %w", db, err)
@@ -674,116 +794,364 @@ func (c *Client) SyncDatabaseAccess(ctx context.Context, username string, allowe
 	return nil
 }
 
-func (c *Client) ApplyPrivileges(ctx context.Context, username, database, preset string, additionalGrants []TableGrant) error {
+type presetPrivileges struct {
+	schema    []string
+	tables    []string
+	sequences []string
+}
+
+var adminPrivileges = presetPrivileges{
+	schema:    []string{"USAGE", "CREATE"},
+	tables:    []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"},
+	sequences: []string{"USAGE", "SELECT"},
+}
+
+var privilegePresets = map[string]presetPrivileges{
+	"readonly":  {schema: []string{"USAGE"}, tables: []string{"SELECT"}},
+	"readwrite": {schema: []string{"USAGE"}, tables: []string{"SELECT", "INSERT", "UPDATE", "DELETE"}, sequences: []string{"USAGE", "SELECT"}},
+	"admin":     adminPrivileges,
+	"owner":     adminPrivileges,
+}
+
+// GRANT ... ON TABLE on a sequence drops any other privilege with a warning, so desiring one would never converge.
+var sequencePrivileges = map[string]bool{"USAGE": true, "SELECT": true, "UPDATE": true}
+
+// Objects the owner role creates get the preset's default privileges too.
+func (c *Client) ApplyPrivileges(ctx context.Context, username, database, preset, ownerRole string, additionalGrants []TableGrant) error {
+	desired, err := newDesiredPrivileges(username, preset, ownerRole, additionalGrants)
+	if err != nil {
+		return err
+	}
+
 	conn, err := c.connectToDatabase(ctx, database)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.Close(ctx) }() // error on close is not actionable
+	defer func() { _ = conn.Close(ctx) }()
 
-	quotedUser := pq.QuoteIdentifier(username)
-
-	// Revoke all first for clean state (best-effort)
-	_, _ = conn.Exec(ctx, fmt.Sprintf("REVOKE ALL ON SCHEMA public FROM %s", quotedUser)) // may fail if no grants exist
-
-	// Grant USAGE on schema
-	if _, err = conn.Exec(ctx, fmt.Sprintf("GRANT USAGE ON SCHEMA public TO %s", quotedUser)); err != nil {
-		return fmt.Errorf("failed to grant schema usage: %w", err)
-	}
-
-	switch preset {
-	case "readonly":
-		if err := c.applyReadonlyPrivileges(ctx, conn, quotedUser); err != nil {
-			return err
-		}
-	case "readwrite":
-		if err := c.applyReadwritePrivileges(ctx, conn, quotedUser); err != nil {
-			return err
-		}
-	case "admin":
-		if err := c.applyAdminPrivileges(ctx, conn, quotedUser); err != nil {
-			return err
-		}
-	case "owner":
-		if err := c.applyOwnerPrivileges(ctx, conn, username); err != nil {
+	if desired.ownerRole != "" {
+		if err := ensureRoleMembership(ctx, conn, desired.ownerRole); err != nil {
 			return err
 		}
 	}
 
-	// Apply additional grants
-	for _, grant := range additionalGrants {
-		if err := c.applyTableGrant(ctx, conn, quotedUser, grant); err != nil {
-			return err
-		}
+	if err := convergePrivileges(ctx, conn, username, &desired); err != nil {
+		return fmt.Errorf("failed to apply %s privileges: %w", preset, err)
 	}
 
-	return nil
-}
-
-func (c *Client) applyReadonlyPrivileges(ctx context.Context, conn *pgx.Conn, quotedUser string) error {
-	queries := []string{
-		fmt.Sprintf("GRANT SELECT ON ALL TABLES IN SCHEMA public TO %s", quotedUser),
-		fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO %s", quotedUser),
+	if preset != "owner" {
+		return nil
 	}
-	for _, q := range queries {
-		if _, err := conn.Exec(ctx, q); err != nil {
-			return fmt.Errorf("failed to apply readonly privileges: %w", err)
-		}
-	}
-	return nil
-}
-
-func (c *Client) applyReadwritePrivileges(ctx context.Context, conn *pgx.Conn, quotedUser string) error {
-	if err := c.applyReadonlyPrivileges(ctx, conn, quotedUser); err != nil {
-		return err
-	}
-	queries := []string{
-		fmt.Sprintf("GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %s", quotedUser),
-		fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT INSERT, UPDATE, DELETE ON TABLES TO %s", quotedUser),
-		fmt.Sprintf("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %s", quotedUser),
-		fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO %s", quotedUser),
-	}
-	for _, q := range queries {
-		if _, err := conn.Exec(ctx, q); err != nil {
-			return fmt.Errorf("failed to apply readwrite privileges: %w", err)
-		}
-	}
-	return nil
-}
-
-func (c *Client) applyAdminPrivileges(ctx context.Context, conn *pgx.Conn, quotedUser string) error {
-	if err := c.applyReadwritePrivileges(ctx, conn, quotedUser); err != nil {
-		return err
-	}
-	queries := []string{
-		fmt.Sprintf("GRANT CREATE ON SCHEMA public TO %s", quotedUser),
-		fmt.Sprintf("GRANT TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA public TO %s", quotedUser),
-		fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT TRUNCATE, REFERENCES, TRIGGER ON TABLES TO %s", quotedUser),
-	}
-	for _, q := range queries {
-		if _, err := conn.Exec(ctx, q); err != nil {
-			return fmt.Errorf("failed to apply admin privileges: %w", err)
-		}
-	}
-	return nil
-}
-
-func (c *Client) applyOwnerPrivileges(ctx context.Context, conn *pgx.Conn, username string) error {
-	if err := c.applyAdminPrivileges(ctx, conn, pq.QuoteIdentifier(username)); err != nil {
-		return err
-	}
-
 	// After the admin grants so a refused membership leaves the user degraded to admin instead of stripped of everything.
 	if err := ensureRoleMembership(ctx, conn, username); err != nil {
 		return err
 	}
-
 	statements, err := pendingOwnershipStatements(ctx, conn, username)
 	if err != nil {
 		return fmt.Errorf("failed to list objects to transfer to %s: %w", username, err)
 	}
-
 	return transferOwnership(ctx, conn, statements)
+}
+
+type desiredPrivileges struct {
+	preset    presetPrivileges
+	ownerRole string
+	tables    map[string][]string
+}
+
+func newDesiredPrivileges(username, preset, ownerRole string, additionalGrants []TableGrant) (desiredPrivileges, error) {
+	privileges, ok := privilegePresets[preset]
+	if !ok {
+		return desiredPrivileges{}, fmt.Errorf("unknown privileges preset %q", preset)
+	}
+	if ownerRole == username {
+		ownerRole = ""
+	}
+	tables, err := additionalTablePrivileges(additionalGrants)
+	if err != nil {
+		return desiredPrivileges{}, err
+	}
+	return desiredPrivileges{preset: privileges, ownerRole: ownerRole, tables: tables}, nil
+}
+
+func additionalTablePrivileges(grants []TableGrant) (map[string][]string, error) {
+	tables := make(map[string][]string)
+	for _, grant := range grants {
+		privileges, err := allowedPrivileges(grant.Privileges)
+		if err != nil {
+			return nil, err
+		}
+		for _, table := range grant.Tables {
+			tables[table] = append(tables[table], privileges...)
+		}
+	}
+	return tables, nil
+}
+
+func (d *desiredPrivileges) relation(sequence, inPublic bool, names []string) []string {
+	var privileges []string
+	if inPublic && sequence {
+		privileges = append(privileges, d.preset.sequences...)
+	} else if inPublic {
+		privileges = append(privileges, d.preset.tables...)
+	}
+	for _, name := range names {
+		privileges = append(privileges, d.tables[name]...)
+	}
+	if !sequence {
+		return privileges
+	}
+	valid := privileges[:0]
+	for _, privilege := range privileges {
+		if sequencePrivileges[privilege] {
+			valid = append(valid, privilege)
+		}
+	}
+	return valid
+}
+
+type defaultACLKey struct {
+	role    string
+	objects string
+}
+
+func (d *desiredPrivileges) defaults(operator string) map[defaultACLKey][]string {
+	defaults := make(map[defaultACLKey][]string)
+	for _, creator := range []string{operator, d.ownerRole} {
+		if creator == "" {
+			continue
+		}
+		defaults[defaultACLKey{creator, "TABLES"}] = d.preset.tables
+		if len(d.preset.sequences) > 0 {
+			defaults[defaultACLKey{creator, "SEQUENCES"}] = d.preset.sequences
+		}
+	}
+	return defaults
+}
+
+// Privileges the user holds in public from a grantor the operator acts for, plus every relation a grant may target.
+const heldPrivilegesQuery = `
+WITH target AS (SELECT (SELECT oid FROM pg_roles WHERE rolname = $1) AS oid),
+named AS (SELECT name, to_regclass(quote_ident(name)) AS oid FROM unnest($2::text[]) AS name),
+objects AS (
+	SELECT 'SCHEMA' AS kind, quote_ident(n.nspname) AS object, '' AS role, true AS in_public, false AS owned,
+		'{}'::text[] AS named, n.nspacl AS acl
+	FROM pg_namespace n
+	WHERE n.nspname = 'public'
+	UNION ALL
+	SELECT CASE c.relkind WHEN 'S' THEN 'SEQUENCE' ELSE 'TABLE' END, format('%I.%I', n.nspname, c.relname), '',
+		n.nspname = 'public', (c.relowner = target.oid) IS TRUE,
+		ARRAY(SELECT named.name FROM named WHERE named.oid = c.oid ORDER BY named.name), c.relacl
+	FROM pg_class c
+	JOIN pg_namespace n ON n.oid = c.relnamespace
+	CROSS JOIN target
+	WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+		AND (n.nspname = 'public' OR c.oid IN (SELECT named.oid FROM named))
+	UNION ALL
+	SELECT 'ROUTINE', format('%I.%I(%s)', n.nspname, p.proname, pg_get_function_identity_arguments(p.oid)), '',
+		true, (p.proowner = target.oid) IS TRUE, '{}', p.proacl
+	FROM pg_proc p
+	JOIN pg_namespace n ON n.oid = p.pronamespace
+	CROSS JOIN target
+	WHERE n.nspname = 'public' AND p.proacl IS NOT NULL
+	UNION ALL
+	SELECT 'DEFAULT',
+		CASE d.defaclobjtype WHEN 'r' THEN 'TABLES' WHEN 'S' THEN 'SEQUENCES' WHEN 'f' THEN 'FUNCTIONS' ELSE 'TYPES' END,
+		pg_get_userbyid(d.defaclrole), true, false, '{}', d.defaclacl
+	FROM pg_default_acl d
+	JOIN pg_namespace n ON n.oid = d.defaclnamespace
+	WHERE n.nspname = 'public'
+		AND d.defaclobjtype IN ('r', 'S', 'f', 'T')
+		AND pg_has_role(d.defaclrole, 'USAGE')
+)
+SELECT o.kind, o.object, o.role, o.in_public, o.owned, o.named, held.privileges, held.grantable
+FROM objects o
+CROSS JOIN target
+CROSS JOIN LATERAL (
+	SELECT coalesce(array_agg(a.privilege_type), '{}'),
+		coalesce(array_agg(a.privilege_type) FILTER (WHERE a.is_grantable), '{}')
+	FROM aclexplode(o.acl) a
+	WHERE a.grantee = target.oid AND pg_has_role(a.grantor, 'USAGE')
+) held(privileges, grantable)
+ORDER BY o.kind, o.role, o.object`
+
+type heldPrivileges struct {
+	kind       string
+	object     string
+	role       string
+	inPublic   bool
+	owned      bool
+	named      []string
+	privileges []string
+	grantable  []string
+}
+
+// One transaction so other sessions never see a partial privilege set.
+func convergePrivileges(ctx context.Context, conn *pgx.Conn, username string, desired *desiredPrivileges) error {
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after commit
+
+	statements, err := privilegeStatements(ctx, tx, username, desired)
+	if err != nil {
+		return fmt.Errorf("failed to read current privileges: %w", err)
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			return fmt.Errorf("%s: %w", statement, err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func privilegeStatements(ctx context.Context, tx pgx.Tx, username string, desired *desiredPrivileges) ([]string, error) {
+	var operator string
+	if err := tx.QueryRow(ctx, "SELECT current_user").Scan(&operator); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, heldPrivilegesQuery, username, slices.Collect(maps.Keys(desired.tables)))
+	if err != nil {
+		return nil, err
+	}
+	held, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (heldPrivileges, error) {
+		var h heldPrivileges
+		err := row.Scan(&h.kind, &h.object, &h.role, &h.inPublic, &h.owned, &h.named, &h.privileges, &h.grantable)
+		return h, err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	plan := newPrivilegePlan(desired, operator)
+	for i := range held {
+		plan.reconcile(&held[i])
+	}
+	return plan.statements(pq.QuoteIdentifier(username)), nil
+}
+
+type privilegePlan struct {
+	desired      *desiredPrivileges
+	defaults     map[defaultACLKey][]string
+	unresolved   map[string]bool
+	schemaListed bool
+	targets      []aclTarget
+}
+
+func newPrivilegePlan(desired *desiredPrivileges, operator string) *privilegePlan {
+	unresolved := make(map[string]bool, len(desired.tables))
+	for name := range desired.tables {
+		unresolved[name] = true
+	}
+	return &privilegePlan{desired: desired, defaults: desired.defaults(operator), unresolved: unresolved}
+}
+
+func (p *privilegePlan) reconcile(h *heldPrivileges) {
+	target := aclTarget{object: h.kind + " " + h.object, held: heldMap(h.privileges, h.grantable)}
+	switch h.kind {
+	case "SCHEMA":
+		p.schemaListed = true
+		target.desired = p.desired.preset.schema
+	case "TABLE", "SEQUENCE":
+		for _, name := range h.named {
+			delete(p.unresolved, name)
+		}
+		if h.owned {
+			return
+		}
+		target.desired = p.desired.relation(h.kind == "SEQUENCE", h.inPublic, h.named)
+		target.keepUndesired = !h.inPublic
+	case "ROUTINE":
+		if h.owned {
+			return
+		}
+	case "DEFAULT":
+		key := defaultACLKey{h.role, h.object}
+		target.prefix, target.object, target.desired = defaultACLPrefix(h.role), h.object, p.defaults[key]
+		delete(p.defaults, key)
+	}
+	p.targets = append(p.targets, target)
+}
+
+func (p *privilegePlan) statements(grantee string) []string {
+	targets := p.targets
+	if !p.schemaListed {
+		targets = append(targets, aclTarget{object: "SCHEMA public", desired: p.desired.preset.schema})
+	}
+	keys := slices.SortedFunc(maps.Keys(p.defaults), func(a, b defaultACLKey) int {
+		return cmp.Or(strings.Compare(a.role, b.role), strings.Compare(a.objects, b.objects))
+	})
+	for _, key := range keys {
+		targets = append(targets, aclTarget{prefix: defaultACLPrefix(key.role), object: key.objects, desired: p.defaults[key]})
+	}
+	// Left to the server so a missing or non-relation table fails exactly as GRANT reports it.
+	for _, name := range slices.Sorted(maps.Keys(p.unresolved)) {
+		targets = append(targets, aclTarget{object: "TABLE " + pq.QuoteIdentifier(name), desired: p.desired.tables[name]})
+	}
+
+	statements := make([]string, 0, len(targets))
+	for i := range targets {
+		statements = append(statements, targets[i].statements(grantee)...)
+	}
+	return statements
+}
+
+func defaultACLPrefix(role string) string {
+	return "ALTER DEFAULT PRIVILEGES FOR ROLE " + pq.QuoteIdentifier(role) + " IN SCHEMA public "
+}
+
+type aclTarget struct {
+	prefix        string
+	object        string
+	desired       []string
+	held          map[string]bool
+	keepUndesired bool
+}
+
+func heldMap(privileges, grantable []string) map[string]bool {
+	held := make(map[string]bool, len(privileges))
+	for _, privilege := range privileges {
+		held[privilege] = held[privilege] || slices.Contains(grantable, privilege)
+	}
+	return held
+}
+
+func (t aclTarget) statements(grantee string) []string {
+	want := make(map[string]bool, len(t.desired))
+	for _, privilege := range t.desired {
+		want[privilege] = true
+	}
+	var grant, revoke, revokeOption []string
+	for privilege := range want {
+		grantable, held := t.held[privilege]
+		if !held {
+			grant = append(grant, privilege)
+		} else if grantable {
+			revokeOption = append(revokeOption, privilege)
+		}
+	}
+	if !t.keepUndesired {
+		for privilege := range t.held {
+			if !want[privilege] {
+				revoke = append(revoke, privilege)
+			}
+		}
+	}
+
+	var statements []string
+	add := func(format string, privileges []string) {
+		if len(privileges) == 0 {
+			return
+		}
+		slices.Sort(privileges)
+		statements = append(statements,
+			t.prefix+fmt.Sprintf(format, strings.Join(privileges, ", "), t.object, grantee))
+	}
+	add("REVOKE %s ON %s FROM %s", revoke)
+	add("REVOKE GRANT OPTION FOR %s ON %s FROM %s", revokeOption)
+	add("GRANT %s ON %s TO %s", grant)
+	return statements
 }
 
 type sqlExecutor interface {
@@ -938,35 +1306,21 @@ func (e *ownershipTransferError) Unwrap() []error {
 	return e.failures
 }
 
-func (c *Client) applyTableGrant(ctx context.Context, conn *pgx.Conn, quotedUser string, grant TableGrant) error {
-	privs, err := joinAllowedPrivileges(grant.Privileges)
-	if err != nil {
-		return err
-	}
-	for _, table := range grant.Tables {
-		query := fmt.Sprintf("GRANT %s ON TABLE %s TO %s", privs, pq.QuoteIdentifier(table), quotedUser)
-		if _, err := conn.Exec(ctx, query); err != nil {
-			return fmt.Errorf("failed to apply table grant on %s: %w", table, err)
-		}
-	}
-	return nil
-}
-
 // Upper-case is hygiene for non-CRD callers (CRD enum is case-sensitive). Empty
 // slice fails loudly so admission bypass can't produce "GRANT  ON TABLE …".
-func joinAllowedPrivileges(privileges []TablePrivilege) (string, error) {
+func allowedPrivileges(privileges []TablePrivilege) ([]string, error) {
 	if len(privileges) == 0 {
-		return "", fmt.Errorf("%w: no privileges provided", ErrInvalidTablePrivilege)
+		return nil, fmt.Errorf("%w: no privileges provided", ErrInvalidTablePrivilege)
 	}
 	parts := make([]string, 0, len(privileges))
 	for _, p := range privileges {
 		up := TablePrivilege(strings.ToUpper(strings.TrimSpace(string(p))))
 		if _, ok := allowedTablePrivileges[up]; !ok {
-			return "", fmt.Errorf("%w: %q", ErrInvalidTablePrivilege, p)
+			return nil, fmt.Errorf("%w: %q", ErrInvalidTablePrivilege, p)
 		}
 		parts = append(parts, string(up))
 	}
-	return strings.Join(parts, ", "), nil
+	return parts, nil
 }
 
 func (c *Client) VerifyDatabaseIsolation(ctx context.Context, username, allowedDatabase string) ([]string, error) {
@@ -1000,7 +1354,7 @@ func (c *Client) RevokePrivilegesInDatabase(ctx context.Context, username, datab
 		}
 		return err
 	}
-	defer func() { _ = conn.Close(ctx) }() // error on close is not actionable
+	defer func() { _ = conn.Close(ctx) }()
 
 	quotedUser := pq.QuoteIdentifier(username)
 	queries := []string{
@@ -1011,10 +1365,9 @@ func (c *Client) RevokePrivilegesInDatabase(ctx context.Context, username, datab
 		fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM %s", quotedUser),
 	}
 	for _, q := range queries {
-		_, _ = conn.Exec(ctx, q) // best-effort cleanup
+		_, _ = conn.Exec(ctx, q)
 	}
 
-	// Revoke connect on database level
 	revokeConnect := fmt.Sprintf("REVOKE CONNECT ON DATABASE %s FROM %s",
 		pq.QuoteIdentifier(database), quotedUser)
 	_, _ = c.pool.Exec(ctx, revokeConnect) // best-effort: may fail if not granted
@@ -1062,8 +1415,7 @@ func roleMembership(ctx context.Context, db sqlQuerier, username string) (operat
 	return operator, inherited, nil
 }
 
-// ReassignOwnership transfers all objects owned by fromUser to the current connection user (master).
-// This must be called before dropping a user who has owner privileges.
+// Must run before dropping a user that owns objects.
 func (c *Client) ReassignOwnership(ctx context.Context, fromUser, database string) error {
 	conn, err := c.connectToDatabase(ctx, database)
 	if err != nil {
@@ -1074,23 +1426,18 @@ func (c *Client) ReassignOwnership(ctx context.Context, fromUser, database strin
 	}
 	defer func() { _ = conn.Close(ctx) }()
 
-	quotedFromUser := pq.QuoteIdentifier(fromUser)
+	// Both statements wait for ACCESS EXCLUSIVE behind application sessions; the caller retries timeouts.
+	if _, err := conn.Exec(ctx, transferLockTimeout); err != nil {
+		return fmt.Errorf("failed to set the ownership transfer lock timeout: %w", err)
+	}
 
-	// REASSIGN OWNED transfers all objects owned by fromUser to the current user (master)
-	// This is required before DROP USER if the user owns any objects
-	query := fmt.Sprintf("REASSIGN OWNED BY %s TO CURRENT_USER", quotedFromUser)
-	if _, err := conn.Exec(ctx, query); err != nil {
+	quotedFromUser := pq.QuoteIdentifier(fromUser)
+	if _, err := conn.Exec(ctx, fmt.Sprintf("REASSIGN OWNED BY %s TO CURRENT_USER", quotedFromUser)); err != nil {
 		return fmt.Errorf("failed to reassign ownership from %s: %w", fromUser, err)
 	}
-
-	// DROP OWNED removes any remaining privileges (grants) that fromUser has
-	dropOwnedQuery := fmt.Sprintf("DROP OWNED BY %s", quotedFromUser)
-	if _, err := conn.Exec(ctx, dropOwnedQuery); err != nil {
-		// Best-effort: may fail if user has no remaining owned objects
-		// This is expected after REASSIGN OWNED
-		return nil
+	if _, err := conn.Exec(ctx, fmt.Sprintf("DROP OWNED BY %s", quotedFromUser)); err != nil {
+		return fmt.Errorf("failed to drop privileges of %s: %w", fromUser, err)
 	}
-
 	return nil
 }
 

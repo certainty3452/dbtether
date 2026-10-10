@@ -1,206 +1,104 @@
-# DBTether Helm Chart
+# dbtether Helm chart
 
-A Kubernetes operator for managing PostgreSQL databases in external clusters (AWS RDS, Aurora, Azure Database, GCP Cloud SQL, or any PostgreSQL-compatible database).
+Installs the dbtether operator and its CRDs. Usage and resource reference: [repository README](https://github.com/certainty3452/dbtether#readme).
 
-## Installation
+## Install
 
 ```bash
 helm upgrade -i dbtether oci://ghcr.io/certainty3452/charts/dbtether -n dbtether --create-namespace
 ```
 
-## Upgrading
+## Upgrade
 
-Helm installs the CRDs from `crds/` once and never upgrades them on subsequent `helm upgrade` runs — a Helm limitation, not specific to this chart. Apply the new version's CRDs first:
+Helm installs `crds/` once and never upgrades it. Apply the new version's CRDs first, then upgrade the release:
 
 ```bash
-helm show crds oci://ghcr.io/certainty3452/charts/dbtether --version <chart version> | kubectl apply --server-side --force-conflicts -f -
+helm show crds oci://ghcr.io/certainty3452/charts/dbtether --version <version> \
+  | kubectl apply --server-side --force-conflicts -f -
+helm upgrade dbtether oci://ghcr.io/certainty3452/charts/dbtether --version <version> -n dbtether
 ```
 
-`--force-conflicts` is required because Helm owns the CRD fields from the original install.
+`--force-conflicts` is needed because Helm owns the CRD fields from the first install.
 
-## CRDs Overview
+## Values
 
-| CRD | Description |
-|-----|-------------|
-| `DBCluster` | Connection to external PostgreSQL cluster |
-| `Database` | PostgreSQL database managed by the operator |
-| `DatabaseUser` | PostgreSQL user with automatic password management |
-| `BackupStorage` | S3/GCS/Azure storage configuration |
-| `Backup` | One-time database backup |
-| `BackupSchedule` | Scheduled backups with retention policy |
-| `Restore` | Database restoration from backup |
+| Key | Default | Description |
+|-----|---------|-------------|
+| `replicaCount` | `1` | Operator replicas. Above 1 requires `leaderElection.enabled` |
+| `revisionHistoryLimit` | `""` | Old ReplicaSets to keep (Kubernetes default when empty) |
+| `image.repository` | `ghcr.io/certainty3452/dbtether` | Operator image, also used for backup and restore Jobs |
+| `image.tag` | `""` | Defaults to the chart `appVersion` |
+| `image.pullPolicy` | `IfNotPresent` | |
+| `imagePullSecrets` | `[]` | |
+| `nameOverride` / `fullnameOverride` | `""` | |
+| `serviceAccount.create` | `true` | |
+| `serviceAccount.name` | `""` | Generated from the release name when empty |
+| `serviceAccount.annotations` | `{}` | Where the IRSA or Workload Identity binding goes |
+| `podAnnotations` / `podLabels` | `{}` | Extra metadata on the operator pod |
+| `podSecurityContext` | non-root, `RuntimeDefault` seccomp | |
+| `securityContext` | no privilege escalation, drop all capabilities, read-only root filesystem | |
+| `resources` | requests `100m` / `128Mi`, limits `500m` / `256Mi` | Operator pod |
+| `nodeSelector` / `tolerations` / `affinity` | `{}` / `[]` / `{}` | |
+| `leaderElection.enabled` | `true` | Lease-based election; standby replicas take over if the leader dies |
+| `metrics.enabled` | `true` | Serve the metrics endpoint; `false` passes `--metrics-bind-address=0` and drops the container port |
+| `metrics.port` | `8080` | Metrics endpoint port |
+| `health.port` | `8081` | Probe endpoint port |
+| `startupProbe` / `livenessProbe` / `readinessProbe` | `/healthz`, `/healthz`, `/readyz` | Full probe specs. The startup probe allows 5 minutes |
+| `logging.level` | `info` | `debug`, `info` or `error` |
+| `logging.format` | `json` | `json` or `console` |
+| `backup.maxConcurrentPerCluster` | `3` | Concurrent backup and restore Jobs per DBCluster |
+| `backup.resources` | requests `100m` / `384Mi`, limit memory `1Gi` | Backup and restore Job pods. Memory follows upload buffers, not database size; raise it for schemas with 100k+ objects |
+| `backup.podAnnotations` | `{}` | Job pod annotations, e.g. `karpenter.sh/do-not-disrupt: "true"` |
+| `backup.podLabels` | `{}` | Job pod labels |
+| `backup.jobLabels` | `{}` | Job object labels |
+| `extraEnv` | `[]` | Extra operator env vars: sources for DBCluster `credentialsFromEnv`, and `DB_SSLMODE` |
 
-## Quick Start
-
-### 1. Create a DBCluster (connection to your PostgreSQL)
+`DB_SSLMODE` (default `require`) sets the TLS mode of the operator's connections and of backup and restore Jobs:
 
 ```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: DBCluster
-metadata:
-  name: my-aurora
-spec:
-  endpoint: my-cluster.cluster-xxx.eu-central-1.rds.amazonaws.com
-  port: 5432
-  credentialsSecretRef:
-    name: aurora-master-credentials
-    namespace: default
+extraEnv:
+  - name: DB_SSLMODE
+    value: verify-full
 ```
 
-### 2. Create a Database
+## Cloud identity for storage
+
+The operator ServiceAccount's identity is used for BackupStorage access by the operator and by backup and restore Jobs, so one identity must reach every configured bucket. For per-tenant isolation, install one operator per tenant.
 
 ```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: Database
-metadata:
-  name: myapp-db
-  namespace: default
-spec:
-  clusterRef:
-    name: my-aurora
-  databaseName: myapp
-  deletionPolicy: Retain  # Keep database when CRD is deleted
-```
-
-### 3. Create a User
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: DatabaseUser
-metadata:
-  name: myapp-user
-  namespace: default
-spec:
-  database:
-    name: myapp-db
-  username: myapp
-  privileges: readwrite
-  password:
-    length: 32
-  rotation:
-    days: 30
-```
-
-### 4. Setup Backups
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: BackupStorage
-metadata:
-  name: s3-backups
-spec:
-  s3:
-    bucket: my-backups
-    region: eu-central-1
-    # Uses IRSA by default — no credentials needed!
----
-apiVersion: dbtether.io/v1alpha1
-kind: BackupSchedule
-metadata:
-  name: daily-backup
-  namespace: default
-spec:
-  databaseRef:
-    name: myapp-db
-  storageRef:
-    name: s3-backups
-  schedule: "0 2 * * *"  # Daily at 2 AM
-  retention:
-    keepLast: 7
-    keepDaily: 7
-    keepWeekly: 4
-```
-
-### 5. Restore from Backup
-
-```yaml
-apiVersion: dbtether.io/v1alpha1
-kind: Restore
-metadata:
-  name: restore-myapp
-  namespace: default
-spec:
-  source:
-    latestFrom:
-      databaseRef:
-        name: myapp-db  # Auto-find latest backup
-  target:
-    databaseRef:
-      name: myapp-db-restored
-  onConflict: drop  # drop existing database before restore
-```
-
-## Configuration
-
-### Values
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `replicaCount` | Number of operator replicas; > 1 needs `leaderElection.enabled` | `1` |
-| `image.repository` | Operator image | `ghcr.io/certainty3452/dbtether` |
-| `image.tag` | Image tag | `0.9.1` |
-| `serviceAccount.annotations` | ServiceAccount annotations — where the IRSA / Workload Identity binding goes | `{}` |
-| `resources.requests.cpu` | CPU request | `100m` |
-| `resources.requests.memory` | Memory request | `128Mi` |
-| `resources.limits.cpu` | CPU limit | `500m` |
-| `resources.limits.memory` | Memory limit | `256Mi` |
-| `leaderElection.enabled` | Enable leader election | `true` |
-| `logging.level` | Log level (debug, info, warn, error) | `info` |
-| `logging.format` | Log format (json, console) | `json` |
-| `backup.maxConcurrentPerCluster` | Max concurrent backups per cluster | `3` |
-| `backup.resources.requests.memory` | Memory request for backup/restore job pods | `384Mi` |
-| `backup.resources.limits.memory` | Memory limit for backup/restore job pods | `1Gi` |
-| `backup.podAnnotations` | Annotations for backup job pods (e.g., Karpenter protection) | `{}` |
-| `backup.podLabels` | Labels for backup job pods | `{}` |
-| `backup.jobLabels` | Labels for backup Job objects | `{}` |
-| `extraEnv` | Extra env vars on the operator pod — sources for `DBCluster.spec.credentialsFromEnv`, and `DB_SSLMODE` (default `require`), which applies to the operator and to backup/restore jobs | `[]` |
-
-Backup job memory is driven by upload buffers and the Go runtime, not by database size; raise it for schemas with 100k+ objects.
-
-### Cloud Authentication
-
-#### AWS (IRSA)
-
-```yaml
+# AWS (IRSA)
 serviceAccount:
   annotations:
     eks.amazonaws.com/role-arn: arn:aws:iam::123456789:role/dbtether-backup-role
 ```
 
-#### GCP (Workload Identity)
-
 ```yaml
+# GCP (Workload Identity)
 serviceAccount:
   annotations:
     iam.gke.io/gcp-service-account: dbtether@project.iam.gserviceaccount.com
 ```
 
-#### Azure (Workload Identity)
-
 ```yaml
+# Azure (Workload Identity)
 serviceAccount:
   annotations:
     azure.workload.identity/client-id: <client-id>
-podAnnotations:
+podLabels:
   azure.workload.identity/use: "true"
+backup:
+  podLabels:
+    azure.workload.identity/use: "true"
 ```
 
-## Uninstallation
+## Uninstall
+
+Delete the Database, DatabaseUser, Backup, BackupSchedule and Restore resources first: each has a finalizer only the operator removes, so deleting them afterwards leaves them in `Terminating`.
 
 ```bash
 helm uninstall dbtether -n dbtether
-kubectl delete namespace dbtether
+kubectl delete crd dbclusters.dbtether.io databases.dbtether.io databaseusers.dbtether.io \
+  backupstorages.dbtether.io backups.dbtether.io backupschedules.dbtether.io restores.dbtether.io
 ```
 
-> **Note:** CRDs are not deleted automatically. Delete the `Database`, `DatabaseUser`, `Backup`, `BackupSchedule` and `Restore` resources **before** uninstalling — each carries a finalizer that only the operator removes, so deleting them afterwards leaves them stuck in `Terminating` and blocks the CRD deletion below.
-> ```bash
-> kubectl delete crd dbclusters.dbtether.io databases.dbtether.io \
->   databaseusers.dbtether.io backupstorages.dbtether.io \
->   backups.dbtether.io backupschedules.dbtether.io restores.dbtether.io
-> ```
-
-## Links
-
-- [GitHub Repository](https://github.com/certainty3452/dbtether)
-- [Documentation](https://github.com/certainty3452/dbtether/tree/main/docs)
-- [Issues](https://github.com/certainty3452/dbtether/issues)
+Helm does not delete CRDs; the last command does, and removes every remaining resource of these kinds.

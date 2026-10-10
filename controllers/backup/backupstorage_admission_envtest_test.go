@@ -12,9 +12,7 @@ import (
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
 )
 
-// XValidation rules are evaluated by the apiserver, so they only show up under
-// envtest (the fake client doesn't run CEL). These tests pin the rule that
-// credentialsSecretRef is only allowed alongside an S3 provider.
+// CEL rules run only under envtest (the fake client skips them); pins credentialsSecretRef as S3-only.
 var _ = Describe("BackupStorage credentialsSecretRef admission", func() {
 	It("rejects credentialsSecretRef when GCS provider is selected", func() {
 		bs := &databasesv1alpha1.BackupStorage{

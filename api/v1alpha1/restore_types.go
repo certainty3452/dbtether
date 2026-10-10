@@ -5,6 +5,7 @@ import (
 )
 
 // RestoreSource specifies where to restore from
+// +kubebuilder:validation:XValidation:rule="(has(self.backupRef) ? 1 : 0) + (has(self.latestFrom) ? 1 : 0) + (has(self.path) ? 1 : 0) == 1",message="set exactly one of backupRef, latestFrom, path"
 type RestoreSource struct {
 	// Reference to an existing Backup resource
 	// +optional
@@ -26,7 +27,7 @@ type RestoreSource struct {
 
 // LatestFromSource specifies to use the latest backup from a database
 type LatestFromSource struct {
-	// Reference to the Database to find the latest backup for
+	// Reference to the Database to find the latest backup for; its namespace defaults to namespace below
 	// +kubebuilder:validation:Required
 	DatabaseRef DatabaseReference `json:"databaseRef"`
 
@@ -79,8 +80,7 @@ type RestoreSpec struct {
 // RestoreStatus defines the observed state of Restore
 type RestoreStatus struct {
 	// Current phase of the restore operation.
-	// Granting means the data landed but the target's DatabaseUsers do not hold
-	// their grants yet — the restore is not usable by them until Completed.
+	// Granting means the data is restored but the target's DatabaseUsers do not hold their grants yet.
 	// +kubebuilder:validation:Enum=Pending;Running;Granting;Completed;Failed
 	Phase string `json:"phase,omitempty"`
 
@@ -102,8 +102,11 @@ type RestoreStatus struct {
 	// RunID is a unique identifier for this restore run
 	RunID string `json:"runId,omitempty"`
 
-	// Number of failed grant re-apply rounds retried so far.
-	// Reset when Granting is entered after a successful restore Job.
+	// Time the restore Job reported that the backup was restored into the target database.
+	// +optional
+	JobSucceededAt *metav1.Time `json:"jobSucceededAt,omitempty"`
+
+	// Number of failed grant re-apply rounds so far.
 	// +optional
 	GrantAttempts int32 `json:"grantAttempts,omitempty"`
 
@@ -126,6 +129,7 @@ type Restore struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable; create a new Restore"
 	Spec   RestoreSpec   `json:"spec,omitempty"`
 	Status RestoreStatus `json:"status,omitempty"`
 }

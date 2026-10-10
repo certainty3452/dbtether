@@ -2,6 +2,22 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.10.0] - 2026-10-10
+
+### Breaking
+- Using a Database from another namespace now requires listing that namespace in `allowedNamespaces` (names or patterns like `box-*`; `*` allows any). Apply the new CRDs and add it before upgrading.
+- Database name and cluster, user name and Restore spec can't be changed after creation. A Restore must name exactly one source.
+- S3 backups need permission to tag objects; without it they now fail instead of producing broken files.
+
+### Fixed
+- Backups could end up empty or truncated, and retention could delete other databases' backups. GCS and Azure backups now work.
+- Deleting a Database no longer touches databases it doesn't own; lowered privileges are actually revoked, and outside changes are repaired.
+- Backups and restores survive operator restarts, and a locked or unreachable database no longer stalls the operator.
+
+### Changed
+- Chart logging and metrics settings now take effect; logs default to JSON at info level.
+
+
 ## [0.9.1] - 2026-09-11
 
 ### Fixed

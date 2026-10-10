@@ -1,7 +1,14 @@
 package storage
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
 	"testing"
+
+	"github.com/aws/smithy-go"
+	"github.com/stretchr/testify/require"
 )
 
 func TestS3Config_Validation(t *testing.T) {
@@ -41,7 +48,6 @@ func TestS3Config_Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Basic validation - bucket and region are required
 			hasRequired := tt.cfg.Bucket != "" && tt.cfg.Region != ""
 			if hasRequired != tt.valid {
 				t.Errorf("expected valid=%v, got bucket=%q region=%q", tt.valid, tt.cfg.Bucket, tt.cfg.Region)
@@ -101,54 +107,22 @@ func TestIsAccessDeniedError(t *testing.T) {
 		err      error
 		expected bool
 	}{
-		{
-			name:     "nil error",
-			err:      nil,
-			expected: false,
-		},
-		{
-			name:     "generic error",
-			err:      &testError{msg: "connection timeout"},
-			expected: false,
-		},
-		{
-			name:     "AccessDenied in message",
-			err:      &testError{msg: "operation error S3: AccessDenied: no permission"},
-			expected: true,
-		},
-		{
-			name:     "403 status code in message",
-			err:      &testError{msg: "https response error StatusCode: 403"},
-			expected: true,
-		},
-		{
-			name:     "case sensitive AccessDenied",
-			err:      &testError{msg: "accessdenied"},
-			expected: false, // lowercase not matched
-		},
-		{
-			name:     "PutObjectTagging denied",
-			err:      &testError{msg: "is not authorized to perform: s3:PutObjectTagging... AccessDenied"},
-			expected: true,
-		},
+		{name: "nil error", err: nil, expected: false},
+		{name: "generic error", err: errors.New("connection timeout"), expected: false},
+		{name: "AccessDenied API error", err: &smithy.GenericAPIError{Code: "AccessDenied"}, expected: true},
+		{name: "wrapped AccessDenied API error", err: fmt.Errorf("upload: %w", &smithy.GenericAPIError{Code: "AccessDenied"}), expected: true},
+		{name: "other API error", err: &smithy.GenericAPIError{Code: "NoSuchBucket"}, expected: false},
+		{name: "403 only in message", err: errors.New("https response error StatusCode: 403"), expected: false},
+		{name: "AccessDenied only in message", err: errors.New("operation error S3: AccessDenied: no permission"), expected: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := isAccessDeniedError(tt.err)
-			if result != tt.expected {
-				t.Errorf("isAccessDeniedError() = %v, want %v", result, tt.expected)
+			if got := isAccessDeniedError(tt.err); got != tt.expected {
+				t.Errorf("isAccessDeniedError() = %v, want %v", got, tt.expected)
 			}
 		})
 	}
-}
-
-type testError struct {
-	msg string
-}
-
-func (e *testError) Error() string {
-	return e.msg
 }
 
 func TestObjectTags_Format(t *testing.T) {
@@ -161,13 +135,36 @@ func TestObjectTags_Format(t *testing.T) {
 		CreatedBy:  "dbtether",
 	}
 
-	// Verify all fields are non-empty
 	if tags.Database == "" || tags.Cluster == "" || tags.BackupName == "" {
 		t.Error("all tag fields should be populated")
 	}
 
-	// Verify timestamp format
 	if len(tags.Timestamp) != 15 { // YYYYMMDD-HHMMSS
 		t.Errorf("timestamp format unexpected: %s", tags.Timestamp)
+	}
+}
+
+func TestS3Upload_TaggingDeniedErrorNamesPermission(t *testing.T) {
+	f := newFakeS3DenyingTagging(t)
+	c, err := NewS3Client(context.Background(), &S3Config{
+		Bucket: "b", Region: "us-east-1", Endpoint: f.srv.URL,
+		AccessKey: "AKIATEST", SecretKey: "secret",
+	}, nil)
+	require.NoError(t, err)
+	tags := &ObjectTags{Database: "d", CreatedBy: "dbtether"}
+
+	for name, upload := range map[string]func() error{
+		"UploadWithTags":  func() error { return c.UploadWithTags(context.Background(), "k", bytes.NewReader([]byte("x")), tags) },
+		"UploadStreaming": func() error { return c.UploadStreaming(context.Background(), "k", bytes.NewReader([]byte("x")), tags) },
+		"UploadStreaming multipart": func() error {
+			return c.UploadStreaming(context.Background(), "k", bytes.NewReader(make([]byte, 65*1024*1024)), tags)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := upload()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "s3:PutObjectTagging")
+			require.False(t, f.stored)
+		})
 	}
 }

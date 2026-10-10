@@ -34,7 +34,6 @@ func GeneratePassword(length int) (string, error) {
 	result := make([]byte, length)
 	pos := 0
 
-	// Guarantee minimum of each character type
 	if err := fillFromCharset(result, &pos, lowerChars, minLower); err != nil {
 		return "", err
 	}
@@ -48,13 +47,11 @@ func GeneratePassword(length int) (string, error) {
 		return "", err
 	}
 
-	// Fill remaining positions with random characters from all charsets
 	allChars := lowerChars + upperChars + digitChars + specialChars
 	if err := fillFromCharset(result, &pos, allChars, length-pos); err != nil {
 		return "", err
 	}
 
-	// Shuffle to avoid predictable pattern
 	if err := shuffle(result); err != nil {
 		return "", err
 	}

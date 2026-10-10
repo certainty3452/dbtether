@@ -5,41 +5,25 @@ metadata:
   labels:
     {{- include "dbtether.labels" . | nindent 4 }}
 rules:
-  # DBCluster permissions
   - apiGroups:
       - dbtether.io
     resources:
       - dbclusters
     verbs:
-      - create
-      - delete
       - get
       - list
-      - patch
-      - update
       - watch
   - apiGroups:
       - dbtether.io
     resources:
       - dbclusters/status
     verbs:
-      - get
       - patch
-      - update
-  - apiGroups:
-      - dbtether.io
-    resources:
-      - dbclusters/finalizers
-    verbs:
-      - update
-  # Database permissions
   - apiGroups:
       - dbtether.io
     resources:
       - databases
     verbs:
-      - create
-      - delete
       - get
       - list
       - patch
@@ -50,70 +34,42 @@ rules:
     resources:
       - databases/status
     verbs:
-      - get
       - patch
-      - update
-  - apiGroups:
-      - dbtether.io
-    resources:
-      - databases/finalizers
-    verbs:
-      - update
-  # DatabaseUser permissions
   - apiGroups:
       - dbtether.io
     resources:
       - databaseusers
     verbs:
-      - create
-      - delete
       - get
       - list
       - patch
-      - update
       - watch
   - apiGroups:
       - dbtether.io
     resources:
       - databaseusers/status
     verbs:
-      - get
       - patch
-      - update
   - apiGroups:
       - dbtether.io
     resources:
       - databaseusers/finalizers
     verbs:
       - update
-  # BackupStorage permissions
   - apiGroups:
       - dbtether.io
     resources:
       - backupstorages
     verbs:
-      - create
-      - delete
       - get
       - list
-      - patch
-      - update
       - watch
   - apiGroups:
       - dbtether.io
     resources:
       - backupstorages/status
     verbs:
-      - get
       - patch
-      - update
-  - apiGroups:
-      - dbtether.io
-    resources:
-      - backupstorages/finalizers
-    verbs:
-      - update
-  # Backup permissions
   - apiGroups:
       - dbtether.io
     resources:
@@ -131,50 +87,33 @@ rules:
     resources:
       - backups/status
     verbs:
-      - get
       - patch
-      - update
-  - apiGroups:
-      - dbtether.io
-    resources:
-      - backups/finalizers
-    verbs:
-      - update
-  # BackupSchedule permissions
   - apiGroups:
       - dbtether.io
     resources:
       - backupschedules
     verbs:
-      - create
-      - delete
       - get
       - list
       - patch
-      - update
       - watch
   - apiGroups:
       - dbtether.io
     resources:
       - backupschedules/status
     verbs:
-      - get
       - patch
-      - update
   - apiGroups:
       - dbtether.io
     resources:
       - backupschedules/finalizers
     verbs:
       - update
-  # Restore permissions
   - apiGroups:
       - dbtether.io
     resources:
       - restores
     verbs:
-      - create
-      - delete
       - get
       - list
       - patch
@@ -185,16 +124,7 @@ rules:
     resources:
       - restores/status
     verbs:
-      - get
       - patch
-      - update
-  - apiGroups:
-      - dbtether.io
-    resources:
-      - restores/finalizers
-    verbs:
-      - update
-  # Job permissions (for backup/restore jobs)
   - apiGroups:
       - batch
     resources:
@@ -205,35 +135,26 @@ rules:
       - get
       - list
       - patch
-      - update
       - watch
-  # Secret permissions (read + write for DatabaseUser credentials)
   - apiGroups:
       - ""
     resources:
       - secrets
     verbs:
+      - create
+      - delete
       - get
       - list
-      - watch
-      - create
       - update
-      - patch
-      - delete
-  # Leader election
+      - watch
   - apiGroups:
       - coordination.k8s.io
     resources:
       - leases
     verbs:
       - create
-      - delete
       - get
-      - list
-      - patch
       - update
-      - watch
-  # Events (for leader election announcements)
   - apiGroups:
       - ""
     resources:
@@ -241,13 +162,10 @@ rules:
     verbs:
       - create
       - patch
-  # Pod permissions (for backup job status tracking and failure diagnostics)
   - apiGroups:
       - ""
     resources:
       - pods
     verbs:
-      - get
       - list
       - watch
-

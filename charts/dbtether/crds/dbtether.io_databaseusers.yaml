@@ -60,8 +60,7 @@ spec:
                 items:
                   properties:
                     privileges:
-                      description: Enum here is the admission gate; controller re-checks
-                        before SQL composition.
+                      description: Privileges to grant on the listed tables.
                       items:
                         enum:
                         - SELECT
@@ -76,8 +75,7 @@ spec:
                       minItems: 1
                       type: array
                     tables:
-                      description: Pattern rules out null-bytes and unicode tricks
-                        before SQL layer.
+                      description: Table names in the public schema.
                       items:
                         maxLength: 63
                         pattern: ^[a-zA-Z_][a-zA-Z0-9_]*$
@@ -108,6 +106,8 @@ spec:
                     description: Reference to Database resource
                     type: string
                   namespace:
+                    description: Namespace of the Database. A namespace other than
+                      the DatabaseUser's must be listed in the Database's spec.allowedNamespaces.
                     type: string
                   privileges:
                     description: Override default privileges for this database
@@ -131,6 +131,8 @@ spec:
                       description: Reference to Database resource
                       type: string
                     namespace:
+                      description: Namespace of the Database. A namespace other than
+                        the DatabaseUser's must be listed in the Database's spec.allowedNamespaces.
                       type: string
                     privileges:
                       description: Override default privileges for this database
@@ -195,10 +197,8 @@ spec:
                       host:
                         type: string
                       password:
-                        description: |-
-                          Renaming after the secret exists forces a password regeneration — the
-                          previous value can't be located under the old name. PG user keeps
-                          working; consumers must re-read the secret.
+                        description: Renaming after the secret exists regenerates
+                          the password; consumers must re-read the secret.
                         type: string
                       port:
                         type: string
@@ -212,11 +212,8 @@ spec:
                   onConflict:
                     default: Fail
                     description: |-
-                      Merge mode persists via an annotation on the produced secret: once a
-                      secret is adopted under Merge, subsequent reconciles keep overlaying
-                      (foreign keys preserved) even if onConflict is later removed from the
-                      spec. Use Adopt then Fail (or recreate the secret) to "fall back" to
-                      full-replace semantics.
+                      What to do when the secret already exists. Merge keeps overlaying the
+                      secret on later reconciles, preserving foreign keys, even if onConflict is removed.
                     enum:
                     - Fail
                     - Adopt
@@ -259,6 +256,9 @@ spec:
                 only Fail is allowed
               rule: '!(self.secretGeneration == ''perDatabase'' && has(self.secret)
                 && has(self.secret.onConflict) && self.secret.onConflict != ''Fail'')'
+            - message: spec.username is immutable
+              rule: has(self.username) == has(oldSelf.username) && (!has(self.username)
+                || self.username == oldSelf.username)
           status:
             properties:
               clusterName:

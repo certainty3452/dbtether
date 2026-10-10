@@ -1,4 +1,3 @@
-# Simple case - single database
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
@@ -9,7 +8,6 @@ spec:
     name: orders-db
   privileges: readwrite
 ---
-# Admin user for migrations with password rotation
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
@@ -26,7 +24,6 @@ spec:
     days: 30
   deletionPolicy: Delete
 ---
-# Readonly user with connection limit
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
@@ -38,7 +35,6 @@ spec:
   privileges: readonly
   connectionLimit: 5
 ---
-# Multiple databases - one user, different privileges per database
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
@@ -52,11 +48,10 @@ spec:
       privileges: readwrite
     - name: temporal-visibility-db
       privileges: readonly
-  privileges: readonly  # default for databases without explicit privileges
+  privileges: readonly
   password:
     length: 24
 ---
-# Multiple databases with separate secret per database
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
@@ -68,11 +63,10 @@ spec:
     - name: db2
     - name: db3
   privileges: readwrite
-  secretGeneration: perDatabase  # creates 3 secrets with same password, different database field
+  secretGeneration: perDatabase
   secret:
     template: POSTGRES
 ---
-# User with Retain policy - user stays in PostgreSQL after resource deletion
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
@@ -84,7 +78,6 @@ spec:
   privileges: readwrite
   deletionPolicy: Retain
 ---
-# User with custom secret name and DATABASE template
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
@@ -98,7 +91,6 @@ spec:
     name: api-db-credentials
     template: DATABASE
 ---
-# User with POSTGRES template (for standard PostgreSQL env vars)
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
@@ -111,7 +103,6 @@ spec:
   secret:
     template: POSTGRES
 ---
-# User with fully custom secret keys (for legacy app compatibility)
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
@@ -131,7 +122,6 @@ spec:
       username: PGUSER
       password: PGPASSWORD
 ---
-# User with onConflict: Adopt - take over existing secret
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
@@ -145,7 +135,6 @@ spec:
     name: orphaned-secret
     onConflict: Adopt
 ---
-# User with onConflict: Merge - add credentials to existing secret
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:
@@ -160,7 +149,6 @@ spec:
     template: raw
     onConflict: Merge
 ---
-# Cross-namespace database reference
 apiVersion: dbtether.io/v1alpha1
 kind: DatabaseUser
 metadata:

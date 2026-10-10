@@ -2,10 +2,10 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 )
 
 type S3Client struct {
@@ -24,7 +25,7 @@ type S3Client struct {
 type S3Config struct {
 	Bucket    string
 	Region    string
-	Endpoint  string // optional, for custom endpoints
+	Endpoint  string
 	AccessKey string // optional, empty = use IRSA/Pod Identity
 	SecretKey string
 }
@@ -41,7 +42,6 @@ func NewS3Client(ctx context.Context, cfg *S3Config, logger *slog.Logger) (*S3Cl
 		config.WithRegion(cfg.Region),
 	}
 
-	// Use explicit credentials if provided, otherwise use default chain (IRSA/Pod Identity)
 	if cfg.AccessKey != "" && cfg.SecretKey != "" {
 		opts = append(opts, config.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, ""),
@@ -70,7 +70,6 @@ func NewS3Client(ctx context.Context, cfg *S3Config, logger *slog.Logger) (*S3Cl
 	}, nil
 }
 
-// ObjectTags contains metadata tags for uploaded objects
 type ObjectTags struct {
 	Database   string
 	Cluster    string
@@ -85,73 +84,28 @@ func (c *S3Client) Upload(ctx context.Context, key string, body io.Reader) error
 }
 
 func (c *S3Client) UploadWithTags(ctx context.Context, key string, body io.Reader, tags *ObjectTags) error {
-	input := &s3.PutObjectInput{
-		Bucket:      aws.String(c.bucket),
-		Key:         aws.String(key),
-		Body:        body,
-		ContentType: aws.String("application/gzip"),
-	}
-
-	if tags != nil {
-		// Build tagging string: Key1=Value1&Key2=Value2
-		tagging := fmt.Sprintf(
-			"database=%s&cluster=%s&backup-name=%s&namespace=%s&timestamp=%s&created-by=%s",
-			tags.Database,
-			tags.Cluster,
-			tags.BackupName,
-			tags.Namespace,
-			tags.Timestamp,
-			tags.CreatedBy,
-		)
-		input.Tagging = aws.String(tagging)
-	}
-
-	_, err := c.client.PutObject(ctx, input)
-	if err != nil {
-		// Best-effort: if tagging fails (403 AccessDenied on PutObjectTagging), retry without tags
-		if tags != nil && isAccessDeniedError(err) {
-			c.logger.Warn("S3 tagging permission denied, uploading without tags (add s3:PutObjectTagging to IAM policy)",
-				"bucket", c.bucket,
-				"key", key,
-			)
-			input.Tagging = nil
-			_, retryErr := c.client.PutObject(ctx, input)
-			if retryErr != nil {
-				return fmt.Errorf("failed to upload to S3: %w", retryErr)
-			}
-			return nil // uploaded without tags
-		}
-		return fmt.Errorf("failed to upload to S3: %w", err)
-	}
-	return nil
+	_, err := c.client.PutObject(ctx, c.putObjectInput(key, body, tags))
+	return c.uploadError(key, tags, err)
 }
 
-// isAccessDeniedError checks if the error is an S3 AccessDenied error
-func isAccessDeniedError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := err.Error()
-	// Check for AccessDenied in error string (covers various AWS SDK error types)
-	return strings.Contains(errStr, "AccessDenied") || strings.Contains(errStr, "403")
-}
-
-// UploadStreaming uses S3 multipart upload for large files.
 func (c *S3Client) UploadStreaming(ctx context.Context, key string, body io.Reader, tags *ObjectTags) error {
 	uploader := manager.NewUploader(c.client, func(u *manager.Uploader) {
-		u.PartSize = 64 * 1024 * 1024 // 64MB parts
+		u.PartSize = 64 * 1024 * 1024
 		u.Concurrency = 3
 	})
+	_, err := uploader.Upload(ctx, c.putObjectInput(key, body, tags))
+	return c.uploadError(key, tags, err)
+}
 
+func (c *S3Client) putObjectInput(key string, body io.Reader, tags *ObjectTags) *s3.PutObjectInput {
 	input := &s3.PutObjectInput{
 		Bucket:      aws.String(c.bucket),
 		Key:         aws.String(key),
 		Body:        body,
 		ContentType: aws.String("application/gzip"),
 	}
-
 	if tags != nil {
-		tagging := fmt.Sprintf(
+		input.Tagging = aws.String(fmt.Sprintf(
 			"database=%s&cluster=%s&backup-name=%s&namespace=%s&timestamp=%s&created-by=%s",
 			tags.Database,
 			tags.Cluster,
@@ -159,27 +113,25 @@ func (c *S3Client) UploadStreaming(ctx context.Context, key string, body io.Read
 			tags.Namespace,
 			tags.Timestamp,
 			tags.CreatedBy,
-		)
-		input.Tagging = aws.String(tagging)
+		))
 	}
+	return input
+}
 
-	_, err := uploader.Upload(ctx, input)
-	if err != nil {
-		if tags != nil && isAccessDeniedError(err) {
-			c.logger.Warn("S3 tagging permission denied, uploading without tags",
-				"bucket", c.bucket,
-				"key", key,
-			)
-			input.Tagging = nil
-			_, retryErr := uploader.Upload(ctx, input)
-			if retryErr != nil {
-				return fmt.Errorf("failed to upload to S3: %w", retryErr)
-			}
-			return nil
-		}
-		return fmt.Errorf("failed to upload to S3: %w", err)
+// The body is a one-shot stream, so a denied tagged upload cannot be retried without tags.
+func (c *S3Client) uploadError(key string, tags *ObjectTags, err error) error {
+	if err == nil {
+		return nil
 	}
-	return nil
+	if tags != nil && isAccessDeniedError(err) {
+		return fmt.Errorf("failed to upload s3://%s/%s: access denied for a tagged upload, the IAM policy needs s3:PutObjectTagging in addition to s3:PutObject: %w", c.bucket, key, err)
+	}
+	return fmt.Errorf("failed to upload to S3: %w", err)
+}
+
+func isAccessDeniedError(err error) bool {
+	var apiErr smithy.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "AccessDenied"
 }
 
 func (c *S3Client) Download(ctx context.Context, key string) (io.ReadCloser, error) {
@@ -199,7 +151,6 @@ func (c *S3Client) Exists(ctx context.Context, key string) (bool, error) {
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		// Check if it's a "not found" error
 		return false, nil
 	}
 	return true, nil
@@ -216,9 +167,7 @@ func (c *S3Client) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// Reachable verifies bucket existence and access via HeadBucket.
-// HeadBucket is the canonical S3 reachability probe: one round-trip,
-// no body, requires only s3:ListBucket on the bucket resource.
+// Needs only s3:ListBucket on the bucket.
 func (c *S3Client) Reachable(ctx context.Context) error {
 	_, err := c.client.HeadBucket(ctx, &s3.HeadBucketInput{
 		Bucket: aws.String(c.bucket),
@@ -229,7 +178,6 @@ func (c *S3Client) Reachable(ctx context.Context) error {
 	return nil
 }
 
-// List lists all objects with the given prefix
 func (c *S3Client) List(ctx context.Context, prefix string) ([]StorageObject, error) {
 	var objects []StorageObject
 

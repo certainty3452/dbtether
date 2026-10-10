@@ -88,7 +88,6 @@ var _ = Describe("BackupSchedule Controller", func() {
 			}
 			Expect(k8sClient.Create(ctx, db)).Should(Succeed())
 
-			// Manually set database status to Ready
 			Eventually(func() error {
 				if err := k8sClient.Get(ctx, types.NamespacedName{Name: testDBNameEnvtest, Namespace: scheduleTestNS}, db); err != nil {
 					return err
@@ -107,7 +106,7 @@ var _ = Describe("BackupSchedule Controller", func() {
 				Spec: databasesv1alpha1.BackupScheduleSpec{
 					DatabaseRef: databasesv1alpha1.DatabaseReference{Name: testDBNameEnvtest},
 					StorageRef:  databasesv1alpha1.StorageReference{Name: "test-storage"},
-					Schedule:    "0 2 * * *", // Daily at 2 AM
+					Schedule:    "0 2 * * *",
 					Retention: &databasesv1alpha1.RetentionPolicy{
 						KeepLast: intPtr(7),
 					},
@@ -170,7 +169,7 @@ var _ = Describe("BackupSchedule Controller", func() {
 				Spec: databasesv1alpha1.BackupScheduleSpec{
 					DatabaseRef: databasesv1alpha1.DatabaseReference{Name: "nonexistent-db"},
 					StorageRef:  databasesv1alpha1.StorageReference{Name: "nonexistent-storage"},
-					Schedule:    "invalid cron", // Invalid - will be rejected by CRD validation
+					Schedule:    "invalid cron",
 				},
 			}
 			err := k8sClient.Create(ctx, schedule)
@@ -273,5 +272,3 @@ var _ = Describe("BackupSchedule Controller", func() {
 		})
 	})
 })
-
-// intPtr is defined in schedule_controller_test.go

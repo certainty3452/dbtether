@@ -161,7 +161,6 @@ func TestBackupStorage_GetProvider(t *testing.T) {
 	}
 }
 
-// newStorageTestScheme registers the types needed by the BackupStorage reconciler tests.
 func newStorageTestScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = databasesv1alpha1.AddToScheme(s)
@@ -169,8 +168,6 @@ func newStorageTestScheme() *runtime.Scheme {
 	return s
 }
 
-// newStorageReconciler builds a BackupStorageReconciler backed by a fake client.
-// `probeErr` is what the injected storage factory returns from Reachable().
 func newStorageReconciler(probeErr error, objs ...client.Object) (*BackupStorageReconciler, *fakeStorageFactory) {
 	scheme := newStorageTestScheme()
 	fakeClient := fake.NewClientBuilder().
@@ -206,8 +203,6 @@ func (f *fakeStorageFactory) build(_ context.Context, _ client.Client, bs *datab
 	return m, nil
 }
 
-// TestBackupStorageReconciler_ProbeReady covers the happy path: valid spec +
-// reachable bucket → status Ready, message references reachability.
 func TestBackupStorageReconciler_ProbeReady(t *testing.T) {
 	bs := &databasesv1alpha1.BackupStorage{
 		ObjectMeta: metav1.ObjectMeta{Name: "ready-s3"},
@@ -241,10 +236,6 @@ func TestBackupStorageReconciler_ProbeReady(t *testing.T) {
 	}
 }
 
-// TestBackupStorageReconciler_ProbeFailureSurfacesError covers the missed
-// failure mode from the previous behaviour: validateStorage said "one provider
-// configured", reconciler flipped to Ready, the actual bucket call failed.
-// The reachability probe must catch this and surface the real error.
 func TestBackupStorageReconciler_ProbeFailureSurfacesError(t *testing.T) {
 	bs := &databasesv1alpha1.BackupStorage{
 		ObjectMeta: metav1.ObjectMeta{Name: "broken-s3"},
@@ -277,9 +268,6 @@ func TestBackupStorageReconciler_ProbeFailureSurfacesError(t *testing.T) {
 	}
 }
 
-// TestBackupStorageReconciler_ValidationFailureSkipsProbe verifies the
-// pre-existing validation still short-circuits before the probe runs — no
-// point calling the SDK if the spec itself is malformed.
 func TestBackupStorageReconciler_ValidationFailureSkipsProbe(t *testing.T) {
 	bs := &databasesv1alpha1.BackupStorage{
 		ObjectMeta: metav1.ObjectMeta{Name: "no-provider"},
@@ -304,9 +292,6 @@ func TestBackupStorageReconciler_ValidationFailureSkipsProbe(t *testing.T) {
 	}
 }
 
-// TestReadS3CredentialsErrors covers the credential-resolution branches that
-// are easy to get wrong: missing namespace on the SecretRef, missing Secret,
-// and incomplete Secret data.
 func TestReadS3CredentialsErrors(t *testing.T) {
 	scheme := newStorageTestScheme()
 
@@ -374,8 +359,6 @@ func TestReadS3CredentialsErrors(t *testing.T) {
 	}
 }
 
-// TestBackupStorageStatusChangeDetection verifies that status is only updated when meaningful changes occur
-// This prevents unnecessary reconciliation loops caused by status patches
 func TestBackupStorageStatusChangeDetection(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -460,7 +443,6 @@ func TestBackupStorageStatusChangeDetection(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Simulate the statusChanged check from updateStatus
 			statusChanged := tt.currentStatus.Phase != tt.newPhase ||
 				tt.currentStatus.Message != tt.newMessage ||
 				tt.currentStatus.Provider != tt.newProvider ||

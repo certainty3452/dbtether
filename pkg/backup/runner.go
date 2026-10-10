@@ -18,8 +18,9 @@ import (
 	"github.com/certainty3452/dbtether/pkg/storage"
 )
 
+const DefaultFilenameTemplate = "{{ .Timestamp }}.sql.gz"
+
 type BackupConfig struct {
-	// Database connection
 	Host     string
 	Port     int
 	Database string
@@ -27,22 +28,19 @@ type BackupConfig struct {
 	Password string
 	SSLMode  string
 
-	// Storage
 	StorageType string // "s3", "gcs", "azure"
 	S3Config    storage.S3Config
 	GCSConfig   storage.GCSConfig
 	AzureConfig storage.AzureConfig
 
-	// Output
 	PathTemplate     string
 	FilenameTemplate string
 
-	// Metadata for templates and tags
 	ClusterName  string
 	DatabaseName string
 	BackupName   string
 	Namespace    string
-	RunID        string // Unique identifier for this backup run
+	RunID        string
 }
 
 type TemplateData struct {
@@ -52,14 +50,13 @@ type TemplateData struct {
 	Month        string
 	Day          string
 	Timestamp    string
-	RunID        string // Unique identifier for this backup run (8 alphanumeric chars)
+	RunID        string
 }
 
-// BackupResult contains the results of a backup operation
 type BackupResult struct {
-	Path             string // Full path to the backup file in storage
-	Size             int64  // Size of compressed backup in bytes
-	UncompressedSize int64  // Size before compression
+	Path             string
+	Size             int64
+	UncompressedSize int64
 	Duration         time.Duration
 }
 
@@ -118,8 +115,6 @@ func RunBackup(ctx context.Context, cfg *BackupConfig) (*BackupResult, error) {
 	return result, nil
 }
 
-// runStreamingBackup streams pg_dump output through gzip directly to storage.
-// Memory usage is O(buffer size) instead of O(database size).
 func runStreamingBackup(ctx context.Context, cfg *BackupConfig, pgDump, fullPath string, tags *storage.ObjectTags) (*BackupResult, error) {
 	pr, pw := io.Pipe()
 
@@ -194,8 +189,6 @@ func pgDumpEnv(cfg *BackupConfig) []string {
 }
 
 func uploadToStorage(ctx context.Context, cfg *BackupConfig, path string, data io.Reader, tags *storage.ObjectTags) error {
-	// S3 uses multipart Uploader (UploadStreaming); GCS/Azure unify through
-	// UploadWithTags. Both go through the shared StorageClient factory.
 	if cfg.StorageType == "s3" {
 		client, err := storage.NewS3Client(ctx, &cfg.S3Config, nil)
 		if err != nil {

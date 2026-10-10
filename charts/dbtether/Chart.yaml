@@ -2,10 +2,9 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.9.1
-appVersion: "0.9.1"
+version: 0.10.0
+appVersion: "0.10.0"
 home: https://github.com/certainty3452/dbtether
-# icon: https://raw.githubusercontent.com/certainty3452/dbtether/main/docs/logo.png
 keywords:
   - postgresql
   - postgres
@@ -90,6 +89,9 @@ annotations:
         extensions:
           - uuid-ossp
           - pg_trgm
+        allowedNamespaces:
+          - team-beta
+          - box-*
         deletionPolicy: Delete
     - apiVersion: dbtether.io/v1alpha1
       kind: DatabaseUser
@@ -132,7 +134,7 @@ annotations:
       kind: BackupSchedule
       metadata:
         name: orders-nightly
-        namespace: orders-team
+        namespace: team-alpha
       spec:
         databaseRef:
           name: orders-db
@@ -148,7 +150,7 @@ annotations:
       kind: Restore
       metadata:
         name: restore-orders-latest
-        namespace: default
+        namespace: team-alpha
       spec:
         source:
           latestFrom:
@@ -159,9 +161,19 @@ annotations:
             name: orders-db-restored
         onConflict: drop
   artifacthub.io/changes: |
+    - kind: changed
+      description: "Breaking: Using a Database from another namespace now requires listing that namespace in `allowedNamespaces` (names or patterns like `box-*`; `*` allows any). Apply the new CRDs and add it before upgrading."
+    - kind: changed
+      description: "Breaking: Database name and cluster, user name and Restore spec can't be changed after creation. A Restore must name exactly one source."
+    - kind: changed
+      description: "Breaking: S3 backups need permission to tag objects; without it they now fail instead of producing broken files."
     - kind: fixed
-      description: "After a restore that replaced the database (`onConflict: drop`), the database was left open to every role of the cluster and looked unowned until the next periodic reconcile; the restore now re-applies the database settings (ownership, public access, extensions) as soon as the data is in"
+      description: "Backups could end up empty or truncated, and retention could delete other databases' backups. GCS and Azure backups now work."
     - kind: fixed
-      description: "Users of a replaced database lost their connection right when that reconcile ran; the restore now re-grants every user's access and privileges"
+      description: "Deleting a Database no longer touches databases it doesn't own; lowered privileges are actually revoked, and outside changes are repaired."
     - kind: fixed
-      description: "A database whose public access could not be revoked, including when the operator is not its owner, was reported as ready; it is now reported as failed"
+      description: "Backups and restores survive operator restarts, and a locked or unreachable database no longer stalls the operator."
+    - kind: changed
+      description: "Chart logging and metrics settings now take effect; logs default to JSON at info level."
+    - kind: security
+      description: "Go and dependencies updated to fix known vulnerabilities."

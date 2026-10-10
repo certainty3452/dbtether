@@ -1,17 +1,11 @@
-# Default values for dbtether
 
-# replicaCount=1 with leaderElection.enabled=true is the safe default — single
-# active reconciler, no split-brain. Set replicaCount >= 2 to enable HA: extra
-# replicas sit on standby and one takes over via lease if the leader dies.
 replicaCount: 1
-# Number of old ReplicaSets to retain (Kubernetes default is 10)
 revisionHistoryLimit: ""
 
 image:
   repository: ghcr.io/certainty3452/dbtether
   pullPolicy: IfNotPresent
-  # Automatically updated by release pipeline from git tag
-  tag: "0.9.1"
+  tag: ""
 
 imagePullSecrets: []
 nameOverride: ""
@@ -22,13 +16,9 @@ serviceAccount:
   annotations: {}
   name: ""
 
-# Additional annotations for the operator pod
 podAnnotations: {}
 
-# Additional labels for the operator pod (in addition to standard app.kubernetes.io/* labels)
 podLabels: {}
-# Example:
-#   custom-label: my-value
 
 podSecurityContext:
   runAsNonRoot: true
@@ -56,23 +46,16 @@ tolerations: []
 
 affinity: {}
 
-# Leader election (coordination.k8s.io lease). Required if replicaCount > 1;
-# harmless overhead if replicaCount == 1.
 leaderElection:
   enabled: true
 
-# Metrics configuration
 metrics:
   enabled: true
   port: 8080
 
-# Health probe configuration
 health:
   port: 8081
 
-# Probes configuration
-# Startup probe - gives time for leader election and initialization
-# failureThreshold * periodSeconds = max startup time (default: 30 * 10 = 300s = 5 min)
 startupProbe:
   httpGet:
     path: /healthz
@@ -102,20 +85,13 @@ readinessProbe:
   successThreshold: 1
   failureThreshold: 3
 
-# Logging configuration
 logging:
-  level: info  # debug, info, warn, error
-  format: json  # json, console
+  level: info
+  format: json
 
-# Backup configuration
 backup:
-  # Maximum concurrent backup jobs per DBCluster (prevents connection pool exhaustion)
   maxConcurrentPerCluster: 3
 
-  # Peak is O(S3 multipart buffers + Go runtime) ≈ 300-500 MiB regardless of
-  # database size — not O(DB size). Bump on huge schemas (100k+ objects).
-  # Burstable QoS (requests < limits) is intentional for a chart default;
-  # override requests.memory to match limits if you need Guaranteed QoS.
   resources:
     limits:
       memory: 1Gi
@@ -123,42 +99,10 @@ backup:
       cpu: 100m
       memory: 384Mi
 
-  # Annotations for backup job pods
-  # Use this to protect backup pods from autoscaler disruption (Karpenter, cluster-autoscaler)
-  # Similar to Dagster's runK8sConfig.podTemplateSpecMetadata.annotations
-  # or Airbyte's global.jobs.kube.annotations
   podAnnotations: {}
-  # Example:
-  #   karpenter.sh/do-not-disrupt: "true"
-  #   cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
 
-  # Labels for backup job pods (in addition to required dbtether.io/* labels)
-  # Use for log filtering in Grafana/Loki, monitoring, etc.
   podLabels: {}
-  # Example:
-  #   app.kubernetes.io/name: dbtether-backup
-  #   app.kubernetes.io/component: backup-job
 
-  # Labels for backup Job objects (in addition to required dbtether.io/* labels)
   jobLabels: {}
-  # Example:
-  #   app.kubernetes.io/name: dbtether-backup
-  #   app.kubernetes.io/managed-by: dbtether
 
-# Extra environment variables for the operator pod.
-# Used for credentialsFromEnv in DBCluster resources, and for tunables like
-# DB_SSLMODE, which applies to the operator's own connections and to backup/restore jobs.
 extraEnv: []
-# Example:
-#   - name: DB_SSLMODE
-#     value: "verify-full"
-#   - name: AURORA_USERNAME
-#     valueFrom:
-#       secretKeyRef:
-#         name: aurora-credentials
-#         key: username
-#   - name: AURORA_PASSWORD
-#     valueFrom:
-#       secretKeyRef:
-#         name: aurora-credentials
-#         key: password

@@ -46,7 +46,7 @@ var _ = BeforeSuite(func() {
 
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "charts", "dbtether", "crds")},
 		ErrorIfCRDPathMissing: true,
 	}
 
@@ -62,7 +62,6 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
 
-	// Create zap logger for schedule controller
 	devLogger, _ := zap.NewDevelopment()
 	zapLogger = devLogger.Sugar()
 
@@ -80,23 +79,21 @@ var _ = BeforeSuite(func() {
 	})
 	Expect(err).NotTo(HaveOccurred())
 
-	// Register BackupStorage controller
 	err = (&BackupStorageReconciler{
 		Client: k8sManager.GetClient(),
 		Scheme: k8sManager.GetScheme(),
 	}).SetupWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred())
 
-	// Register Backup controller
 	err = (&BackupReconciler{
 		Client:    k8sManager.GetClient(),
+		APIReader: k8sManager.GetAPIReader(),
 		Scheme:    k8sManager.GetScheme(),
 		Namespace: "default",
 		Image:     "dbtether:test",
 	}).SetupWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred())
 
-	// Register BackupSchedule controller
 	err = (&BackupScheduleReconciler{
 		Client:    k8sManager.GetClient(),
 		Scheme:    k8sManager.GetScheme(),

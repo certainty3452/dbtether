@@ -50,6 +50,16 @@ spec:
             type: object
           spec:
             properties:
+              allowedNamespaces:
+                description: |-
+                  Other namespaces whose DatabaseUsers, Backups, BackupSchedules and Restores may reference this Database.
+                  The Database's own namespace is always allowed. Entries are names or patterns where "*" matches any sequence of characters.
+                items:
+                  maxLength: 63
+                  pattern: ^[a-z0-9*]([-a-z0-9*]*[a-z0-9*])?$
+                  type: string
+                type: array
+                x-kubernetes-list-type: set
               clusterRef:
                 properties:
                   name:
@@ -57,6 +67,9 @@ spec:
                 required:
                 - name
                 type: object
+                x-kubernetes-validations:
+                - message: spec.clusterRef is immutable
+                  rule: self == oldSelf
               databaseName:
                 maxLength: 63
                 pattern: ^[a-z_][a-z0-9_]*$
@@ -76,6 +89,10 @@ spec:
             required:
             - clusterRef
             type: object
+            x-kubernetes-validations:
+            - message: spec.databaseName is immutable
+              rule: has(self.databaseName) == has(oldSelf.databaseName) && (!has(self.databaseName)
+                || self.databaseName == oldSelf.databaseName)
           status:
             properties:
               conditions:
@@ -142,9 +159,8 @@ spec:
                 format: int64
                 type: integer
               ownershipTracked:
-                description: |-
-                  OwnershipTracked indicates if the operator was able to set ownership comment on the database.
-                  For legacy databases owned by other PostgreSQL users, this may be false.
+                description: OwnershipTracked is false when the operator could not
+                  record ownership, e.g. on a database owned by another role.
                 type: boolean
               pendingSince:
                 format: date-time

@@ -1,44 +1,33 @@
-# Binaries
 bin/
 *.exe
 *.dll
 *.so
 *.dylib
 
-# Test
 cover.out
 coverage.out
 coverage_envtest.out
 *.test
 
-# Dependency
 vendor/
 
-# IDE
 .idea/
 .vscode/
 *.swp
 
-# AI assistant rules
 CLAUDE.md
 *.swo
 *~
 
-# OS
 .DS_Store
 Thumbs.db
 
-# Debug
 *.log
 debug
 
-# Linter cache
 .golangci-lint/
 
-# Local env
 .env
 .env.local
 
-# Build (contains local image refs)
-Makefile
 

@@ -65,6 +65,9 @@ spec:
                   name:
                     type: string
                   namespace:
+                    description: Namespace of the Database. A namespace other than
+                      the referencing resource's must be listed in the Database's
+                      spec.allowedNamespaces.
                     type: string
                 required:
                 - name
@@ -80,10 +83,8 @@ spec:
                   this schedule
                 properties:
                   activeDeadlineSeconds:
-                    description: |-
-                      ActiveDeadlineSeconds specifies the duration in seconds relative to the startTime
-                      that the backup job may be active before the system tries to terminate it.
-                      This is a hard timeout for the entire backup operation.
+                    description: ActiveDeadlineSeconds is the hard timeout in seconds
+                      for the entire backup operation.
                     format: int64
                     minimum: 60
                     type: integer
@@ -97,10 +98,8 @@ spec:
                     minimum: 0
                     type: integer
                   ttlSecondsAfterFailed:
-                    description: |-
-                      TTLSecondsAfterFailed specifies the TTL for the Job after it fails.
-                      This allows keeping failed jobs longer for debugging.
-                      Defaults to 12 hours (43200 seconds).
+                    description: TTLSecondsAfterFailed is the TTL of the Job after
+                      it fails. Defaults to 12 hours (43200 seconds).
                     format: int32
                     type: integer
                 type: object
@@ -162,7 +161,7 @@ spec:
                 description: Name of the last successful backup
                 type: string
               managedBackups:
-                description: Number of backups managed by this schedule (in S3)
+                description: Number of Completed Backups created by this schedule
                 type: integer
               message:
                 type: string
@@ -176,6 +175,7 @@ spec:
               phase:
                 enum:
                 - Active
+                - Pending
                 - Suspended
                 - Failed
                 type: string

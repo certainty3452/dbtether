@@ -157,9 +157,7 @@ func TestGeneratePassword_Shuffled(t *testing.T) {
 		}
 	}
 
-	// Without shuffling, first chars would always be lowercase (3 of them)
-	// With shuffling, distribution should be more even
-	// Allow some variance, but not all should start with lowercase
+	// Without shuffling every password would start with a lowercase letter.
 	if startsWithLower == 100 {
 		t.Error("passwords not shuffled - all start with lowercase")
 	}

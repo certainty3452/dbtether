@@ -1,4 +1,3 @@
-# AWS S3 storage with secret-based auth
 apiVersion: dbtether.io/v1alpha1
 kind: BackupStorage
 metadata:
@@ -7,21 +6,11 @@ spec:
   s3:
     bucket: my-company-backups
     region: eu-central-1
-  # Default pathTemplate: "{{ .ClusterName }}/{{ .DatabaseName }}"
-  # Available template variables:
-  #   {{ .ClusterName }}  - DBCluster name
-  #   {{ .DatabaseName }} - Database name
-  #   {{ .Year }}         - 4-digit year (2026)
-  #   {{ .Month }}        - 2-digit month (01-12)
-  #   {{ .Day }}          - 2-digit day (01-31)
   credentialsSecretRef:
     name: s3-backup-credentials
     namespace: dbtether
 ---
-# AWS S3 storage with OIDC/Pod Identity (no credentials needed)
-# Recommended IAM permissions:
-#   s3:PutObject, s3:GetObject, s3:DeleteObject, s3:ListBucket
-#   s3:PutObjectTagging, s3:GetObjectTagging (optional, for metadata tags)
+# No credentialsSecretRef: uses IRSA/Pod Identity
 apiVersion: dbtether.io/v1alpha1
 kind: BackupStorage
 metadata:
@@ -30,15 +19,9 @@ spec:
   s3:
     bucket: my-company-backups
     region: eu-central-1
-  # Custom pathTemplate with date organization
   pathTemplate: "{{ .ClusterName }}/{{ .Year }}/{{ .Month }}"
-  # No credentialsSecretRef = uses IRSA/Pod Identity
 ---
-# Google Cloud Storage with Workload Identity
-# Uses Application Default Credentials:
-#   - Workload Identity on GKE (recommended)
-#   - GOOGLE_APPLICATION_CREDENTIALS env var
-#   - gcloud auth application-default login (local dev)
+# No credentialsSecretRef: uses Application Default Credentials (Workload Identity)
 apiVersion: dbtether.io/v1alpha1
 kind: BackupStorage
 metadata:
@@ -49,11 +32,7 @@ spec:
     project: my-gcp-project
   pathTemplate: "{{ .ClusterName }}/{{ .DatabaseName }}/{{ .Year }}"
 ---
-# Azure Blob Storage with Managed Identity
-# Uses DefaultAzureCredential:
-#   - Managed Identity on AKS (recommended)
-#   - Environment vars: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_CLIENT_SECRET
-#   - Azure CLI credentials (local dev)
+# No credentialsSecretRef: uses DefaultAzureCredential (Managed Identity)
 apiVersion: dbtether.io/v1alpha1
 kind: BackupStorage
 metadata:
@@ -64,7 +43,6 @@ spec:
     storageAccount: companybackupstorage
   pathTemplate: "{{ .ClusterName }}/{{ .DatabaseName }}"
 ---
-# S3-compatible storage (MinIO, Ceph, etc.)
 apiVersion: dbtether.io/v1alpha1
 kind: BackupStorage
 metadata:

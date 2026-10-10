@@ -12,10 +12,7 @@ import (
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
 )
 
-// XValidation rules are evaluated by the apiserver, so they only show up under
-// envtest (the fake client doesn't run CEL). This pins the rule requiring at
-// least one positive keep* field on RetentionPolicy — an empty or all-zero
-// policy would otherwise delete every backup (see pkg/backup/retention.go).
+// CEL rules run only under envtest; pins the rule keeping an empty RetentionPolicy from deleting every backup.
 var _ = Describe("BackupSchedule retention admission", func() {
 	It("rejects an empty retention policy", func() {
 		bs := &databasesv1alpha1.BackupSchedule{

@@ -138,10 +138,7 @@ var _ = Describe("DBCluster Controller", func() {
 	})
 })
 
-// Unit tests for getCredentialsFromEnv
 func TestGetCredentialsFromEnv(t *testing.T) {
-	r := &DBClusterReconciler{}
-
 	t.Run("returns credentials from ENV", func(t *testing.T) {
 		t.Setenv("TEST_USER", "myuser")
 		t.Setenv("TEST_PASS", "mypass")
@@ -151,7 +148,7 @@ func TestGetCredentialsFromEnv(t *testing.T) {
 			Password: "TEST_PASS",
 		}
 
-		user, pass, err := r.getCredentialsFromEnv(cfg)
+		user, pass, err := credentialsFromEnv(cfg)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -171,7 +168,7 @@ func TestGetCredentialsFromEnv(t *testing.T) {
 			Password: "TEST_PASS",
 		}
 
-		_, _, err := r.getCredentialsFromEnv(cfg)
+		_, _, err := credentialsFromEnv(cfg)
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
@@ -185,7 +182,7 @@ func TestGetCredentialsFromEnv(t *testing.T) {
 			Password: "MISSING_PASS",
 		}
 
-		_, _, err := r.getCredentialsFromEnv(cfg)
+		_, _, err := credentialsFromEnv(cfg)
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
@@ -193,8 +190,6 @@ func TestGetCredentialsFromEnv(t *testing.T) {
 }
 
 func TestGetCredentials_NoSourceSpecified(t *testing.T) {
-	r := &DBClusterReconciler{}
-
 	cluster := &databasesv1alpha1.DBCluster{
 		Spec: databasesv1alpha1.DBClusterSpec{
 			Endpoint: "localhost",
@@ -202,15 +197,13 @@ func TestGetCredentials_NoSourceSpecified(t *testing.T) {
 		},
 	}
 
-	_, _, err := r.getCredentials(context.TODO(), cluster)
+	_, _, err := clusterCredentials(context.TODO(), nil, cluster)
 	if err == nil {
 		t.Fatal("expected error when no credentials source specified")
 	}
 }
 
 func TestGetCredentials_BothSourcesSpecified_UsesEnv(t *testing.T) {
-	r := &DBClusterReconciler{}
-
 	t.Setenv("USER_ENV", "envuser")
 	t.Setenv("PASS_ENV", "envpass")
 
@@ -229,7 +222,7 @@ func TestGetCredentials_BothSourcesSpecified_UsesEnv(t *testing.T) {
 		},
 	}
 
-	user, pass, err := r.getCredentials(context.TODO(), cluster)
+	user, pass, err := clusterCredentials(context.TODO(), nil, cluster)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -241,8 +234,6 @@ func TestGetCredentials_BothSourcesSpecified_UsesEnv(t *testing.T) {
 	}
 }
 
-// TestStatusChangeDetection verifies that status is only updated when meaningful changes occur
-// This prevents unnecessary reconciliation loops caused by status patches
 func TestStatusChangeDetection(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -338,7 +329,6 @@ func TestStatusChangeDetection(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Simulate the statusChanged check from updateStatus
 			statusChanged := tt.currentStatus.Phase != tt.newPhase ||
 				tt.currentStatus.Message != tt.newMessage ||
 				tt.currentStatus.ObservedGeneration != tt.generation ||

@@ -95,7 +95,6 @@ func TestRestoreSpec_Validation(t *testing.T) {
 				Spec: tt.spec,
 			}
 
-			// Basic validation - struct should be valid
 			assert.NotEmpty(t, restore.Spec.Target.DatabaseRef.Name)
 			if tt.spec.Source.BackupRef != nil {
 				assert.NotEmpty(t, tt.spec.Source.BackupRef.Name)
@@ -143,79 +142,27 @@ func TestRestoreReconciler_ComputeSpecHash(t *testing.T) {
 	hash1 := r.computeSpecHash(restore)
 	hash2 := r.computeSpecHash(restore)
 
-	// Same spec should produce same hash
 	assert.Equal(t, hash1, hash2)
 	assert.Len(t, hash1, 16) // 8 bytes = 16 hex chars
 
-	// Different spec should produce different hash
 	restore.Spec.OnConflict = "drop"
 	hash3 := r.computeSpecHash(restore)
 	assert.NotEqual(t, hash1, hash3)
 }
 
-func TestRestoreReconciler_IsAlreadyProcessed(t *testing.T) {
-	tests := []struct {
-		name       string
-		phase      string
-		statusHash string
-		specHash   string
-		expectSkip bool
-	}{
-		{
-			name:       "empty status - not processed",
-			phase:      "",
-			statusHash: "",
-			specHash:   "abc123",
-			expectSkip: false,
-		},
-		{
-			name:       "running - not processed",
-			phase:      "Running",
-			statusHash: "abc123",
-			specHash:   "abc123",
-			expectSkip: false,
-		},
-		{
-			name:       "completed with same hash - processed",
-			phase:      "Completed",
-			statusHash: "abc123",
-			specHash:   "abc123",
-			expectSkip: true,
-		},
-		{
-			name:       "failed with same hash - processed",
-			phase:      "Failed",
-			statusHash: "abc123",
-			specHash:   "abc123",
-			expectSkip: true,
-		},
-		{
-			name:       "completed with different hash - not processed (spec changed)",
-			phase:      "Completed",
-			statusHash: "abc123",
-			specHash:   "xyz789",
-			expectSkip: false,
-		},
-	}
+func TestRestoreReconciler_FinishedRestoreNeverReruns(t *testing.T) {
+	for _, phase := range []string{"Completed", "Failed"} {
+		t.Run(phase, func(t *testing.T) {
+			restore, db, cluster, storage := newStartFixture()
+			restore.Status = dbtether.RestoreStatus{Phase: phase, SpecHash: "from-an-earlier-spec", JobName: "restore-my-restore-run1"}
+			r := newLifecycleReconciler(&interceptor.Funcs{}, restore, db, cluster, storage)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			restore := &dbtether.Restore{
-				Status: dbtether.RestoreStatus{
-					Phase:    tt.phase,
-					SpecHash: tt.statusHash,
-				},
-			}
+			res, err := reconcileRestore(t, r)
+			require.NoError(t, err)
 
-			// Using zap test logger would require more setup, so just testing the logic
-			isProcessed := func() bool {
-				if restore.Status.Phase == "" || restore.Status.SpecHash != tt.specHash {
-					return false
-				}
-				return restore.Status.Phase == "Completed" || restore.Status.Phase == "Failed"
-			}
-
-			assert.Equal(t, tt.expectSkip, isProcessed())
+			assert.Zero(t, res)
+			assert.Empty(t, listRestoreJobs(t, r))
+			assert.Equal(t, phase, getRestoreStatus(t, r).Phase)
 		})
 	}
 }
@@ -324,8 +271,8 @@ func TestBuildRestoreJob_TTLFromSpec(t *testing.T) {
 		Spec: dbtether.BackupStorageSpec{S3: &dbtether.S3StorageConfig{Bucket: "b", Region: "us-east-1"}},
 	}
 
-	job, err := r.buildRestoreJob(restore, db, cluster, storage, "path/to.sql.gz", "run1")
-	require.NoError(t, err)
+	restore.Status = dbtether.RestoreStatus{RunID: "run1", JobName: restoreJobName(restore.Name, "run1"), SourcePath: "path/to.sql.gz"}
+	job := r.buildRestoreJob(restore, db, cluster, storage)
 	require.NotNil(t, job.Spec.TTLSecondsAfterFinished)
 	assert.Equal(t, int32(7200), *job.Spec.TTLSecondsAfterFinished)
 }
@@ -363,7 +310,7 @@ func TestBuildEnvVars_Storage(t *testing.T) {
 				},
 			},
 			expectType:  "s3",
-			expectCount: 7, // base vars + S3 vars
+			expectCount: 7,
 		},
 		{
 			name: "GCS storage",
@@ -376,7 +323,7 @@ func TestBuildEnvVars_Storage(t *testing.T) {
 				},
 			},
 			expectType:  "gcs",
-			expectCount: 8, // base vars + GCS vars with project
+			expectCount: 8,
 		},
 		{
 			name: "Azure storage",
@@ -389,7 +336,7 @@ func TestBuildEnvVars_Storage(t *testing.T) {
 				},
 			},
 			expectType:  "azure",
-			expectCount: 8, // base vars + Azure vars
+			expectCount: 8,
 		},
 		{
 			name: "S3 storage with credentialsSecretRef",
@@ -406,7 +353,7 @@ func TestBuildEnvVars_Storage(t *testing.T) {
 				},
 			},
 			expectType:  "s3",
-			expectCount: 10, // base vars + S3 vars + AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
+			expectCount: 10,
 		},
 	}
 
@@ -414,7 +361,6 @@ func TestBuildEnvVars_Storage(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			env := r.buildEnvVars(db, cluster, tt.storage, "path/to/backup.sql.gz", "fail")
 
-			// Find storage type
 			var storageType string
 			for _, e := range env {
 				if e.Name == "STORAGE_TYPE" {
@@ -424,7 +370,7 @@ func TestBuildEnvVars_Storage(t *testing.T) {
 			}
 
 			assert.Equal(t, tt.expectType, storageType)
-			assert.GreaterOrEqual(t, len(env), 5) // At least base vars
+			assert.GreaterOrEqual(t, len(env), 5)
 
 			if tt.storage.Spec.CredentialsSecretRef != nil {
 				var hasAccessKey, hasSecretKey bool
@@ -483,7 +429,6 @@ func TestBuildEnvVars_Credentials(t *testing.T) {
 
 		env := r.buildEnvVars(db, cluster, storage, "path/backup.sql.gz", "fail")
 
-		// Should have DB_USER and DB_PASSWORD from secret
 		var hasUser, hasPassword bool
 		for _, e := range env {
 			if e.Name == "DB_USER" && e.ValueFrom != nil {
@@ -513,7 +458,6 @@ func TestBuildEnvVars_Credentials(t *testing.T) {
 
 		env := r.buildEnvVars(db, cluster, storage, "path/backup.sql.gz", "fail")
 
-		// Should NOT have DB_USER or DB_PASSWORD
 		for _, e := range env {
 			assert.NotEqual(t, "DB_USER", e.Name)
 			assert.NotEqual(t, "DB_PASSWORD", e.Name)
@@ -680,7 +624,6 @@ func TestResolveSource_LatestFrom(t *testing.T) {
 	now := metav1.Now()
 	earlier := metav1.NewTime(now.Add(-1 * time.Hour))
 
-	// Create multiple backups, latest should be selected
 	backups := []runtime.Object{
 		&dbtether.Backup{
 			ObjectMeta: metav1.ObjectMeta{
@@ -712,7 +655,6 @@ func TestResolveSource_LatestFrom(t *testing.T) {
 				CompletedAt: &now,
 			},
 		},
-		// Different database - should be ignored
 		&dbtether.Backup{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "backup-other-db",
@@ -795,18 +737,22 @@ func TestResolveSource_LatestFrom_CrossNamespace(t *testing.T) {
 		},
 	}
 
-	r := newFakeRestoreReconciler(backup)
+	sourceDB := &dbtether.Database{
+		ObjectMeta: metav1.ObjectMeta{Name: "prod-db", Namespace: "prod"},
+		Spec:       dbtether.DatabaseSpec{AllowedNamespaces: []string{"dev"}},
+	}
+	r := newFakeRestoreReconciler(backup, sourceDB)
 
 	restore := &dbtether.Restore{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "dev-restore",
-			Namespace: "dev", // Different namespace
+			Namespace: "dev",
 		},
 		Spec: dbtether.RestoreSpec{
 			Source: dbtether.RestoreSource{
 				LatestFrom: &dbtether.LatestFromSource{
 					DatabaseRef: dbtether.DatabaseReference{Name: "prod-db"},
-					Namespace:   "prod", // Look in prod namespace
+					Namespace:   "prod",
 				},
 			},
 		},
@@ -853,7 +799,6 @@ func TestResolveSource_DirectPath_MissingStorageRef(t *testing.T) {
 		Spec: dbtether.RestoreSpec{
 			Source: dbtether.RestoreSource{
 				Path: "direct/path/backup.sql.gz",
-				// Missing StorageRef
 			},
 		},
 	}
@@ -873,7 +818,7 @@ func TestResolveSource_EmptySource(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: dbtether.RestoreSpec{
-			Source: dbtether.RestoreSource{}, // Empty
+			Source: dbtether.RestoreSource{},
 		},
 	}
 
@@ -996,7 +941,7 @@ func TestRestoreReconciler_EnsureFinalizer_UpdateError(t *testing.T) {
 		}).
 		Build()
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether"}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether"}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-restore", Namespace: "default"}}
 	if _, err := r.Reconcile(context.Background(), req); err == nil {
@@ -1020,6 +965,11 @@ func TestRestoreReconciler_AdoptsExistingJob(t *testing.T) {
 				DatabaseRef: dbtether.DatabaseReference{Name: "my-database"},
 			},
 		},
+		Status: dbtether.RestoreStatus{
+			Phase:   "Pending",
+			RunID:   "existing1",
+			JobName: "restore-my-restore-existing1",
+		},
 	}
 
 	existingJob := &batchv1.Job{
@@ -1029,6 +979,7 @@ func TestRestoreReconciler_AdoptsExistingJob(t *testing.T) {
 			Labels: map[string]string{
 				LabelRestoreName:      "my-restore",
 				LabelRestoreNamespace: "app-ns",
+				LabelRunID:            "existing1",
 			},
 		},
 	}
@@ -1040,7 +991,7 @@ func TestRestoreReconciler_AdoptsExistingJob(t *testing.T) {
 		WithStatusSubresource(&dbtether.Restore{}).
 		Build()
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether"}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether"}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
@@ -1070,8 +1021,6 @@ func TestRestoreReconciler_AdoptsExistingJob(t *testing.T) {
 	}
 }
 
-// TestRestoreReconciler_BackupRefNotReady covers a Restore whose referenced Backup hasn't produced a usable
-// result yet: still Running (wait Pending, no Job started) or Failed (the Restore fails too).
 func TestRestoreReconciler_BackupRefNotReady(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -1113,7 +1062,7 @@ func TestRestoreReconciler_BackupRefNotReady(t *testing.T) {
 				WithStatusSubresource(&dbtether.Restore{}).
 				Build()
 
-			r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether"}
+			r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether"}
 
 			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 			if _, err := r.Reconcile(context.Background(), req); err != nil {
@@ -1152,8 +1101,6 @@ func TestRestoreLabelConstants(t *testing.T) {
 	}
 }
 
-// recordedApplyPrivilegesCall captures one invocation of ApplyPrivileges so
-// tests can assert exactly what regrantDatabaseUsers sent to Postgres.
 type recordedApplyPrivilegesCall struct {
 	Username, Database, Preset string
 	AdditionalGrants           []postgres.TableGrant
@@ -1168,8 +1115,6 @@ type recordedExtensionsCall struct {
 	Extensions []string
 }
 
-// recordingPGClient wraps postgres.MockClient (which doesn't track
-// ApplyPrivileges calls) to record invocations without touching the shared mock.
 type recordingPGClient struct {
 	*postgres.MockClient
 	calls           []recordedApplyPrivilegesCall
@@ -1205,7 +1150,7 @@ func (m *recordingPGClient) EnsureExtensions(ctx context.Context, dbName string,
 	return m.MockClient.EnsureExtensions(ctx, dbName, extensions)
 }
 
-func (m *recordingPGClient) ApplyPrivileges(ctx context.Context, username, database, preset string, additionalGrants []postgres.TableGrant) error {
+func (m *recordingPGClient) ApplyPrivileges(ctx context.Context, username, database, preset, ownerRole string, additionalGrants []postgres.TableGrant) error {
 	m.calls = append(m.calls, recordedApplyPrivilegesCall{
 		Username:         username,
 		Database:         database,
@@ -1228,8 +1173,6 @@ func (m *recordingPGClient) GrantDatabaseAccess(ctx context.Context, username, d
 	return m.MockClient.GrantDatabaseAccess(ctx, username, database)
 }
 
-// singleClientCache is a minimal ClientCacheInterface that always returns the
-// same client and counts how many times a connection was requested.
 type singleClientCache struct {
 	pgClient postgres.ClientInterface
 	getCalls int
@@ -1242,9 +1185,6 @@ func (c *singleClientCache) Get(_ context.Context, _ string, _ postgres.Config) 
 func (c *singleClientCache) Remove(_ string) {}
 func (c *singleClientCache) Close()          {}
 
-// indexDatabaseUserRefsForTest reimplements the controllers package's unexported
-// indexer, which can't be imported here, so the fake client can be built
-// WithIndex the same way the real manager wires it up via RegisterIndexers.
 func indexDatabaseUserRefsForTest(obj client.Object) []string {
 	user, ok := obj.(*dbtether.DatabaseUser)
 	if !ok {
@@ -1262,9 +1202,6 @@ func indexDatabaseUserRefsForTest(obj client.Object) []string {
 	return keys
 }
 
-// newRegrantFixture builds a Restore whose Job has already succeeded, plus
-// the target Database/DBCluster/credentials Secret it points at. Restore
-// lives in "app-ns"; the restore Job lives in the operator namespace "dbtether".
 func newRegrantFixture() (restore *dbtether.Restore, job *batchv1.Job, db *dbtether.Database, cluster *dbtether.DBCluster, secret *corev1.Secret) {
 	restore = &dbtether.Restore{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1283,6 +1220,7 @@ func newRegrantFixture() (restore *dbtether.Restore, job *batchv1.Job, db *dbtet
 		},
 		Status: dbtether.RestoreStatus{
 			Phase:   "Running",
+			RunID:   "run1",
 			JobName: "restore-my-restore-run1",
 		},
 	}
@@ -1291,6 +1229,7 @@ func newRegrantFixture() (restore *dbtether.Restore, job *batchv1.Job, db *dbtet
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "restore-my-restore-run1",
 			Namespace: "dbtether",
+			Labels:    map[string]string{LabelRestoreName: "my-restore", LabelRestoreNamespace: "app-ns", LabelRunID: "run1"},
 		},
 		Status: batchv1.JobStatus{Succeeded: 1},
 	}
@@ -1355,7 +1294,7 @@ func TestRestoreReconciler_RegrantsGrantsOnSuccess(t *testing.T) {
 	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	_, err := r.Reconcile(context.Background(), req)
@@ -1418,7 +1357,7 @@ func TestRestoreReconciler_RegrantsOwnerToWinnerAdminToLoser(t *testing.T) {
 	require.NoError(t, pg.CreateUser(context.Background(), "owner_loser", "pw"))
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	_, err := r.Reconcile(context.Background(), req)
@@ -1464,7 +1403,7 @@ func TestRestoreReconciler_RegrantFailureKeepsGranting(t *testing.T) {
 	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	result, err := r.Reconcile(context.Background(), req)
@@ -1504,7 +1443,7 @@ func TestRestoreReconciler_ConnectRegrantFailureKeepsGranting(t *testing.T) {
 	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	result, err := r.Reconcile(context.Background(), req)
@@ -1543,7 +1482,7 @@ func TestRestoreReconciler_RegrantSkipsUsersWithoutRole(t *testing.T) {
 	pg := &recordingPGClient{MockClient: postgres.NewMockClient()}
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	_, err := r.Reconcile(context.Background(), req)
@@ -1594,7 +1533,7 @@ func TestRestoreReconciler_RegrantSkipsTerminatingUser(t *testing.T) {
 	require.NoError(t, pg.CreateUser(context.Background(), "staying_user", "pw"))
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	_, err := r.Reconcile(context.Background(), req)
@@ -1642,7 +1581,7 @@ func TestRestoreReconciler_RegrantSkipsUserWithInvalidSpec(t *testing.T) {
 	require.NoError(t, pg.CreateUser(context.Background(), "valid_user", "pw"))
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	_, err := r.Reconcile(context.Background(), req)
@@ -1671,7 +1610,7 @@ func TestRestoreReconciler_AppliesDatabaseSpecWithoutUsers(t *testing.T) {
 	pg := &recordingPGClient{MockClient: postgres.NewMockClient()}
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	_, err := r.Reconcile(context.Background(), req)
@@ -1710,7 +1649,7 @@ func TestRestoreReconciler_ReAppliesDatabaseSpecBeforeGrants(t *testing.T) {
 	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	_, err := r.Reconcile(context.Background(), req)
@@ -1751,7 +1690,7 @@ func TestRestoreReconciler_KeepsPublicConnectWhenSpecDoesNot(t *testing.T) {
 	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	_, err := r.Reconcile(context.Background(), req)
@@ -1788,7 +1727,7 @@ func TestRestoreReconciler_DatabaseSpecFailureKeepsGranting(t *testing.T) {
 	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	result, err := r.Reconcile(context.Background(), req)
@@ -1856,6 +1795,7 @@ func newDatabaseStepRestore(t *testing.T, pg *recordingPGClient, specifyDatabase
 
 	return &RestoreReconciler{
 		Client:        fakeClient,
+		APIReader:     fakeClient,
 		Scheme:        scheme,
 		Namespace:     "dbtether",
 		PGClientCache: &singleClientCache{pgClient: pg},
@@ -1919,8 +1859,6 @@ func TestRestoreReconciler_GrantingSurvivesJobGC(t *testing.T) {
 	restore, _, db, cluster, secret := newRegrantFixture()
 	restore.Status.Phase = "Granting"
 	restore.Status.SpecHash = (&RestoreReconciler{}).computeSpecHash(restore)
-	// Job intentionally left out of the fake client even though Status.JobName
-	// still references it - simulates the Job having been GC'd by its TTL.
 
 	user := &dbtether.DatabaseUser{
 		ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "app-ns"},
@@ -1942,7 +1880,7 @@ func TestRestoreReconciler_GrantingSurvivesJobGC(t *testing.T) {
 	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	_, err := r.Reconcile(context.Background(), req)
@@ -1958,8 +1896,6 @@ func TestRestoreReconciler_GrantingSurvivesJobGC(t *testing.T) {
 
 func TestRestoreReconciler_JobDeletedWhileRunning_Failed(t *testing.T) {
 	restore, _, db, cluster, secret := newRegrantFixture()
-	// restore.Status.Phase is "Running" from the fixture. Job intentionally
-	// left out of the fake client.
 
 	scheme := newRestoreTestScheme()
 	fakeClient := fake.NewClientBuilder().
@@ -1968,7 +1904,7 @@ func TestRestoreReconciler_JobDeletedWhileRunning_Failed(t *testing.T) {
 		WithStatusSubresource(&dbtether.Restore{}).
 		Build()
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether"}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether"}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	_, err := r.Reconcile(context.Background(), req)
@@ -1977,7 +1913,7 @@ func TestRestoreReconciler_JobDeletedWhileRunning_Failed(t *testing.T) {
 	var updated dbtether.Restore
 	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}, &updated))
 	assert.Equal(t, "Failed", updated.Status.Phase)
-	assert.Equal(t, "restore job was deleted", updated.Status.Message)
+	assert.Equal(t, "restore job restore-my-restore-run1 disappeared without recording a result; the target database state is unknown", updated.Status.Message)
 }
 
 func TestJobFailureReasonPrefersTerminationMessage(t *testing.T) {
@@ -2033,7 +1969,6 @@ func TestRestoreReconciler_DatabaseDeletedDuringGranting_CompletesWithWarning(t 
 	restore, _, _, _, _ := newRegrantFixture()
 	restore.Status.Phase = "Granting"
 	restore.Status.SpecHash = (&RestoreReconciler{}).computeSpecHash(restore)
-	// Target Database intentionally left out of the fake client.
 
 	scheme := newRestoreTestScheme()
 	fakeClient := fake.NewClientBuilder().
@@ -2043,7 +1978,7 @@ func TestRestoreReconciler_DatabaseDeletedDuringGranting_CompletesWithWarning(t 
 		Build()
 
 	recorder := record.NewFakeRecorder(10)
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", Recorder: recorder}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", Recorder: recorder}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	_, err := r.Reconcile(context.Background(), req)
@@ -2067,7 +2002,6 @@ func TestRestoreReconciler_ClusterDeletedDuringGranting_CompletesWithWarning(t *
 	restore, _, db, _, _ := newRegrantFixture()
 	restore.Status.Phase = "Granting"
 	restore.Status.SpecHash = (&RestoreReconciler{}).computeSpecHash(restore)
-	// DBCluster (and its secret) intentionally left out of the fake client.
 
 	user := &dbtether.DatabaseUser{
 		ObjectMeta: metav1.ObjectMeta{Name: "app-user", Namespace: "app-ns"},
@@ -2086,7 +2020,7 @@ func TestRestoreReconciler_ClusterDeletedDuringGranting_CompletesWithWarning(t *
 		Build()
 
 	recorder := record.NewFakeRecorder(10)
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", Recorder: recorder}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", Recorder: recorder}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	_, err := r.Reconcile(context.Background(), req)
@@ -2129,7 +2063,7 @@ func TestRestoreReconciler_RegrantsForFailedUser(t *testing.T) {
 	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	_, err := r.Reconcile(context.Background(), req)
@@ -2175,7 +2109,7 @@ func TestRestoreReconciler_TransientRegrantErrorChargesOneAttemptPerRetry(t *tes
 	require.NoError(t, pg.CreateUser(context.Background(), "app_user", "pw"))
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 
 	result, err := r.Reconcile(context.Background(), req)
@@ -2238,7 +2172,7 @@ func TestRestoreReconciler_RegrantPartialFailureServesHealthyUsers(t *testing.T)
 	require.NoError(t, pg.CreateUser(context.Background(), "broken_user", "pw"))
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	result, err := r.Reconcile(context.Background(), req)
@@ -2286,7 +2220,7 @@ func TestRestoreReconciler_RegrantAttemptsExhausted_CompletesWithWarning(t *test
 	cache := &singleClientCache{pgClient: pg}
 
 	recorder := record.NewFakeRecorder(10)
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache, Recorder: recorder}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache, Recorder: recorder}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	_, err := r.Reconcile(context.Background(), req)
@@ -2333,7 +2267,7 @@ func TestRestoreReconciler_JobSuccessResetsStaleGrantAttempts(t *testing.T) {
 	require.NoError(t, pg.CreateUser(context.Background(), "broken_user", "pw"))
 	cache := &singleClientCache{pgClient: pg}
 
-	r := &RestoreReconciler{Client: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
+	r := &RestoreReconciler{Client: fakeClient, APIReader: fakeClient, Scheme: scheme, Namespace: "dbtether", PGClientCache: cache}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "my-restore", Namespace: "app-ns"}}
 	result, err := r.Reconcile(context.Background(), req)
@@ -2345,4 +2279,37 @@ func TestRestoreReconciler_JobSuccessResetsStaleGrantAttempts(t *testing.T) {
 	assert.Equal(t, "Granting", updated.Status.Phase)
 	assert.Equal(t, int32(1), updated.Status.GrantAttempts,
 		"entering Granting from the Job's success must reset the stale counter to 0 before this round's failure charges attempt 1, not carry the stale 3 forward to 4")
+}
+
+func TestRestoreReconciler_EnvOnlyClusterCredentialsStayPending(t *testing.T) {
+	restore, db, cluster, storage := newStartFixture()
+	cluster.Spec.CredentialsSecretRef = nil
+	cluster.Spec.CredentialsFromEnv = &dbtether.CredentialsFromEnv{Username: "PG_USER", Password: "PG_PASSWORD"}
+	r := newLifecycleReconciler(&interceptor.Funcs{}, restore, db, cluster, storage)
+
+	res, err := reconcileRestore(t, r)
+	require.NoError(t, err)
+
+	assert.Empty(t, listRestoreJobs(t, r))
+	status := getRestoreStatus(t, r)
+	assert.Equal(t, "Pending", status.Phase)
+	assert.Contains(t, status.Message, "credentialsSecretRef")
+	assert.Contains(t, status.Message, "dbtether")
+	assert.Positive(t, res.RequeueAfter)
+}
+
+func TestRestoreReconciler_SpecChangedMidRunFailsWithoutRerun(t *testing.T) {
+	restore, job, db, cluster, _ := newRegrantFixture()
+	restore.Status.SpecHash = (&RestoreReconciler{}).computeSpecHash(restore)
+	restore.Spec.Source.Path = "cluster1/my-database/20260121-140000.sql.gz"
+	job.Status = batchv1.JobStatus{}
+	r := newLifecycleReconciler(&interceptor.Funcs{}, restore, job, db, cluster)
+
+	_, err := reconcileRestore(t, r)
+	require.NoError(t, err)
+
+	status := getRestoreStatus(t, r)
+	assert.Equal(t, "Failed", status.Phase)
+	assert.Contains(t, status.Message, "create a new Restore")
+	assert.Len(t, listRestoreJobs(t, r), 1)
 }

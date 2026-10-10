@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -152,7 +153,6 @@ func TestDatabaseReconciler_StatusDatabaseName(t *testing.T) {
 				},
 			}
 
-			// Simulate what setStatus does
 			db.Status.DatabaseName = DatabaseNameFor(db)
 
 			if db.Status.DatabaseName != tt.wantStatus {
@@ -252,7 +252,6 @@ func TestDatabaseReconciler_OwnershipTrackedStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Logic from reconcileDatabase
 			shouldWarn := !tt.tracked && (tt.statusTracked == nil || *tt.statusTracked)
 			if shouldWarn != tt.shouldWarn {
 				t.Errorf("shouldWarn = %v, want %v", shouldWarn, tt.shouldWarn)
@@ -381,6 +380,30 @@ func TestDatabaseReconciler_DatabaseSpecFailureRequeues(t *testing.T) {
 				t.Errorf("message = %q, want %q", updated.Status.Message, tt.want)
 			}
 		})
+	}
+}
+
+func TestDatabaseReconciler_NonTransientFailureRequeues(t *testing.T) {
+	ctx := context.Background()
+	secret, cluster, db := newDatabaseSpecFixture("permanent-fail-db", func(spec *databasesv1alpha1.DatabaseSpec) {
+		spec.Extensions = []string{"pg_trgm"}
+	})
+	pg := &stepFailingPGClient{MockClient: postgres.NewMockClient(), extensionsErr: errors.New("extension \"pg_trgm\" is not available")}
+	r := newDatabaseTestReconciler(&singleClientCache{pgClient: pg}, secret, cluster, db)
+
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "permanent-fail-db", Namespace: "default"}}
+	result, err := r.Reconcile(ctx, req)
+	if err == nil && result.RequeueAfter <= 0 {
+		t.Fatalf("non-transient failure parked: result=%+v err=%v", result, err)
+	}
+
+	var updated databasesv1alpha1.Database
+	if err := r.Get(ctx, req.NamespacedName, &updated); err != nil {
+		t.Fatalf("failed to get database: %v", err)
+	}
+	want := "transient error (will retry): failed to create extensions: extension \"pg_trgm\" is not available"
+	if updated.Status.Phase != "Failed" || updated.Status.Message != want {
+		t.Errorf("status = %q/%q, want Failed/%q", updated.Status.Phase, updated.Status.Message, want)
 	}
 }
 
@@ -573,5 +596,49 @@ func TestDatabaseReconciler_SetStatus_PendingSinceClearsOnReady(t *testing.T) {
 	}
 	if afterReady.Status.PendingSince != nil {
 		t.Error("expected PendingSince to be nil once phase is Ready")
+	}
+}
+
+func TestDatabaseReconciler_EnqueueClusterDatabases(t *testing.T) {
+	cluster := &databasesv1alpha1.DBCluster{ObjectMeta: metav1.ObjectMeta{Name: "watched"}}
+	onCluster := &databasesv1alpha1.Database{
+		ObjectMeta: metav1.ObjectMeta{Name: "on-cluster", Namespace: "team-a"},
+		Spec:       databasesv1alpha1.DatabaseSpec{ClusterRef: databasesv1alpha1.ClusterReference{Name: "watched"}},
+	}
+	elsewhere := &databasesv1alpha1.Database{
+		ObjectMeta: metav1.ObjectMeta{Name: "elsewhere", Namespace: "team-a"},
+		Spec:       databasesv1alpha1.DatabaseSpec{ClusterRef: databasesv1alpha1.ClusterReference{Name: "other"}},
+	}
+	r := newDatabaseTestReconciler(postgres.NewMockClientCache(), cluster, onCluster, elsewhere)
+
+	got := r.enqueueClusterDatabases(context.Background(), cluster)
+
+	if len(got) != 1 || got[0].String() != "team-a/on-cluster" {
+		t.Errorf("cluster event enqueued %v, want [team-a/on-cluster]", got)
+	}
+}
+
+func TestDBClusterChangedPredicate(t *testing.T) {
+	base := &databasesv1alpha1.DBCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "c", Generation: 1},
+		Status:     databasesv1alpha1.DBClusterStatus{Phase: "Connected", Message: "ok"},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*databasesv1alpha1.DBCluster)
+		want   bool
+	}{
+		{"spec edit", func(c *databasesv1alpha1.DBCluster) { c.Generation = 2 }, true},
+		{"phase transition", func(c *databasesv1alpha1.DBCluster) { c.Status.Phase = "Failed" }, true},
+		{"message only", func(c *databasesv1alpha1.DBCluster) { c.Status.Message = "still ok" }, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			updated := base.DeepCopy()
+			tt.mutate(updated)
+			if got := dbClusterChanged.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: updated}); got != tt.want {
+				t.Errorf("Update() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

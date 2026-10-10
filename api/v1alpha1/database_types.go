@@ -4,8 +4,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// +kubebuilder:validation:XValidation:rule="has(self.databaseName) == has(oldSelf.databaseName) && (!has(self.databaseName) || self.databaseName == oldSelf.databaseName)",message="spec.databaseName is immutable"
 type DatabaseSpec struct {
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec.clusterRef is immutable"
 	ClusterRef ClusterReference `json:"clusterRef"`
 
 	// +optional
@@ -22,6 +24,14 @@ type DatabaseSpec struct {
 
 	// +optional
 	RevokePublicConnect bool `json:"revokePublicConnect,omitempty"`
+
+	// Other namespaces whose DatabaseUsers, Backups, BackupSchedules and Restores may reference this Database.
+	// The Database's own namespace is always allowed. Entries are names or patterns where "*" matches any sequence of characters.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9*]([-a-z0-9*]*[a-z0-9*])?$`
+	// +kubebuilder:validation:items:MaxLength=63
+	AllowedNamespaces []string `json:"allowedNamespaces,omitempty"`
 }
 
 type ClusterReference struct {
@@ -37,8 +47,7 @@ type DatabaseStatus struct {
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`
 	DatabaseName       string             `json:"databaseName,omitempty"`
 	PendingSince       *metav1.Time       `json:"pendingSince,omitempty"`
-	// OwnershipTracked indicates if the operator was able to set ownership comment on the database.
-	// For legacy databases owned by other PostgreSQL users, this may be false.
+	// OwnershipTracked is false when the operator could not record ownership, e.g. on a database owned by another role.
 	OwnershipTracked *bool `json:"ownershipTracked,omitempty"`
 }
 

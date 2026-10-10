@@ -30,7 +30,7 @@ type SecretReference struct {
 }
 
 // CredentialsFromEnv specifies environment variable names containing credentials.
-// The operator reads these ENV vars at runtime from its own environment.
+// The operator reads them from its own environment.
 type CredentialsFromEnv struct {
 	// Username is the name of the environment variable containing the database username
 	// +kubebuilder:validation:Required

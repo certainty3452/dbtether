@@ -21,7 +21,6 @@ import (
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
 )
 
-// Test constants to avoid magic strings
 const (
 	testDBName      = "test-db"
 	testStorageName = "test-storage"
@@ -34,16 +33,15 @@ const (
 	testImage       = "dbtether:test"
 )
 
-// Error message templates for tests
 const (
-	errUnexpectedError   = "unexpected error: %v"
-	errFailedToGet       = "failed to get backup: %v"
-	errFailedToListJobs  = "failed to list jobs: %v"
-	errExpectedOneJob    = "expected 1 job, got %d"
-	errExpectedPhase     = "expected %s phase, got %s"
-	testJobName          = "backup-test-backup-12345678"
-	annotationBackupPath = "dbtether.io/backup-path"
-	testClusterA         = "cluster-a"
+	errUnexpectedError  = "unexpected error: %v"
+	errFailedToGet      = "failed to get backup: %v"
+	errFailedToListJobs = "failed to list jobs: %v"
+	errExpectedOneJob   = "expected 1 job, got %d"
+	errExpectedPhase    = "expected %s phase, got %s"
+	testRunID           = "12345678"
+	testJobName         = "backup-test-backup-" + testRunID
+	testClusterA        = "cluster-a"
 )
 
 func newTestScheme() *runtime.Scheme {
@@ -64,6 +62,7 @@ func newTestReconciler(objs ...client.Object) *BackupReconciler {
 
 	return &BackupReconciler{
 		Client:    fakeClient,
+		APIReader: fakeClient,
 		Scheme:    scheme,
 		Namespace: testOperatorNS,
 		Image:     testImage,
@@ -150,7 +149,6 @@ func newTestSecret(name, namespace string) *corev1.Secret {
 	}
 }
 
-// TestBackupReconciler_ComputeSpecHash tests hash computation
 func TestBackupReconciler_ComputeSpecHash(t *testing.T) {
 	r := &BackupReconciler{}
 
@@ -159,26 +157,22 @@ func TestBackupReconciler_ComputeSpecHash(t *testing.T) {
 	backup3 := newTestBackup("backup3", "default")
 	backup3.Spec.DatabaseRef.Name = "different-db"
 
-	// Same spec should produce same hash
 	hash1 := r.computeSpecHash(backup1)
 	hash2 := r.computeSpecHash(backup2)
 	if hash1 != hash2 {
 		t.Errorf("same spec should produce same hash: %s != %s", hash1, hash2)
 	}
 
-	// Different spec should produce different hash
 	hash3 := r.computeSpecHash(backup3)
 	if hash1 == hash3 {
 		t.Errorf("different spec should produce different hash: %s == %s", hash1, hash3)
 	}
 
-	// Hash should be non-empty and deterministic length
 	if hash1 == "" || len(hash1) != 16 {
 		t.Errorf("hash should be 16 chars, got %d", len(hash1))
 	}
 }
 
-// TestBackupReconciler_FinalizerAdded tests finalizer is added on first reconcile
 func TestBackupReconciler_FinalizerAdded(t *testing.T) {
 	backup := newTestBackup(testBackupName, "default")
 	db := newTestDatabase(testDBName, "default", testClusterName)
@@ -195,7 +189,6 @@ func TestBackupReconciler_FinalizerAdded(t *testing.T) {
 		},
 	}
 
-	// First reconcile should add finalizer and requeue
 	result, err := r.Reconcile(context.Background(), req)
 	if err != nil {
 		t.Fatalf(errUnexpectedError, err)
@@ -204,7 +197,6 @@ func TestBackupReconciler_FinalizerAdded(t *testing.T) {
 		t.Errorf("expected RequeueAfter=%v after adding finalizer, got %v", finalizerRequeueDelay, result.RequeueAfter)
 	}
 
-	// Verify finalizer was added
 	var updatedBackup databasesv1alpha1.Backup
 	if err := r.Get(context.Background(), req.NamespacedName, &updatedBackup); err != nil {
 		t.Fatalf(errFailedToGet, err)
@@ -214,7 +206,6 @@ func TestBackupReconciler_FinalizerAdded(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_SkipAlreadyProcessed tests skip logic for completed/failed backups
 func TestBackupReconciler_SkipAlreadyProcessed(t *testing.T) {
 	r := &BackupReconciler{}
 	backup := newTestBackup(testBackupName, "default")
@@ -250,7 +241,6 @@ func TestBackupReconciler_SkipAlreadyProcessed(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_JobCreation tests job creation with correct labels
 func TestBackupReconciler_JobCreation(t *testing.T) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
@@ -273,7 +263,6 @@ func TestBackupReconciler_JobCreation(t *testing.T) {
 		t.Fatalf(errUnexpectedError, err)
 	}
 
-	// Verify job was created in operator namespace
 	var jobs batchv1.JobList
 	if err := r.List(context.Background(), &jobs, client.InNamespace("dbtether")); err != nil {
 		t.Fatalf(errFailedToListJobs, err)
@@ -285,7 +274,6 @@ func TestBackupReconciler_JobCreation(t *testing.T) {
 
 	job := &jobs.Items[0]
 
-	// Verify labels for cross-namespace tracking
 	if job.Labels[LabelBackupName] != testBackupName {
 		t.Errorf("backup label mismatch: %s", job.Labels[LabelBackupName])
 	}
@@ -296,18 +284,15 @@ func TestBackupReconciler_JobCreation(t *testing.T) {
 		t.Errorf("cluster label mismatch: %s", job.Labels[LabelCluster])
 	}
 
-	// Verify no OwnerReference (cross-namespace not allowed)
 	if len(job.OwnerReferences) != 0 {
 		t.Error("job should not have OwnerReferences for cross-namespace backups")
 	}
 
-	// Verify TTL is set
 	if job.Spec.TTLSecondsAfterFinished == nil || *job.Spec.TTLSecondsAfterFinished != 3600 {
 		t.Error("TTL should be 3600 seconds")
 	}
 }
 
-// TestBackupReconciler_JobAlreadyExists tests race condition handling
 func TestBackupReconciler_JobAlreadyExists(t *testing.T) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
@@ -316,7 +301,6 @@ func TestBackupReconciler_JobAlreadyExists(t *testing.T) {
 	storage := newTestStorage(testStorageName)
 	secret := newTestSecret(testSecretName, "dbtether")
 
-	// Pre-create a job with matching labels
 	existingJob := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "backup-test-backup-test-uid",
@@ -338,7 +322,7 @@ func TestBackupReconciler_JobAlreadyExists(t *testing.T) {
 			},
 		},
 		Status: batchv1.JobStatus{
-			Active: 1, // Job is running
+			Active: 1,
 		},
 	}
 
@@ -351,18 +335,15 @@ func TestBackupReconciler_JobAlreadyExists(t *testing.T) {
 		},
 	}
 
-	// Reconcile should find existing job and not fail
 	result, err := r.Reconcile(context.Background(), req)
 	if err != nil {
 		t.Fatalf(errUnexpectedError, err)
 	}
 
-	// Should requeue to check job status
 	if result.RequeueAfter == 0 {
 		t.Error("expected RequeueAfter for running job")
 	}
 
-	// Verify backup status is not Failed
 	var updatedBackup databasesv1alpha1.Backup
 	if err := r.Get(context.Background(), req.NamespacedName, &updatedBackup); err != nil {
 		t.Fatalf(errFailedToGet, err)
@@ -373,11 +354,12 @@ func TestBackupReconciler_JobAlreadyExists(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_JobCompleted tests completed job status propagation
 func TestBackupReconciler_JobCompleted(t *testing.T) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.Status.JobName = testJobName
+	backup.Status.RunID = testRunID
+	backup.Status.Path = "c/app/run.sql.gz"
 	backup.Status.Phase = "Running"
 	backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
 
@@ -388,6 +370,7 @@ func TestBackupReconciler_JobCompleted(t *testing.T) {
 			Labels: map[string]string{
 				LabelBackupName:      testBackupName,
 				LabelBackupNamespace: testNamespace,
+				LabelRunID:           testRunID,
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -431,11 +414,11 @@ func TestBackupReconciler_JobCompleted(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_JobFailed tests failed job status propagation via Job Conditions
 func TestBackupReconciler_JobFailed(t *testing.T) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.Status.JobName = testJobName
+	backup.Status.RunID = testRunID
 	backup.Status.Phase = "Running"
 	backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
 
@@ -444,6 +427,7 @@ func TestBackupReconciler_JobFailed(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testJobName,
 			Namespace: "dbtether",
+			Labels:    map[string]string{LabelBackupName: testBackupName, LabelBackupNamespace: testNamespace, LabelRunID: testRunID},
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit: &backoffLimit,
@@ -455,7 +439,7 @@ func TestBackupReconciler_JobFailed(t *testing.T) {
 			},
 		},
 		Status: batchv1.JobStatus{
-			Failed: 3, // Reached backoff limit
+			Failed: 3,
 			// Job failure is detected via Conditions, not just Failed count
 			Conditions: []batchv1.JobCondition{
 				{
@@ -490,12 +474,11 @@ func TestBackupReconciler_JobFailed(t *testing.T) {
 		t.Errorf(errExpectedPhase, "Failed", updatedBackup.Status.Phase)
 	}
 
-	// Check that Job TTL was updated to default 12 hours for failed jobs
 	var updatedJob batchv1.Job
 	if err := r.Get(context.Background(), types.NamespacedName{Name: testJobName, Namespace: testOperatorNS}, &updatedJob); err != nil {
 		t.Fatalf("Failed to get job: %v", err)
 	}
-	expectedTTL := int32(43200) // 12 hours
+	expectedTTL := int32(43200)
 	if updatedJob.Spec.TTLSecondsAfterFinished == nil {
 		t.Error("Job TTL should be set")
 	} else if *updatedJob.Spec.TTLSecondsAfterFinished != expectedTTL {
@@ -503,12 +486,12 @@ func TestBackupReconciler_JobFailed(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_JobFailedCustomTTL tests that custom TTLSecondsAfterFailed is applied
 func TestBackupReconciler_JobFailedCustomTTL(t *testing.T) {
-	customTTL := int32(86400) // 24 hours
+	customTTL := int32(86400)
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.Status.JobName = testJobName
+	backup.Status.RunID = testRunID
 	backup.Status.Phase = "Running"
 	backup.Spec.JobConfig = &databasesv1alpha1.BackupJobConfig{
 		TTLSecondsAfterFailed: &customTTL,
@@ -516,11 +499,12 @@ func TestBackupReconciler_JobFailedCustomTTL(t *testing.T) {
 	backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
 
 	backoffLimit := int32(2)
-	oldTTL := int32(3600) // 1 hour
+	oldTTL := int32(3600)
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testJobName,
 			Namespace: testOperatorNS,
+			Labels:    map[string]string{LabelBackupName: testBackupName, LabelBackupNamespace: testNamespace, LabelRunID: testRunID},
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            &backoffLimit,
@@ -558,7 +542,6 @@ func TestBackupReconciler_JobFailedCustomTTL(t *testing.T) {
 		t.Fatalf(errUnexpectedError, err)
 	}
 
-	// Check that Job TTL was updated to custom value
 	var updatedJob batchv1.Job
 	if err := r.Get(context.Background(), types.NamespacedName{Name: testJobName, Namespace: testOperatorNS}, &updatedJob); err != nil {
 		t.Fatalf("Failed to get job: %v", err)
@@ -570,14 +553,12 @@ func TestBackupReconciler_JobFailedCustomTTL(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_Deletion tests finalizer cleanup
 func TestBackupReconciler_Deletion(t *testing.T) {
 	now := metav1.Now()
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.DeletionTimestamp = &now
 
-	// Job that should be cleaned up
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testJobName,
@@ -585,6 +566,7 @@ func TestBackupReconciler_Deletion(t *testing.T) {
 			Labels: map[string]string{
 				LabelBackupName:      testBackupName,
 				LabelBackupNamespace: testNamespace,
+				LabelRunID:           testRunID,
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -611,7 +593,6 @@ func TestBackupReconciler_Deletion(t *testing.T) {
 		t.Fatalf(errUnexpectedError, err)
 	}
 
-	// Verify job was deleted
 	var jobs batchv1.JobList
 	if err := r.List(context.Background(), &jobs, client.InNamespace("dbtether")); err != nil {
 		t.Fatalf(errFailedToListJobs, err)
@@ -620,7 +601,6 @@ func TestBackupReconciler_Deletion(t *testing.T) {
 		t.Error("job should be deleted during backup deletion")
 	}
 
-	// Verify finalizer was removed
 	var updatedBackup databasesv1alpha1.Backup
 	err = r.Get(context.Background(), req.NamespacedName, &updatedBackup)
 	if err == nil {
@@ -630,7 +610,6 @@ func TestBackupReconciler_Deletion(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_Throttling tests concurrent job limiting
 func TestBackupReconciler_Throttling(t *testing.T) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
@@ -639,7 +618,6 @@ func TestBackupReconciler_Throttling(t *testing.T) {
 	storage := newTestStorage(testStorageName)
 	secret := newTestSecret(testSecretName, "dbtether")
 
-	// Create DefaultMaxConcurrentJobsPerCluster running jobs
 	var existingJobs []client.Object
 	for i := 0; i < DefaultMaxConcurrentJobsPerCluster; i++ {
 		existingJobs = append(existingJobs, &batchv1.Job{
@@ -659,7 +637,7 @@ func TestBackupReconciler_Throttling(t *testing.T) {
 				},
 			},
 			Status: batchv1.JobStatus{
-				Active: 1, // Running
+				Active: 1,
 			},
 		})
 	}
@@ -679,7 +657,6 @@ func TestBackupReconciler_Throttling(t *testing.T) {
 		t.Fatalf(errUnexpectedError, err)
 	}
 
-	// Should be throttled and requeue
 	if result.RequeueAfter != RequeueDelayWhenThrottled {
 		t.Errorf("expected RequeueAfter=%v, got %v", RequeueDelayWhenThrottled, result.RequeueAfter)
 	}
@@ -694,9 +671,7 @@ func TestBackupReconciler_Throttling(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_CountActiveJobs tests job counting for throttling
 func TestBackupReconciler_CountActiveJobs(t *testing.T) {
-	// Jobs for different clusters
 	job1 := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "job-1",
@@ -711,7 +686,7 @@ func TestBackupReconciler_CountActiveJobs(t *testing.T) {
 			Namespace: "dbtether",
 			Labels:    map[string]string{LabelCluster: testClusterA},
 		},
-		Status: batchv1.JobStatus{Succeeded: 1}, // Completed
+		Status: batchv1.JobStatus{Succeeded: 1},
 	}
 	job3 := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -733,8 +708,7 @@ func TestBackupReconciler_CountActiveJobs(t *testing.T) {
 
 	r := newTestReconciler(job1, job2, job3, job4)
 
-	// Count for cluster-a: should be 2 (job2 is completed, job4 is still retrying)
-	count, err := r.countActiveJobsForCluster(context.Background(), testClusterA)
+	count, err := countActiveJobsForCluster(context.Background(), r.Client, r.Namespace, testClusterA)
 	if err != nil {
 		t.Fatalf(errUnexpectedError, err)
 	}
@@ -742,8 +716,7 @@ func TestBackupReconciler_CountActiveJobs(t *testing.T) {
 		t.Errorf("expected 2 active jobs for cluster-a, got %d", count)
 	}
 
-	// Count for cluster-b: should be 1
-	count, err = r.countActiveJobsForCluster(context.Background(), "cluster-b")
+	count, err = countActiveJobsForCluster(context.Background(), r.Client, r.Namespace, "cluster-b")
 	if err != nil {
 		t.Fatalf(errUnexpectedError, err)
 	}
@@ -751,8 +724,7 @@ func TestBackupReconciler_CountActiveJobs(t *testing.T) {
 		t.Errorf("expected 1 active job for cluster-b, got %d", count)
 	}
 
-	// Count for non-existent cluster: should be 0
-	count, err = r.countActiveJobsForCluster(context.Background(), "cluster-c")
+	count, err = countActiveJobsForCluster(context.Background(), r.Client, r.Namespace, "cluster-c")
 	if err != nil {
 		t.Fatalf(errUnexpectedError, err)
 	}
@@ -761,65 +733,6 @@ func TestBackupReconciler_CountActiveJobs(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_FindJobByLabels tests job lookup by labels
-func TestBackupReconciler_FindJobByLabels(t *testing.T) {
-	backup := newTestBackup(testBackupName, testNamespace)
-	backup.Finalizers = []string{backupFinalizer}
-	specHash := (&BackupReconciler{}).computeSpecHash(backup)
-	// findJobByLabels is only reached with Phase Running, which startRun always pairs with JobName+SpecHash.
-	backup.Status.Phase = "Running"
-	backup.Status.JobName = "backup-test-backup-abc123"
-	backup.Status.SpecHash = specHash
-
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "backup-test-backup-abc123",
-			Namespace: "dbtether",
-			Labels: map[string]string{
-				LabelBackupName:      testBackupName,
-				LabelBackupNamespace: testNamespace,
-				LabelSpecHash:        specHash,
-			},
-		},
-		Spec: batchv1.JobSpec{
-			BackoffLimit: func() *int32 { v := int32(3); return &v }(),
-			Template: corev1.PodTemplateSpec{
-				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
-					Containers:    []corev1.Container{{Name: "backup", Image: "test"}},
-				},
-			},
-		},
-		Status: batchv1.JobStatus{
-			Succeeded: 1,
-		},
-	}
-
-	r := newTestReconciler(backup, job)
-
-	result, err := r.findJobByLabels(context.Background(), backup, specHash)
-	if err != nil {
-		t.Fatalf(errUnexpectedError, err)
-	}
-
-	// Should not requeue for completed job
-	if result.RequeueAfter != 0 {
-		t.Error("completed job should not trigger requeue")
-	}
-
-	var updatedBackup databasesv1alpha1.Backup
-	if err := r.Get(context.Background(), types.NamespacedName{
-		Name: testBackupName, Namespace: testNamespace,
-	}, &updatedBackup); err != nil {
-		t.Fatalf(errFailedToGet, err)
-	}
-
-	if updatedBackup.Status.Phase != "Completed" {
-		t.Errorf("expected Completed, got %s", updatedBackup.Status.Phase)
-	}
-}
-
-// TestBackupReconciler_ResourceNotFound tests handling of missing resources
 func TestBackupReconciler_ResourceNotFound(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -835,7 +748,7 @@ func TestBackupReconciler_ResourceNotFound(t *testing.T) {
 					return b
 				}(),
 			},
-			expectedErrMsg: "database test-db not found",
+			expectedErrMsg: "database default/test-db not found",
 		},
 		{
 			name: "cluster not found",
@@ -901,13 +814,12 @@ func TestBackupReconciler_ResourceNotFound(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_NotReady tests handling of resources not in Ready state
 func TestBackupReconciler_NotReady(t *testing.T) {
 	backup := newTestBackup(testBackupName, "default")
 	backup.Finalizers = []string{backupFinalizer}
 
 	db := newTestDatabase(testDBName, "default", testClusterName)
-	db.Status.Phase = "Pending" // Not ready
+	db.Status.Phase = "Pending"
 
 	cluster := newTestCluster(testClusterName)
 	storage := newTestStorage(testStorageName)
@@ -941,7 +853,6 @@ func TestBackupReconciler_NotReady(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_ThrottlingConstants verifies throttling configuration
 func TestBackupReconciler_ThrottlingConstants(t *testing.T) {
 	if DefaultMaxConcurrentJobsPerCluster < 1 || DefaultMaxConcurrentJobsPerCluster > 10 {
 		t.Errorf("DefaultMaxConcurrentJobsPerCluster should be 1-10, got %d", DefaultMaxConcurrentJobsPerCluster)
@@ -952,9 +863,8 @@ func TestBackupReconciler_ThrottlingConstants(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_BackupNotFound tests graceful handling when backup is deleted
 func TestBackupReconciler_BackupNotFound(t *testing.T) {
-	r := newTestReconciler() // No objects
+	r := newTestReconciler()
 
 	req := reconcile.Request{
 		NamespacedName: types.NamespacedName{
@@ -968,20 +878,17 @@ func TestBackupReconciler_BackupNotFound(t *testing.T) {
 		t.Fatalf(errUnexpectedError, err)
 	}
 
-	// Should not requeue for not found
 	if result.RequeueAfter != 0 {
 		t.Error("should not requeue for not found backup")
 	}
 }
 
-// TestBackupReconciler_DeleteJobNotFound tests cleanup when job already deleted
 func TestBackupReconciler_DeleteJobNotFound(t *testing.T) {
 	now := metav1.Now()
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.DeletionTimestamp = &now
 
-	// No job exists - should not fail
 	r := newTestReconciler(backup)
 
 	req := reconcile.Request{
@@ -996,7 +903,6 @@ func TestBackupReconciler_DeleteJobNotFound(t *testing.T) {
 		t.Fatalf("should handle missing job gracefully: %v", err)
 	}
 
-	// Verify finalizer was still removed
 	var updatedBackup databasesv1alpha1.Backup
 	err = r.Get(context.Background(), req.NamespacedName, &updatedBackup)
 	if err == nil && controllerutil.ContainsFinalizer(&updatedBackup, backupFinalizer) {
@@ -1004,60 +910,53 @@ func TestBackupReconciler_DeleteJobNotFound(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_JobNotFoundRecentlyStarted tests requeue behavior when job not found for recent backup
-func TestBackupReconciler_JobNotFoundRecentlyStarted(t *testing.T) {
-	// Backup was started 30 seconds ago - should requeue, not fail
-	recentStart := metav1.NewTime(time.Now().Add(-30 * time.Second))
+func TestBackupReconciler_JobMissingFromCacheIsNotLost(t *testing.T) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.Status.Phase = "Running"
 	backup.Status.JobName = testJobName
-	backup.Status.StartedAt = &recentStart
+	backup.Status.RunID = testRunID
 	backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
-
-	// No job exists - should requeue, not fail
-	r := newTestReconciler(backup)
-
-	req := reconcile.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      testBackupName,
-			Namespace: testNamespace,
+	activeJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testJobName,
+			Namespace: testOperatorNS,
+			Labels:    map[string]string{LabelBackupName: testBackupName, LabelBackupNamespace: testNamespace, LabelRunID: testRunID},
 		},
+		Status: batchv1.JobStatus{Active: 1},
 	}
 
-	result, err := r.Reconcile(context.Background(), req)
+	r := newTestReconciler(backup)
+	r.APIReader = fake.NewClientBuilder().WithScheme(newTestScheme()).WithObjects(backup.DeepCopy(), activeJob).Build()
+
+	result, err := reconcileBackup(t, r, backup)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf(errUnexpectedError, err)
+	}
+	if result.RequeueAfter != 10*time.Second {
+		t.Errorf("expected the running Job to be polled, got RequeueAfter=%v", result.RequeueAfter)
 	}
 
-	// Should requeue after 15 seconds
-	if result.RequeueAfter != 15*time.Second {
-		t.Errorf("expected RequeueAfter=15s, got %v", result.RequeueAfter)
-	}
-
-	// Verify backup is NOT marked as Failed
 	var updatedBackup databasesv1alpha1.Backup
-	if err := r.Get(context.Background(), req.NamespacedName, &updatedBackup); err != nil {
-		t.Fatalf("failed to get backup: %v", err)
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(backup), &updatedBackup); err != nil {
+		t.Fatalf(errFailedToGet, err)
 	}
-	if updatedBackup.Status.Phase == "Failed" {
-		t.Errorf("backup should not be marked Failed when recently started, got phase=%s message=%s",
+	if updatedBackup.Status.Phase != "Running" {
+		t.Errorf("a Job the cache has not seen yet is not lost, got phase=%s message=%s",
 			updatedBackup.Status.Phase, updatedBackup.Status.Message)
 	}
 }
 
-// TestBackupReconciler_JobNotFoundOldBackup tests failure when job not found for old backup
 func TestBackupReconciler_JobNotFoundOldBackup(t *testing.T) {
-	// Backup was started 2 minutes ago - should fail
 	oldStart := metav1.NewTime(time.Now().Add(-120 * time.Second))
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.Status.Phase = "Running"
 	backup.Status.JobName = testJobName
+	backup.Status.RunID = testRunID
 	backup.Status.StartedAt = &oldStart
 	backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
 
-	// No job exists - should fail after 90s threshold
 	r := newTestReconciler(backup)
 
 	req := reconcile.Request{
@@ -1072,12 +971,10 @@ func TestBackupReconciler_JobNotFoundOldBackup(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Should not requeue
 	if result.RequeueAfter != 0 {
 		t.Errorf("expected no requeue for old backup, got RequeueAfter=%v", result.RequeueAfter)
 	}
 
-	// Verify backup is marked as Failed
 	var updatedBackup databasesv1alpha1.Backup
 	if err := r.Get(context.Background(), req.NamespacedName, &updatedBackup); err != nil {
 		t.Fatalf("failed to get backup: %v", err)
@@ -1090,17 +987,15 @@ func TestBackupReconciler_JobNotFoundOldBackup(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_JobNotFoundNoStartedAt tests failure when job not found and no StartedAt
 func TestBackupReconciler_JobNotFoundNoStartedAt(t *testing.T) {
-	// Backup has no StartedAt - should fail immediately
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.Status.Phase = "Running"
 	backup.Status.JobName = testJobName
-	backup.Status.StartedAt = nil // No StartedAt set
+	backup.Status.RunID = testRunID
+	backup.Status.StartedAt = nil
 	backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
 
-	// No job exists - should fail
 	r := newTestReconciler(backup)
 
 	req := reconcile.Request{
@@ -1115,12 +1010,10 @@ func TestBackupReconciler_JobNotFoundNoStartedAt(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Should not requeue
 	if result.RequeueAfter != 0 {
 		t.Errorf("expected no requeue when no StartedAt, got RequeueAfter=%v", result.RequeueAfter)
 	}
 
-	// Verify backup is marked as Failed
 	var updatedBackup databasesv1alpha1.Backup
 	if err := r.Get(context.Background(), req.NamespacedName, &updatedBackup); err != nil {
 		t.Fatalf("failed to get backup: %v", err)
@@ -1133,93 +1026,12 @@ func TestBackupReconciler_JobNotFoundNoStartedAt(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_JobNotFoundBoundaryCase tests boundary at exactly 90 seconds
-func TestBackupReconciler_JobNotFoundBoundaryCase(t *testing.T) {
-	tests := []struct {
-		name            string
-		ageSeconds      int
-		shouldRequeue   bool
-		expectedRequeue time.Duration
-		expectedPhase   string
-	}{
-		{
-			name:            "just under threshold (89s)",
-			ageSeconds:      89,
-			shouldRequeue:   true,
-			expectedRequeue: 15 * time.Second,
-			expectedPhase:   "Running",
-		},
-		{
-			name:            "exactly at threshold (90s)",
-			ageSeconds:      90,
-			shouldRequeue:   false,
-			expectedRequeue: 0,
-			expectedPhase:   "Failed",
-		},
-		{
-			name:            "just over threshold (91s)",
-			ageSeconds:      91,
-			shouldRequeue:   false,
-			expectedRequeue: 0,
-			expectedPhase:   "Failed",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			startTime := metav1.NewTime(time.Now().Add(-time.Duration(tt.ageSeconds) * time.Second))
-			backup := newTestBackup(testBackupName, testNamespace)
-			backup.Finalizers = []string{backupFinalizer}
-			backup.Status.Phase = "Running"
-			backup.Status.JobName = testJobName
-			backup.Status.StartedAt = &startTime
-			backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
-
-			r := newTestReconciler(backup)
-
-			req := reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Name:      testBackupName,
-					Namespace: testNamespace,
-				},
-			}
-
-			result, err := r.Reconcile(context.Background(), req)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			if result.RequeueAfter != tt.expectedRequeue {
-				t.Errorf("expected RequeueAfter=%v, got %v", tt.expectedRequeue, result.RequeueAfter)
-			}
-
-			var updatedBackup databasesv1alpha1.Backup
-			if err := r.Get(context.Background(), req.NamespacedName, &updatedBackup); err != nil {
-				t.Fatalf("failed to get backup: %v", err)
-			}
-
-			if tt.shouldRequeue {
-				if updatedBackup.Status.Phase == "Failed" {
-					t.Errorf("backup should not be Failed when requeuing, got phase=%s", updatedBackup.Status.Phase)
-				}
-			} else {
-				if updatedBackup.Status.Phase != tt.expectedPhase {
-					t.Errorf("expected phase=%s, got %s", tt.expectedPhase, updatedBackup.Status.Phase)
-				}
-			}
-		})
-	}
-}
-
-// TestGenerateRunID tests RunID generation
 func TestGenerateRunID(t *testing.T) {
-	// Test length
 	runID := generateRunID()
 	if len(runID) != 8 {
 		t.Errorf("expected 8 characters, got %d: %s", len(runID), runID)
 	}
 
-	// Test character set (lowercase letters and digits only)
 	for _, c := range runID {
 		isLower := c >= 'a' && c <= 'z'
 		isDigit := c >= '0' && c <= '9'
@@ -1228,7 +1040,6 @@ func TestGenerateRunID(t *testing.T) {
 		}
 	}
 
-	// Test uniqueness (probabilistic)
 	seen := make(map[string]bool)
 	for i := 0; i < 100; i++ {
 		id := generateRunID()
@@ -1239,14 +1050,16 @@ func TestGenerateRunID(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_JobWithAnnotations tests completed job with result annotations
-func TestBackupReconciler_JobWithAnnotations(t *testing.T) {
+func TestBackupReconciler_CompletedKeepsResultRecordedByJob(t *testing.T) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.Status.JobName = "backup-test-backup-abc12345"
 	backup.Status.Phase = "Running"
 	backup.Status.RunID = "abc12345"
 	backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
+	backup.Status.Path = "microservices/orders_db/20260120-143022.sql.gz"
+	backup.Status.Size = "25.6 MiB"
+	backup.Status.Duration = "3.2s"
 
 	completedJob := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1255,11 +1068,7 @@ func TestBackupReconciler_JobWithAnnotations(t *testing.T) {
 			Labels: map[string]string{
 				LabelBackupName:      testBackupName,
 				LabelBackupNamespace: testNamespace,
-			},
-			Annotations: map[string]string{
-				annotationBackupPath:            "microservices/orders_db/20260120-143022.sql.gz",
-				"dbtether.io/backup-size-human": "25.6 MiB",
-				"dbtether.io/backup-duration":   "3.2s",
+				LabelRunID:           "abc12345",
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -1295,7 +1104,6 @@ func TestBackupReconciler_JobWithAnnotations(t *testing.T) {
 		t.Fatalf(errFailedToGet, err)
 	}
 
-	// Verify annotations were propagated to status
 	if updatedBackup.Status.Path != "microservices/orders_db/20260120-143022.sql.gz" {
 		t.Errorf("expected path in status, got %q", updatedBackup.Status.Path)
 	}
@@ -1307,7 +1115,6 @@ func TestBackupReconciler_JobWithAnnotations(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_RunIDInJobName tests that RunID is used in job name
 func TestBackupReconciler_RunIDInJobName(t *testing.T) {
 	backup := newTestBackup("my-backup", testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
@@ -1330,7 +1137,6 @@ func TestBackupReconciler_RunIDInJobName(t *testing.T) {
 		t.Fatalf(errUnexpectedError, err)
 	}
 
-	// Verify RunID was saved in status
 	var updatedBackup databasesv1alpha1.Backup
 	if err := r.Get(context.Background(), req.NamespacedName, &updatedBackup); err != nil {
 		t.Fatalf(errFailedToGet, err)
@@ -1344,13 +1150,11 @@ func TestBackupReconciler_RunIDInJobName(t *testing.T) {
 		t.Errorf("RunID should be 8 chars, got %d: %s", len(runID), runID)
 	}
 
-	// Verify job name contains RunID
 	expectedJobNamePrefix := "backup-my-backup-" + runID
 	if updatedBackup.Status.JobName != expectedJobNamePrefix {
 		t.Errorf("job name should be %q, got %q", expectedJobNamePrefix, updatedBackup.Status.JobName)
 	}
 
-	// Verify job exists with correct name
 	var jobs batchv1.JobList
 	if err := r.List(context.Background(), &jobs, client.InNamespace("dbtether")); err != nil {
 		t.Fatalf(errFailedToListJobs, err)
@@ -1363,7 +1167,6 @@ func TestBackupReconciler_RunIDInJobName(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_CustomTTL tests custom TTL setting
 func TestBackupReconciler_CustomTTL(t *testing.T) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
@@ -1398,180 +1201,25 @@ func TestBackupReconciler_CustomTTL(t *testing.T) {
 	}
 
 	job := &jobs.Items[0]
-	expectedTTL := int32(86400) // 24 hours in seconds
+	expectedTTL := int32(86400)
 	if job.Spec.TTLSecondsAfterFinished == nil || *job.Spec.TTLSecondsAfterFinished != expectedTTL {
 		t.Errorf("TTL should be %d, got %v", expectedTTL, job.Spec.TTLSecondsAfterFinished)
 	}
 }
 
-// TestFindExistingJob tests finding existing jobs by labels
-func TestFindExistingJob(t *testing.T) {
-	backup := newTestBackup(testBackupName, testNamespace)
-	specHash := (&BackupReconciler{}).computeSpecHash(backup)
-
-	tests := []struct {
-		name        string
-		jobs        []batchv1.Job
-		expectFound bool
-	}{
-		{
-			name:        "no jobs exist",
-			jobs:        []batchv1.Job{},
-			expectFound: false,
-		},
-		{
-			name: "matching job exists",
-			jobs: []batchv1.Job{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "backup-test-backup-abc12345",
-						Namespace: testOperatorNS,
-						Labels: map[string]string{
-							LabelBackupName:      testBackupName,
-							LabelBackupNamespace: testNamespace,
-							LabelSpecHash:        specHash,
-						},
-					},
-				},
-			},
-			expectFound: true,
-		},
-		{
-			name: "job with different backup name",
-			jobs: []batchv1.Job{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "backup-other-backup-abc12345",
-						Namespace: testOperatorNS,
-						Labels: map[string]string{
-							LabelBackupName:      "other-backup",
-							LabelBackupNamespace: testNamespace,
-							LabelSpecHash:        specHash,
-						},
-					},
-				},
-			},
-			expectFound: false,
-		},
-		{
-			name: "job in different namespace",
-			jobs: []batchv1.Job{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "backup-test-backup-abc12345",
-						Namespace: "other-namespace",
-						Labels: map[string]string{
-							LabelBackupName:      testBackupName,
-							LabelBackupNamespace: testNamespace,
-							LabelSpecHash:        specHash,
-						},
-					},
-				},
-			},
-			expectFound: false,
-		},
-		{
-			name: "active job from a different spec is adopted",
-			jobs: []batchv1.Job{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "backup-test-backup-abc12345",
-						Namespace: testOperatorNS,
-						Labels: map[string]string{
-							LabelBackupName:      testBackupName,
-							LabelBackupNamespace: testNamespace,
-							LabelSpecHash:        "0000000000000000",
-						},
-					},
-				},
-			},
-			expectFound: true,
-		},
-		{
-			name: "finished job from a different spec is left alone",
-			jobs: []batchv1.Job{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "backup-test-backup-abc12345",
-						Namespace: testOperatorNS,
-						Labels: map[string]string{
-							LabelBackupName:      testBackupName,
-							LabelBackupNamespace: testNamespace,
-							LabelSpecHash:        "0000000000000000",
-						},
-					},
-					Status: batchv1.JobStatus{Succeeded: 1},
-				},
-			},
-			expectFound: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			objects := make([]client.Object, 0, 1+len(tt.jobs))
-			objects = append(objects, backup)
-			for i := range tt.jobs {
-				objects = append(objects, &tt.jobs[i])
-			}
-
-			r := newTestReconcilerWithObjects(objects...)
-
-			job, err := r.findExistingJob(context.Background(), backup, specHash)
-			if err != nil {
-				t.Fatalf(errUnexpectedError, err)
-			}
-
-			if tt.expectFound && job == nil {
-				t.Error("expected to find job, got nil")
-			}
-			if !tt.expectFound && job != nil {
-				t.Errorf("expected no job, got %s", job.Name)
-			}
-		})
-	}
-}
-
-func TestRunIDFromJob(t *testing.T) {
-	tests := []struct {
-		name     string
-		env      []corev1.EnvVar
-		expected string
-	}{
-		{name: "no env vars", env: nil, expected: ""},
-		{name: "RUN_ID present", env: []corev1.EnvVar{{Name: "RUN_ID", Value: "abc12345"}}, expected: "abc12345"},
-		{name: "RUN_ID absent", env: []corev1.EnvVar{{Name: "DB_HOST", Value: "localhost"}}, expected: ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			job := &batchv1.Job{
-				Spec: batchv1.JobSpec{
-					Template: corev1.PodTemplateSpec{
-						Spec: corev1.PodSpec{
-							Containers: []corev1.Container{{Name: "backup", Env: tt.env}},
-						},
-					},
-				},
-			}
-			if result := runIDFromJob(job); result != tt.expected {
-				t.Errorf("runIDFromJob() = %q, want %q", result, tt.expected)
-			}
-		})
-	}
-}
-
-// TestCreateBackupJobIfAllowed_ExistingJob tests that no duplicate jobs are created
-func TestCreateBackupJobIfAllowed_ExistingJob(t *testing.T) {
+func TestBackupReconciler_ReservedRunContinuesWithItsCreatedJob(t *testing.T) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
+	backup.Status.Phase = "Pending"
+	backup.Status.RunID = "existing1"
+	backup.Status.JobName = "backup-test-backup-existing1"
+	backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
 
 	db := newTestDatabase(testDBName, testNamespace, testClusterName)
 	cluster := newTestCluster(testClusterName)
 	storage := newTestStorage(testStorageName)
 	secret := newTestSecret(testSecretName, testOperatorNS)
 
-	// Pre-create a job for this backup
 	existingJob := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "backup-test-backup-existing1",
@@ -1580,7 +1228,7 @@ func TestCreateBackupJobIfAllowed_ExistingJob(t *testing.T) {
 				LabelBackupName:      testBackupName,
 				LabelBackupNamespace: testNamespace,
 				LabelCluster:         testClusterName,
-				LabelSpecHash:        (&BackupReconciler{}).computeSpecHash(backup),
+				LabelRunID:           "existing1",
 			},
 		},
 		Spec: batchv1.JobSpec{
@@ -1609,7 +1257,6 @@ func TestCreateBackupJobIfAllowed_ExistingJob(t *testing.T) {
 		t.Fatalf(errUnexpectedError, err)
 	}
 
-	// Verify only ONE job exists (the pre-existing one)
 	var jobs batchv1.JobList
 	if err := r.List(context.Background(), &jobs, client.InNamespace(testOperatorNS)); err != nil {
 		t.Fatalf(errFailedToListJobs, err)
@@ -1621,7 +1268,6 @@ func TestCreateBackupJobIfAllowed_ExistingJob(t *testing.T) {
 		t.Errorf("expected existing job name, got %s", jobs.Items[0].Name)
 	}
 
-	// Verify backup status was updated with existing job info
 	var updatedBackup databasesv1alpha1.Backup
 	if err := r.Get(context.Background(), req.NamespacedName, &updatedBackup); err != nil {
 		t.Fatalf(errFailedToGet, err)
@@ -1631,6 +1277,9 @@ func TestCreateBackupJobIfAllowed_ExistingJob(t *testing.T) {
 	}
 	if updatedBackup.Status.RunID != "existing1" {
 		t.Errorf("expected RunID 'existing1', got %s", updatedBackup.Status.RunID)
+	}
+	if updatedBackup.Status.Phase != "Running" || updatedBackup.Status.StartedAt == nil {
+		t.Errorf("expected the found Job to confirm the run, got phase %q startedAt %v", updatedBackup.Status.Phase, updatedBackup.Status.StartedAt)
 	}
 }
 
@@ -1644,19 +1293,19 @@ func newTestReconcilerWithObjects(objs ...client.Object) *BackupReconciler {
 
 	return &BackupReconciler{
 		Client:    fakeClient,
+		APIReader: fakeClient,
 		Scheme:    scheme,
 		Image:     testImage,
 		Namespace: testOperatorNS,
 	}
 }
 
-// TestIsJobFailed tests the isJobFailed function with various Job conditions
 func TestIsJobFailed(t *testing.T) {
 	tests := []struct {
 		name           string
 		conditions     []batchv1.JobCondition
 		expectFailed   bool
-		expectContains string // substring expected in reason
+		expectContains string
 	}{
 		{
 			name:         "no conditions",
@@ -1767,16 +1416,15 @@ func TestIsJobFailed(t *testing.T) {
 	}
 }
 
-// contains checks if s contains substr
 func contains(s, substr string) bool {
 	return strings.Contains(s, substr)
 }
 
-// TestBackupReconciler_JobFailedWithCondition tests that job failure is detected via conditions
 func TestBackupReconciler_JobFailedWithCondition(t *testing.T) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.Status.JobName = testJobName
+	backup.Status.RunID = testRunID
 	backup.Status.Phase = "Running"
 	backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
 
@@ -1785,6 +1433,7 @@ func TestBackupReconciler_JobFailedWithCondition(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testJobName,
 			Namespace: "dbtether",
+			Labels:    map[string]string{LabelBackupName: testBackupName, LabelBackupNamespace: testNamespace, LabelRunID: testRunID},
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit: &backoffLimit,
@@ -1831,7 +1480,6 @@ func TestBackupReconciler_JobFailedWithCondition(t *testing.T) {
 		t.Errorf(errExpectedPhase, "Failed", updatedBackup.Status.Phase)
 	}
 
-	// Verify failure reason is captured
 	if !contains(updatedBackup.Status.Message, "BackoffLimitExceeded") {
 		t.Errorf("expected message to contain 'BackoffLimitExceeded', got %q", updatedBackup.Status.Message)
 	}
@@ -1841,11 +1489,16 @@ func newSpentBackoffFixture() (*databasesv1alpha1.Backup, *batchv1.Job) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.Status.JobName = testJobName
+	backup.Status.RunID = testRunID
 	backup.Status.Phase = "Running"
 	backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
 
 	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: testJobName, Namespace: testOperatorNS},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testJobName,
+			Namespace: testOperatorNS,
+			Labels:    map[string]string{LabelBackupName: testBackupName, LabelBackupNamespace: testNamespace, LabelRunID: testRunID},
+		},
 		Status: batchv1.JobStatus{
 			Failed: 1,
 			Conditions: []batchv1.JobCondition{
@@ -2007,13 +1660,19 @@ func TestBackupReconciler_CompletedBackupNamesTheSucceededPod(t *testing.T) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.Status.JobName = testJobName
+	backup.Status.RunID = testRunID
 	backup.Status.Phase = "Running"
 	backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
 	backup.Status.LastPodName = testJobName + "-zzzzz"
+	backup.Status.Path = "c/app/run.sql.gz"
 
 	succeededJob := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: testJobName, Namespace: testOperatorNS},
-		Status:     batchv1.JobStatus{Succeeded: 1, Failed: 1},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testJobName,
+			Namespace: testOperatorNS,
+			Labels:    map[string]string{LabelBackupName: testBackupName, LabelBackupNamespace: testNamespace, LabelRunID: testRunID},
+		},
+		Status: batchv1.JobStatus{Succeeded: 1, Failed: 1},
 	}
 
 	base := time.Now().Add(-time.Hour)
@@ -2067,7 +1726,6 @@ func TestBackupReconciler_FailureFallsBackToLastTermination(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_CustomBackoffLimit tests custom backoff limit configuration
 func TestBackupReconciler_CustomBackoffLimit(t *testing.T) {
 	backoffLimit := int32(5)
 	backup := newTestBackup(testBackupName, testNamespace)
@@ -2109,9 +1767,8 @@ func TestBackupReconciler_CustomBackoffLimit(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_ActiveDeadlineSeconds tests active deadline configuration
 func TestBackupReconciler_ActiveDeadlineSeconds(t *testing.T) {
-	deadline := int64(1800) // 30 minutes
+	deadline := int64(1800)
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.Spec.JobConfig = &databasesv1alpha1.BackupJobConfig{
@@ -2151,11 +1808,11 @@ func TestBackupReconciler_ActiveDeadlineSeconds(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_DeadlineExceeded tests handling of deadline exceeded failure
 func TestBackupReconciler_DeadlineExceeded(t *testing.T) {
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.Status.JobName = testJobName
+	backup.Status.RunID = testRunID
 	backup.Status.Phase = "Running"
 	backup.Status.SpecHash = (&BackupReconciler{}).computeSpecHash(backup)
 
@@ -2164,6 +1821,7 @@ func TestBackupReconciler_DeadlineExceeded(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testJobName,
 			Namespace: "dbtether",
+			Labels:    map[string]string{LabelBackupName: testBackupName, LabelBackupNamespace: testNamespace, LabelRunID: testRunID},
 		},
 		Spec: batchv1.JobSpec{
 			ActiveDeadlineSeconds: &deadline,
@@ -2214,9 +1872,8 @@ func TestBackupReconciler_DeadlineExceeded(t *testing.T) {
 	}
 }
 
-// TestBackupReconciler_ZeroBackoffLimit tests zero retries configuration
 func TestBackupReconciler_ZeroBackoffLimit(t *testing.T) {
-	backoffLimit := int32(0) // No retries
+	backoffLimit := int32(0)
 	backup := newTestBackup(testBackupName, testNamespace)
 	backup.Finalizers = []string{backupFinalizer}
 	backup.Spec.JobConfig = &databasesv1alpha1.BackupJobConfig{
@@ -2257,7 +1914,6 @@ func TestBackupReconciler_ZeroBackoffLimit(t *testing.T) {
 }
 
 func TestGetLastPodName_Logic(t *testing.T) {
-	// Test the logic of selecting the most recently created pod
 	now := metav1.Now()
 	earlier := metav1.NewTime(now.Add(-1 * time.Hour))
 	evenEarlier := metav1.NewTime(now.Add(-2 * time.Hour))
@@ -2272,7 +1928,7 @@ func TestGetLastPodName_Logic(t *testing.T) {
 		{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:              "job-abc-pod-3",
-				CreationTimestamp: now, // newest
+				CreationTimestamp: now,
 			},
 		},
 		{
@@ -2283,7 +1939,6 @@ func TestGetLastPodName_Logic(t *testing.T) {
 		},
 	}
 
-	// Simulate getLastPodName logic
 	var lastPod *corev1.Pod
 	for i := range pods {
 		pod := &pods[i]
@@ -2301,7 +1956,6 @@ func TestGetLastPodName_Logic(t *testing.T) {
 }
 
 func TestGetLastPodName_EmptyList(t *testing.T) {
-	// Test with empty pod list
 	pods := []corev1.Pod{}
 
 	var lastPod *corev1.Pod
@@ -2318,7 +1972,6 @@ func TestGetLastPodName_EmptyList(t *testing.T) {
 }
 
 func TestGetLastPodName_SinglePod(t *testing.T) {
-	// Test with single pod
 	now := metav1.Now()
 	pods := []corev1.Pod{
 		{
@@ -2443,7 +2096,7 @@ func TestJobToBackupMapping(t *testing.T) {
 }
 
 func TestBackupReconciler_EnsureFinalizer_UpdateError(t *testing.T) {
-	backup := newTestBackup(testBackupName, testNamespace) // no finalizer yet
+	backup := newTestBackup(testBackupName, testNamespace)
 
 	scheme := newTestScheme()
 	fakeClient := fake.NewClientBuilder().
@@ -2459,6 +2112,7 @@ func TestBackupReconciler_EnsureFinalizer_UpdateError(t *testing.T) {
 
 	r := &BackupReconciler{
 		Client:    fakeClient,
+		APIReader: fakeClient,
 		Scheme:    scheme,
 		Namespace: testOperatorNS,
 		Image:     testImage,

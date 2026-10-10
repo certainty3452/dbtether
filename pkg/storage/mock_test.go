@@ -155,12 +155,10 @@ func TestMockClient_List(t *testing.T) {
 	client.AddObject("prefix/file2.txt", []byte("22"), now)
 	client.AddObject("other/file3.txt", []byte("333"), now)
 
-	// List with prefix
 	objects, err := client.List(ctx, "prefix/")
 	require.NoError(t, err)
 	assert.Len(t, objects, 2)
 
-	// List all
 	objects, err = client.List(ctx, "")
 	require.NoError(t, err)
 	assert.Len(t, objects, 3)
@@ -225,7 +223,6 @@ func TestMockClient_Keys(t *testing.T) {
 }
 
 func TestMockClient_Implements_StorageClient(t *testing.T) {
-	// Compile-time check
 	var _ StorageClient = (*MockClient)(nil)
 }
 
@@ -233,7 +230,6 @@ func TestMockClient_ConcurrentAccess(t *testing.T) {
 	ctx := context.Background()
 	client := NewMockClient()
 
-	// Concurrent writes
 	done := make(chan bool)
 	for i := 0; i < 10; i++ {
 		go func(idx int) {

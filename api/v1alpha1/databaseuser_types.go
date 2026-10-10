@@ -7,6 +7,7 @@ import (
 // +kubebuilder:validation:XValidation:rule="has(self.database) != has(self.databases)",message="exactly one of database or databases must be set"
 // +kubebuilder:validation:XValidation:rule="!(self.secretGeneration == 'perDatabase' && has(self.secret) && has(self.secret.name) && size(self.secret.name) > 0)",message="spec.secret.name cannot be set when secretGeneration=perDatabase (each per-DB secret derives its name from the DB)"
 // +kubebuilder:validation:XValidation:rule="!(self.secretGeneration == 'perDatabase' && has(self.secret) && has(self.secret.onConflict) && self.secret.onConflict != 'Fail')",message="onConflict policies Adopt/Merge are not supported when secretGeneration=perDatabase; only Fail is allowed"
+// +kubebuilder:validation:XValidation:rule="has(self.username) == has(oldSelf.username) && (!has(self.username) || self.username == oldSelf.username)",message="spec.username is immutable"
 type DatabaseUserSpec struct {
 	// Simple case: single database reference
 	// Mutually exclusive with Databases
@@ -74,6 +75,7 @@ type DatabaseAccess struct {
 	// +kubebuilder:validation:Required
 	Name string `json:"name"`
 
+	// Namespace of the Database. A namespace other than the DatabaseUser's must be listed in the Database's spec.allowedNamespaces.
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 
@@ -88,11 +90,11 @@ type DatabaseReference struct {
 	// +kubebuilder:validation:Required
 	Name string `json:"name"`
 
+	// Namespace of the Database. A namespace other than the referencing resource's must be listed in the Database's spec.allowedNamespaces.
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 }
 
-// GetDatabases returns a unified list of databases from either Database or Databases field
 func (s *DatabaseUserSpec) GetDatabases() []DatabaseAccess {
 	if s.Database != nil {
 		return []DatabaseAccess{*s.Database}
@@ -100,20 +102,19 @@ func (s *DatabaseUserSpec) GetDatabases() []DatabaseAccess {
 	return s.Databases
 }
 
-// HasDatabases returns true if at least one database is configured
 func (s *DatabaseUserSpec) HasDatabases() bool {
 	return s.Database != nil || len(s.Databases) > 0
 }
 
 type TableGrant struct {
-	// Pattern rules out null-bytes and unicode tricks before SQL layer.
+	// Table names in the public schema.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:items:Pattern=`^[a-zA-Z_][a-zA-Z0-9_]*$`
 	// +kubebuilder:validation:items:MaxLength=63
 	Tables []string `json:"tables"`
 
-	// Enum here is the admission gate; controller re-checks before SQL composition.
+	// Privileges to grant on the listed tables.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:items:Enum=SELECT;INSERT;UPDATE;DELETE;TRUNCATE;REFERENCES;TRIGGER;USAGE
@@ -147,11 +148,8 @@ type SecretConfig struct {
 	// +optional
 	Keys *SecretKeys `json:"keys,omitempty"`
 
-	// Merge mode persists via an annotation on the produced secret: once a
-	// secret is adopted under Merge, subsequent reconciles keep overlaying
-	// (foreign keys preserved) even if onConflict is later removed from the
-	// spec. Use Adopt then Fail (or recreate the secret) to "fall back" to
-	// full-replace semantics.
+	// What to do when the secret already exists. Merge keeps overlaying the
+	// secret on later reconciles, preserving foreign keys, even if onConflict is removed.
 	// +optional
 	// +kubebuilder:validation:Enum=Fail;Adopt;Merge
 	// +kubebuilder:default=Fail
@@ -167,9 +165,7 @@ type SecretKeys struct {
 	Database string `json:"database,omitempty"`
 	// +optional
 	Username string `json:"username,omitempty"`
-	// Renaming after the secret exists forces a password regeneration — the
-	// previous value can't be located under the old name. PG user keeps
-	// working; consumers must re-read the secret.
+	// Renaming after the secret exists regenerates the password; consumers must re-read the secret.
 	// +optional
 	Password string `json:"password,omitempty"`
 }
@@ -227,7 +223,6 @@ type DatabaseAccessStatus struct {
 	Message string `json:"message,omitempty"`
 }
 
-// GetDatabaseNames returns a comma-separated list of database names for display
 func (s *DatabaseUserStatus) GetDatabaseNames() string {
 	if len(s.Databases) == 0 {
 		return ""

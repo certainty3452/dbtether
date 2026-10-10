@@ -41,7 +41,6 @@ func TestAzureConfig_Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Basic validation - both container and storage account are required
 			hasRequired := tt.cfg.Container != "" && tt.cfg.StorageAccount != ""
 			if hasRequired != tt.valid {
 				t.Errorf("expected valid=%v, got container=%q storageAccount=%q",

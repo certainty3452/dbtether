@@ -32,7 +32,7 @@
         },
         "tag": {
           "type": "string",
-          "description": "Image tag. Automatically updated by release pipeline from git tag.",
+          "description": "Image tag. Defaults to the chart appVersion.",
           "default": ""
         }
       },
@@ -473,7 +473,7 @@
         "level": {
           "type": "string",
           "description": "Log level",
-          "enum": ["debug", "info", "warn", "error"],
+          "enum": ["debug", "info", "error"],
           "default": "info"
         },
         "format": {

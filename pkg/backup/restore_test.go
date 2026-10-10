@@ -80,7 +80,6 @@ func TestRestoreConfig_Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Basic validation checks
 			assert.NotEmpty(t, tt.config.Host)
 			assert.NotEmpty(t, tt.config.Database)
 			assert.NotEmpty(t, tt.config.SourcePath)

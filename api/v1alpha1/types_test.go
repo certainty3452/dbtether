@@ -81,7 +81,7 @@ func TestDatabaseSpec_DeletionPolicyDefaults(t *testing.T) {
 	tests := []struct {
 		name     string
 		policy   string
-		expected bool // should retain
+		expected bool
 	}{
 		{"Delete policy", "Delete", false},
 		{"Retain policy", "Retain", true},
@@ -105,7 +105,7 @@ func TestDatabaseUserSpec_DeletionPolicyDefaults(t *testing.T) {
 	tests := []struct {
 		name     string
 		policy   string
-		expected bool // should delete
+		expected bool
 	}{
 		{"Delete policy", "Delete", true},
 		{"Retain policy", "Retain", false},
@@ -210,7 +210,6 @@ func TestLatestFromSource_Fields(t *testing.T) {
 }
 
 func TestRestoreSource_Priority(t *testing.T) {
-	// Test that the source types are mutually exclusive in practice
 	t.Run("backupRef takes priority", func(t *testing.T) {
 		source := RestoreSource{
 			BackupRef:  &BackupReference{Name: "specific-backup"},
@@ -218,7 +217,6 @@ func TestRestoreSource_Priority(t *testing.T) {
 			Path:       "some/path.sql.gz",
 		}
 
-		// In controller, BackupRef is checked first
 		hasBackupRef := source.BackupRef != nil
 		assert.True(t, hasBackupRef)
 	})

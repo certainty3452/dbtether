@@ -31,48 +31,38 @@ import (
 
 const restoreFinalizer = "dbtether.io/restore-job"
 
-// regrantTimeout bounds the grant re-apply step, which is one sequential set of
-// PG round-trips per DatabaseUser of the target database.
+// One sequential set of PG round-trips per DatabaseUser of the target database.
 const regrantTimeout = 5 * time.Minute
 
-// grantAttemptLimit caps the rounds spent on DatabaseUsers whose grants keep
-// failing (e.g. additionalGrants naming a table an older dump never had), so one
-// permanently broken user cannot pin a finished restore in Granting forever.
+// Keeps one permanently broken user (e.g. additionalGrants naming a table an old dump lacked) from pinning Granting.
 const grantAttemptLimit = 5
 
-// grantRetryDelay paces regrant rounds with a fixed delay: workqueue backoff
-// starts at ~5ms and would burn the whole attempt budget in under a second on
-// a transient outage (e.g. a PG restart) that a later round would survive.
+// Fixed delay: workqueue backoff (~5ms start) would burn the attempt budget on a brief PG outage.
 const grantRetryDelay = 30 * time.Second
 
-// Label keys for restore resources
 const (
 	LabelRestoreName      = "dbtether.io/restore"
 	LabelRestoreNamespace = "dbtether.io/restore-namespace"
+
+	AnnotationRestoreName = "dbtether.io/restore-name"
 )
 
-// Event reason constants for restore operations
 const EventReasonRestoreGrantsSkipped = "RestoreGrantsSkipped"
 
 type RestoreReconciler struct {
 	client.Client
-	Scheme        *runtime.Scheme
-	Recorder      record.EventRecorder
-	Image         string
-	Namespace     string
-	SSLMode       string // propagated into Job env so it matches operator's posture
-	PodResources  corev1.ResourceRequirements
-	PGClientCache postgres.ClientCacheInterface
-}
+	APIReader          client.Reader
+	Scheme             *runtime.Scheme
+	Recorder           record.EventRecorder
+	Image              string
+	Namespace          string
+	ServiceAccountName string
+	SSLMode            string
+	PodResources       corev1.ResourceRequirements
+	PGClientCache      postgres.ClientCacheInterface
 
-// +kubebuilder:rbac:groups=dbtether.io,resources=restores,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=dbtether.io,resources=restores/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=dbtether.io,resources=restores/finalizers,verbs=update
-// +kubebuilder:rbac:groups=dbtether.io,resources=databases,verbs=get;list;watch
-// +kubebuilder:rbac:groups=dbtether.io,resources=databaseusers,verbs=get;list;watch
-// +kubebuilder:rbac:groups=dbtether.io,resources=dbclusters,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+	MaxConcurrentJobs int
+}
 
 func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -82,38 +72,44 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Handle deletion - cleanup Job via finalizer
 	if !restore.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, &restore)
 	}
 
-	// Ensure finalizer
 	if result, done, err := r.ensureFinalizer(ctx, &restore); done {
 		return result, err
 	}
 
-	specHash := r.computeSpecHash(&restore)
-
-	// Skip if already processed
-	if r.isAlreadyProcessed(&restore, specHash, logger) {
+	if restore.Status.Phase == "Completed" || restore.Status.Phase == "Failed" {
 		return ctrl.Result{}, nil
 	}
 
 	logger.V(1).Info("reconciling restore", "target", restore.Spec.Target.DatabaseRef.Name)
 
-	// The data already landed, so the Job is irrelevant from here on — and its TTL
-	// may well have collected it. Looking it up would report NotFound and bury a
-	// successful restore under a "job was deleted" failure.
-	if restore.Status.Phase == "Granting" && restore.Status.SpecHash == specHash {
-		return r.finishGranting(ctx, &restore, specHash)
+	result, err := r.reconcileRun(ctx, &restore, r.computeSpecHash(&restore), logger)
+	if errors.IsConflict(err) {
+		logger.V(1).Info("restore status changed since it was read, requeueing", "reason", err.Error())
+		return ctrl.Result{RequeueAfter: rerunRequeueDelay}, nil
 	}
+	return result, err
+}
 
-	// If Job already created, just check its status
-	if restore.Status.JobName != "" {
-		return r.checkJobStatus(ctx, &restore, specHash)
+// A Restore runs at most one Job ever: a reservation is replaced only while its Job provably never existed.
+func (r *RestoreReconciler) reconcileRun(ctx context.Context, restore *databasesv1alpha1.Restore, specHash string, logger logr.Logger) (ctrl.Result, error) {
+	switch {
+	case restore.Status.JobName != "" && restore.Status.SpecHash != "" && restore.Status.SpecHash != specHash:
+		return r.updateStatus(ctx, restore, "Failed", fmt.Sprintf(
+			"spec changed after restore job %s started; that run is no longer tracked, create a new Restore", restore.Status.JobName),
+			restore.Status.SpecHash)
+	case restore.Status.Phase == "Granting":
+		return r.finishGranting(ctx, restore, specHash)
+	case restore.Status.JobSucceededAt != nil:
+		return r.enterGranting(ctx, restore, specHash)
+	case restore.Status.JobName != "":
+		return r.continueRun(ctx, restore, specHash, logger)
+	default:
+		return r.startRestore(ctx, restore, specHash, logger)
 	}
-
-	return r.createRestoreJob(ctx, &restore, specHash, logger)
 }
 
 func (r *RestoreReconciler) ensureFinalizer(ctx context.Context, restore *databasesv1alpha1.Restore) (result ctrl.Result, done bool, err error) {
@@ -127,112 +123,287 @@ func (r *RestoreReconciler) ensureFinalizer(ctx context.Context, restore *databa
 	return ctrl.Result{RequeueAfter: finalizerRequeueDelay}, true, nil
 }
 
-func (r *RestoreReconciler) isAlreadyProcessed(restore *databasesv1alpha1.Restore, specHash string, logger logr.Logger) bool {
-	if restore.Status.Phase == "" || restore.Status.SpecHash != specHash {
-		return false
-	}
-	if restore.Status.Phase == "Completed" || restore.Status.Phase == "Failed" {
-		logger.V(1).Info("restore already processed", "phase", restore.Status.Phase)
-		return true
-	}
-	return false
+type restoreInputs struct {
+	sourcePath string
+	db         *databasesv1alpha1.Database
+	cluster    *databasesv1alpha1.DBCluster
+	storage    *databasesv1alpha1.BackupStorage
 }
 
-func (r *RestoreReconciler) createRestoreJob(
-	ctx context.Context,
-	restore *databasesv1alpha1.Restore,
-	specHash string,
-	logger logr.Logger,
-) (ctrl.Result, error) {
-	// Resolve source path
-	sourcePath, storageRef, err := r.resolveSource(ctx, restore)
-	if err != nil {
-		if isDependencyNotReady(err) {
-			return r.updateStatus(ctx, restore, "Pending", fmt.Sprintf("waiting for source: %v", err), specHash)
-		}
-		return r.updateStatus(ctx, restore, "Failed", fmt.Sprintf("failed to resolve source: %v", err), specHash)
+func (r *RestoreReconciler) startRestore(ctx context.Context, restore *databasesv1alpha1.Restore, specHash string, logger logr.Logger) (ctrl.Result, error) {
+	inputs, result, err := r.resolveInputs(ctx, restore, specHash)
+	if inputs == nil {
+		return result, err
 	}
-
-	// Adopt an already-created job: the job name embeds a fresh runID, so a status
-	// patch that fails after Create would otherwise spawn a second concurrent pg_restore.
-	existingJob, err := r.findExistingJob(ctx, restore)
+	throttled, err := clusterThrottleMessage(ctx, r.Client, r.Namespace, inputs.cluster.Name, r.MaxConcurrentJobs, logger)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if existingJob != nil {
-		logger.V(1).Info("restore job already exists, using existing", "job", existingJob.Name)
-		runID := r.extractRunIDFromJobName(existingJob.Name, restore.Name)
-		return r.updateStatusWithJob(ctx, restore, "Running", "restore job running", specHash, existingJob.Name, runID, sourcePath)
+	if throttled != "" {
+		return r.waitForSlot(ctx, restore, specHash, throttled)
+	}
+	return r.reserveAndCreate(ctx, restore, specHash, inputs, logger)
+}
+
+func (r *RestoreReconciler) resolveInputs(ctx context.Context, restore *databasesv1alpha1.Restore, specHash string) (*restoreInputs, ctrl.Result, error) {
+	sourcePath, storageRef, err := r.resolveSource(ctx, restore)
+	if err != nil {
+		result, err := r.handleResolveError(ctx, restore, specHash, fmt.Errorf("source: %w", err))
+		return nil, result, err
 	}
 
-	// Get target database
+	db, cluster, storage, err := r.getResources(ctx, restore, storageRef)
+	if err != nil {
+		result, err := r.handleResolveError(ctx, restore, specHash, err)
+		return nil, result, err
+	}
+
+	if msg := jobCredentialsProblem(cluster, storage, r.Namespace, "restore"); msg != "" {
+		result, err := r.updateStatus(ctx, restore, "Pending", msg, specHash)
+		return nil, result, err
+	}
+
+	return &restoreInputs{sourcePath: sourcePath, db: db, cluster: cluster, storage: storage}, ctrl.Result{}, nil
+}
+
+func (r *RestoreReconciler) reserveAndCreate(ctx context.Context, restore *databasesv1alpha1.Restore, specHash string,
+	inputs *restoreInputs, logger logr.Logger) (ctrl.Result, error) {
+
+	runID := generateRunID()
+	if err := r.patchRunStatus(ctx, restore, func(status *databasesv1alpha1.RestoreStatus) {
+		*status = databasesv1alpha1.RestoreStatus{
+			Phase:              "Pending",
+			Message:            "creating restore job",
+			SpecHash:           specHash,
+			JobName:            restoreJobName(restore.Name, runID),
+			RunID:              runID,
+			SourcePath:         inputs.sourcePath,
+			ObservedGeneration: restore.Generation,
+		}
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.createRunJob(ctx, restore, specHash, inputs, logger)
+}
+
+func (r *RestoreReconciler) createRunJob(ctx context.Context, restore *databasesv1alpha1.Restore, specHash string,
+	inputs *restoreInputs, logger logr.Logger) (ctrl.Result, error) {
+
+	job := r.buildRestoreJob(restore, inputs.db, inputs.cluster, inputs.storage)
+	err := r.Create(ctx, job)
+	switch {
+	case err == nil:
+		logger.Info("restore job created", "job", job.Name, "runId", restore.Status.RunID, "source", restore.Status.SourcePath)
+	case errors.IsAlreadyExists(err):
+		existing, found, getErr := r.getRunJob(ctx, restore)
+		if getErr != nil {
+			return ctrl.Result{}, getErr
+		}
+		if !found {
+			return ctrl.Result{RequeueAfter: rerunRequeueDelay}, nil
+		}
+		if !jobBelongsToRun(existing, restore.Status.RunID, restoreJobSelector(restore)) {
+			return r.failJobNameCollision(ctx, restore, specHash, existing)
+		}
+		logger.V(1).Info("restore job already created for this run", "job", job.Name)
+	default:
+		return r.handleJobCreationError(ctx, restore, specHash, err, logger)
+	}
+
+	if err := r.confirmRun(ctx, restore, "restore job started"); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+func (r *RestoreReconciler) confirmRun(ctx context.Context, restore *databasesv1alpha1.Restore, message string) error {
+	return r.patchRunStatus(ctx, restore, func(status *databasesv1alpha1.RestoreStatus) {
+		status.Phase = "Running"
+		status.Message = message
+		if status.StartedAt == nil {
+			now := metav1.Now()
+			status.StartedAt = &now
+		}
+	})
+}
+
+func (r *RestoreReconciler) continueRun(ctx context.Context, restore *databasesv1alpha1.Restore, specHash string, logger logr.Logger) (ctrl.Result, error) {
+	job, found, err := r.getRunJob(ctx, restore)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if found {
+		if !jobBelongsToRun(job, restore.Status.RunID, restoreJobSelector(restore)) {
+			return r.failJobNameCollision(ctx, restore, specHash, job)
+		}
+		if restore.Status.Phase != "Running" {
+			if err := r.confirmRun(ctx, restore, "restore job running"); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return r.evaluateJobStatus(ctx, restore, job, specHash)
+	}
+
+	// A stale cache could hide that this restore's Job already ran and recorded its start or success.
+	var fresh databasesv1alpha1.Restore
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(restore), &fresh); err != nil {
+		return ctrl.Result{}, err
+	}
+	if fresh.ResourceVersion != restore.ResourceVersion {
+		return ctrl.Result{RequeueAfter: rerunRequeueDelay}, nil
+	}
+
+	if restoreJobEvidence(restore) {
+		return r.updateStatus(ctx, restore, "Failed", fmt.Sprintf(
+			"restore job %s disappeared without recording a result; the target database state is unknown", restore.Status.JobName), specHash)
+	}
+	return r.createReservedJob(ctx, restore, specHash, logger)
+}
+
+// Each of these is written only after the restore's Job exists, so a missing Job with any of them is gone, not pending creation.
+func restoreJobEvidence(restore *databasesv1alpha1.Restore) bool {
+	return restore.Status.Phase == "Running" || restore.Status.StartedAt != nil
+}
+
+func (r *RestoreReconciler) createReservedJob(ctx context.Context, restore *databasesv1alpha1.Restore, specHash string, logger logr.Logger) (ctrl.Result, error) {
+	inputs, result, err := r.resolveInputs(ctx, restore, specHash)
+	if inputs == nil {
+		return result, err
+	}
+	throttled, err := clusterThrottleMessage(ctx, r.Client, r.Namespace, inputs.cluster.Name, r.MaxConcurrentJobs, logger)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if throttled != "" {
+		return r.waitForSlot(ctx, restore, specHash, throttled)
+	}
+	if inputs.sourcePath != restore.Status.SourcePath {
+		return r.reserveAndCreate(ctx, restore, specHash, inputs, logger)
+	}
+	return r.createRunJob(ctx, restore, specHash, inputs, logger)
+}
+
+func (r *RestoreReconciler) waitForSlot(ctx context.Context, restore *databasesv1alpha1.Restore, specHash, message string) (ctrl.Result, error) {
+	if err := r.patchRunStatus(ctx, restore, func(status *databasesv1alpha1.RestoreStatus) {
+		status.Phase = "Pending"
+		status.Message = message
+		status.SpecHash = specHash
+		status.ObservedGeneration = restore.Generation
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: RequeueDelayWhenThrottled}, nil
+}
+
+func (r *RestoreReconciler) getRunJob(ctx context.Context, restore *databasesv1alpha1.Restore) (*batchv1.Job, bool, error) {
+	return getJob(ctx, r.Client, r.APIReader, types.NamespacedName{Name: restore.Status.JobName, Namespace: r.Namespace})
+}
+
+func (r *RestoreReconciler) failJobNameCollision(ctx context.Context, restore *databasesv1alpha1.Restore, specHash string,
+	existing *batchv1.Job) (ctrl.Result, error) {
+
+	message := jobNameCollisionMessage(existing)
+	log.FromContext(ctx).Error(nil, "restore job name taken by a foreign job", "job", existing.Name)
+	if err := r.patchRunStatus(ctx, restore, func(status *databasesv1alpha1.RestoreStatus) {
+		status.Phase = "Failed"
+		status.Message = message
+		status.SpecHash = specHash
+		status.JobName = ""
+		status.ObservedGeneration = restore.Generation
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *RestoreReconciler) handleResolveError(
+	ctx context.Context,
+	restore *databasesv1alpha1.Restore,
+	specHash string,
+	err error,
+) (ctrl.Result, error) {
+	switch {
+	case isDependencyNotReady(err):
+		return r.updateStatus(ctx, restore, "Pending", fmt.Sprintf("waiting for %v", err), specHash)
+	case isInvalidRestoreSource(err):
+		return r.updateStatus(ctx, restore, "Failed", fmt.Sprintf("failed to resolve %v", err), specHash)
+	default:
+		return ctrl.Result{}, err
+	}
+}
+
+func (r *RestoreReconciler) handleJobCreationError(
+	ctx context.Context,
+	restore *databasesv1alpha1.Restore,
+	specHash string,
+	err error,
+	logger logr.Logger,
+) (ctrl.Result, error) {
+	if errors.IsInvalid(err) {
+		logger.Error(err, "restore job spec rejected by the API server")
+		return r.updateStatus(ctx, restore, "Failed", fmt.Sprintf("failed to create job: %v", err), specHash)
+	}
+	logger.Error(err, "failed to create restore job")
+	// Create may have landed despite the error; the next reconcile finds it under the reserved name.
+	if _, statusErr := r.updateStatus(ctx, restore, "Pending", fmt.Sprintf("failed to create job: %v", err), specHash); statusErr != nil {
+		return ctrl.Result{}, statusErr
+	}
+	return ctrl.Result{}, err
+}
+
+func (r *RestoreReconciler) getResources(ctx context.Context, restore *databasesv1alpha1.Restore, storageRef string) (
+	*databasesv1alpha1.Database, *databasesv1alpha1.DBCluster, *databasesv1alpha1.BackupStorage, error) {
+
+	dbName := restore.Spec.Target.DatabaseRef.Name
 	var db databasesv1alpha1.Database
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      restore.Spec.Target.DatabaseRef.Name,
-		Namespace: restore.Namespace,
-	}, &db); err != nil {
-		return r.updateStatus(ctx, restore, "Failed", fmt.Sprintf("target database not found: %v", err), specHash)
+	if err := r.Get(ctx, types.NamespacedName{Name: dbName, Namespace: restore.Namespace}, &db); err != nil {
+		if errors.IsNotFound(err) {
+			return nil, nil, nil, newDependencyNotReady("target database %s: not found", dbName)
+		}
+		return nil, nil, nil, fmt.Errorf("failed to get target database %s: %w", dbName, err)
+	}
+	if db.Status.Phase != "Ready" {
+		return nil, nil, nil, newDependencyNotReady("target database %s to become Ready (phase: %s)", dbName, db.Status.Phase)
 	}
 
-	// Get DBCluster
 	var cluster databasesv1alpha1.DBCluster
 	if err := r.Get(ctx, types.NamespacedName{Name: db.Spec.ClusterRef.Name}, &cluster); err != nil {
-		return r.updateStatus(ctx, restore, "Failed", fmt.Sprintf("cluster not found: %v", err), specHash)
+		if errors.IsNotFound(err) {
+			return nil, nil, nil, newDependencyNotReady("cluster %s: not found", db.Spec.ClusterRef.Name)
+		}
+		return nil, nil, nil, fmt.Errorf("failed to get cluster %s: %w", db.Spec.ClusterRef.Name, err)
 	}
 
-	// Get BackupStorage
 	var storage databasesv1alpha1.BackupStorage
 	if err := r.Get(ctx, types.NamespacedName{Name: storageRef}, &storage); err != nil {
-		return r.updateStatus(ctx, restore, "Failed", fmt.Sprintf("backup storage not found: %v", err), specHash)
-	}
-
-	// Generate RunID
-	runID := generateRunID()
-
-	// Create restore job (in operator namespace, like backup jobs)
-	job, err := r.buildRestoreJob(restore, &db, &cluster, &storage, sourcePath, runID)
-	if err != nil {
-		return r.updateStatus(ctx, restore, "Failed", fmt.Sprintf("failed to build job: %v", err), specHash)
-	}
-
-	// Note: No owner reference set because Job runs in operator namespace,
-	// while Restore CRD is in user namespace. Cleanup handled by TTL and finalizer.
-
-	if err := r.Create(ctx, job); err != nil {
-		if errors.IsAlreadyExists(err) {
-			logger.V(1).Info("restore job already exists", "job", job.Name)
-		} else {
-			return r.updateStatus(ctx, restore, "Failed", fmt.Sprintf("failed to create job: %v", err), specHash)
+		if errors.IsNotFound(err) {
+			return nil, nil, nil, newDependencyNotReady("backup storage %s: not found", storageRef)
 		}
+		return nil, nil, nil, fmt.Errorf("failed to get backup storage %s: %w", storageRef, err)
 	}
 
-	logger.Info("restore job created", "job", job.Name, "source", sourcePath)
-
-	return r.updateStatusWithJob(ctx, restore, "Running", "restore job started", specHash, job.Name, runID, sourcePath)
+	return &db, &cluster, &storage, nil
 }
 
 func (r *RestoreReconciler) resolveSource(ctx context.Context, restore *databasesv1alpha1.Restore) (sourcePath, storageRefName string, err error) {
 	source := restore.Spec.Source
 
-	// Option 1: BackupRef - get path from existing Backup
 	if source.BackupRef != nil {
 		return r.resolveFromBackupRef(ctx, restore, source.BackupRef)
 	}
 
-	// Option 2: LatestFrom - find latest successful backup for a database
 	if source.LatestFrom != nil {
 		return r.resolveFromLatest(ctx, restore, source.LatestFrom)
 	}
 
-	// Option 3: Direct path
 	if source.Path != "" {
 		if source.StorageRef == nil {
-			return "", "", fmt.Errorf("storageRef is required when using path")
+			return "", "", newInvalidSource("storageRef is required when using path")
 		}
 		return source.Path, source.StorageRef.Name, nil
 	}
 
-	return "", "", fmt.Errorf("either backupRef, latestFrom, or path must be specified")
+	return "", "", newInvalidSource("either backupRef, latestFrom, or path must be specified")
 }
 
 func (r *RestoreReconciler) resolveFromBackupRef(
@@ -250,18 +421,25 @@ func (r *RestoreReconciler) resolveFromBackupRef(
 		Name:      ref.Name,
 		Namespace: ns,
 	}, &backup); err != nil {
-		return "", "", fmt.Errorf("backup not found: %w", err)
+		if errors.IsNotFound(err) {
+			return "", "", newDependencyNotReady("backup not found: %s/%s", ns, ref.Name)
+		}
+		return "", "", fmt.Errorf("failed to get backup %s/%s: %w", ns, ref.Name, err)
+	}
+
+	if err := r.checkSourceConsent(ctx, restore, controllers.DatabaseRefKey(backup.Spec.DatabaseRef, backup.Namespace)); err != nil {
+		return "", "", err
 	}
 
 	switch backup.Status.Phase {
 	case "", "Pending", "Running":
 		return "", "", newDependencyNotReady("backup %s is not completed yet (phase: %s)", ref.Name, backup.Status.Phase)
 	case "Failed":
-		return "", "", fmt.Errorf("backup is not completed (phase: %s)", backup.Status.Phase)
+		return "", "", newInvalidSource("backup is not completed (phase: %s)", backup.Status.Phase)
 	}
 
 	if backup.Status.Path == "" {
-		return "", "", fmt.Errorf("backup has no path in status")
+		return "", "", newInvalidSource("backup has no path in status")
 	}
 
 	return backup.Status.Path, backup.Spec.StorageRef.Name, nil
@@ -277,35 +455,34 @@ func (r *RestoreReconciler) resolveFromLatest(
 		ns = restore.Namespace
 	}
 
-	// List all backups in the namespace
+	source := controllers.DatabaseRefKey(latestFrom.DatabaseRef, ns)
+	if err := r.checkSourceConsent(ctx, restore, source); err != nil {
+		return "", "", err
+	}
+
 	var backupList databasesv1alpha1.BackupList
 	if err := r.List(ctx, &backupList, client.InNamespace(ns)); err != nil {
 		return "", "", fmt.Errorf("failed to list backups: %w", err)
 	}
 
-	// Filter by database and find the latest completed one
 	var latestBackup *databasesv1alpha1.Backup
 	var latestTime *metav1.Time
 
 	for i := range backupList.Items {
 		backup := &backupList.Items[i]
 
-		// Skip if not for this database
-		if backup.Spec.DatabaseRef.Name != latestFrom.DatabaseRef.Name {
+		if controllers.DatabaseRefKey(backup.Spec.DatabaseRef, backup.Namespace) != source {
 			continue
 		}
 
-		// Skip if not completed
 		if backup.Status.Phase != "Completed" {
 			continue
 		}
 
-		// Skip if no path
 		if backup.Status.Path == "" {
 			continue
 		}
 
-		// Check if this is the latest
 		if backup.Status.CompletedAt == nil {
 			continue
 		}
@@ -317,10 +494,27 @@ func (r *RestoreReconciler) resolveFromLatest(
 	}
 
 	if latestBackup == nil {
-		return "", "", fmt.Errorf("no completed backup found for database %s", latestFrom.DatabaseRef.Name)
+		return "", "", newInvalidSource("no completed backup found for database %s", latestFrom.DatabaseRef.Name)
 	}
 
 	return latestBackup.Status.Path, latestBackup.Spec.StorageRef.Name, nil
+}
+
+func (r *RestoreReconciler) checkSourceConsent(ctx context.Context, restore *databasesv1alpha1.Restore, source types.NamespacedName) error {
+	if source.Namespace == restore.Namespace {
+		return nil
+	}
+	var db databasesv1alpha1.Database
+	if err := r.Get(ctx, source, &db); err != nil {
+		if errors.IsNotFound(err) {
+			return newInvalidSource("source database %s no longer exists, so it cannot allow namespace %q", source, restore.Namespace)
+		}
+		return fmt.Errorf("failed to get source database %s: %w", source, err)
+	}
+	if err := controllers.CheckReferenceConsent(&db, restore.Namespace); err != nil {
+		return newDependencyNotReady("%s", err.Error())
+	}
+	return nil
 }
 
 func (r *RestoreReconciler) buildRestoreJob(
@@ -328,13 +522,13 @@ func (r *RestoreReconciler) buildRestoreJob(
 	db *databasesv1alpha1.Database,
 	cluster *databasesv1alpha1.DBCluster,
 	storage *databasesv1alpha1.BackupStorage,
-	sourcePath string,
-	runID string,
-) (*batchv1.Job, error) {
-	jobName := fmt.Sprintf("restore-%s-%s", restore.Name, runID)
-
-	// Build environment variables
-	env := r.buildEnvVars(db, cluster, storage, sourcePath, restore.Spec.OnConflict)
+) *batchv1.Job {
+	env := r.buildEnvVars(db, cluster, storage, restore.Status.SourcePath, restore.Spec.OnConflict)
+	env = append(env,
+		corev1.EnvVar{Name: "RESTORE_NAME", Value: restore.Name},
+		corev1.EnvVar{Name: "RESTORE_NAMESPACE", Value: restore.Namespace},
+		corev1.EnvVar{Name: "RUN_ID", Value: restore.Status.RunID},
+	)
 
 	backoffLimit := int32(0)
 	ttlSeconds := int32(3600)
@@ -342,29 +536,30 @@ func (r *RestoreReconciler) buildRestoreJob(
 		ttlSeconds = int32(restore.Spec.TTLAfterCompletion.Seconds())
 	}
 
-	job := &batchv1.Job{
+	labels := restoreJobSelector(restore)
+	labels[LabelRunID] = restore.Status.RunID
+	jobLabels := map[string]string{LabelCluster: boundedLabelValue(cluster.Name)}
+	for k, v := range labels {
+		jobLabels[k] = v
+	}
+
+	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobName,
-			Namespace: r.Namespace,
-			Labels: map[string]string{
-				LabelRestoreName:      restore.Name,
-				LabelRestoreNamespace: restore.Namespace,
-				LabelCluster:          cluster.Name,
-			},
+			Name:        restore.Status.JobName,
+			Namespace:   r.Namespace,
+			Labels:      jobLabels,
+			Annotations: map[string]string{AnnotationRestoreName: restore.Name},
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            &backoffLimit,
 			TTLSecondsAfterFinished: &ttlSeconds,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						LabelRestoreName:      restore.Name,
-						LabelRestoreNamespace: restore.Namespace,
-					},
+					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
 					RestartPolicy:      corev1.RestartPolicyNever,
-					ServiceAccountName: "dbtether", // Uses operator's SA for IRSA
+					ServiceAccountName: r.ServiceAccountName,
 					Containers: []corev1.Container{
 						{
 							Name:      "restore",
@@ -378,8 +573,6 @@ func (r *RestoreReconciler) buildRestoreJob(
 			},
 		},
 	}
-
-	return job, nil
 }
 
 func (r *RestoreReconciler) buildEnvVars(
@@ -400,7 +593,6 @@ func (r *RestoreReconciler) buildEnvVars(
 		env = append(env, corev1.EnvVar{Name: "DB_SSLMODE", Value: r.SSLMode})
 	}
 
-	// Add credentials from secret
 	if cluster.Spec.CredentialsSecretRef != nil {
 		env = append(env,
 			corev1.EnvVar{
@@ -428,73 +620,20 @@ func (r *RestoreReconciler) buildEnvVars(
 		)
 	}
 
-	// Add storage config
-	if storage.Spec.S3 != nil {
-		env = append(env,
-			corev1.EnvVar{Name: "STORAGE_TYPE", Value: "s3"},
-			corev1.EnvVar{Name: "S3_BUCKET", Value: storage.Spec.S3.Bucket},
-			corev1.EnvVar{Name: "S3_REGION", Value: storage.Spec.S3.Region},
-		)
-		if storage.Spec.S3.Endpoint != "" {
-			env = append(env, corev1.EnvVar{Name: "S3_ENDPOINT", Value: storage.Spec.S3.Endpoint})
-		}
-
-		env = append(env, storageCredentialsEnv(storage)...)
-	}
-
-	if storage.Spec.GCS != nil {
-		env = append(env,
-			corev1.EnvVar{Name: "STORAGE_TYPE", Value: "gcs"},
-			corev1.EnvVar{Name: "GCS_BUCKET", Value: storage.Spec.GCS.Bucket},
-		)
-		if storage.Spec.GCS.Project != "" {
-			env = append(env, corev1.EnvVar{Name: "GCS_PROJECT", Value: storage.Spec.GCS.Project})
-		}
-	}
-
-	if storage.Spec.Azure != nil {
-		env = append(env,
-			corev1.EnvVar{Name: "STORAGE_TYPE", Value: "azure"},
-			corev1.EnvVar{Name: "AZURE_CONTAINER", Value: storage.Spec.Azure.Container},
-			corev1.EnvVar{Name: "AZURE_ACCOUNT", Value: storage.Spec.Azure.StorageAccount},
-		)
-	}
+	env = append(env, storageEnv(storage)...)
 
 	return env
-}
-
-func (r *RestoreReconciler) checkJobStatus(ctx context.Context, restore *databasesv1alpha1.Restore, specHash string) (ctrl.Result, error) {
-	var job batchv1.Job
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      restore.Status.JobName,
-		Namespace: r.Namespace,
-	}, &job); err != nil {
-		if errors.IsNotFound(err) {
-			// Job deleted externally
-			return r.updateStatus(ctx, restore, "Failed", "restore job was deleted", specHash)
-		}
-		return ctrl.Result{}, err
-	}
-
-	return r.evaluateJobStatus(ctx, restore, &job, specHash)
 }
 
 func (r *RestoreReconciler) evaluateJobStatus(ctx context.Context, restore *databasesv1alpha1.Restore, job *batchv1.Job, specHash string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	if job.Status.Succeeded > 0 {
-		// Completed gates downstream automation, so it must mean "usable by the
-		// database's registered users" — hold the phase until grants are back.
-		// Persisting Granting first is what lets a retry outlive the Job's TTL.
-		if _, err := r.updateStatus(ctx, restore, "Granting", "restore succeeded, applying grants", specHash); err != nil {
-			return ctrl.Result{}, err
-		}
-		return r.finishGranting(ctx, restore, specHash)
+		return r.enterGranting(ctx, restore, specHash)
 	}
 
 	if job.Status.Failed > 0 {
 		message := "restore job failed"
-		// Try to get failure reason from pod
 		if reason := jobFailureReason(ctx, r.Client, job); reason != "" {
 			message = reason
 		}
@@ -502,8 +641,15 @@ func (r *RestoreReconciler) evaluateJobStatus(ctx context.Context, restore *data
 		return r.updateStatus(ctx, restore, "Failed", message, specHash)
 	}
 
-	// Still running
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// Completed must mean usable by the database's users; persisting Granting first lets grant retries outlive the Job's TTL.
+func (r *RestoreReconciler) enterGranting(ctx context.Context, restore *databasesv1alpha1.Restore, specHash string) (ctrl.Result, error) {
+	if _, err := r.updateStatus(ctx, restore, "Granting", "restore succeeded, applying grants", specHash); err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.finishGranting(ctx, restore, specHash)
 }
 
 func (r *RestoreReconciler) handleDeletion(ctx context.Context, restore *databasesv1alpha1.Restore) (ctrl.Result, error) {
@@ -513,24 +659,20 @@ func (r *RestoreReconciler) handleDeletion(ctx context.Context, restore *databas
 		return ctrl.Result{}, nil
 	}
 
-	// Delete the job if it exists
-	if restore.Status.JobName != "" {
-		job := &batchv1.Job{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      restore.Status.JobName,
-				Namespace: r.Namespace,
-			},
-		}
-		propagation := metav1.DeletePropagationBackground
-		if err := r.Delete(ctx, job, &client.DeleteOptions{
+	var jobs batchv1.JobList
+	if err := r.List(ctx, &jobs, client.InNamespace(r.Namespace), restoreJobSelector(restore)); err != nil {
+		return ctrl.Result{}, err
+	}
+	propagation := metav1.DeletePropagationBackground
+	for i := range jobs.Items {
+		if err := r.Delete(ctx, &jobs.Items[i], &client.DeleteOptions{
 			PropagationPolicy: &propagation,
 		}); err != nil && !errors.IsNotFound(err) {
 			return ctrl.Result{}, err
 		}
-		logger.Info("restore deleted, job cleaned up", "job", restore.Status.JobName)
+		logger.Info("restore deleted, job cleaned up", "job", jobs.Items[i].Name)
 	}
 
-	// Remove finalizer using Patch to avoid optimistic locking conflicts
 	patch := client.MergeFrom(restore.DeepCopy())
 	controllerutil.RemoveFinalizer(restore, restoreFinalizer)
 	if err := r.Patch(ctx, restore, patch); err != nil {
@@ -545,25 +687,16 @@ func (r *RestoreReconciler) updateStatus(
 	restore *databasesv1alpha1.Restore,
 	phase, message, specHash string,
 ) (ctrl.Result, error) {
-	patch := client.MergeFrom(restore.DeepCopy())
-
-	restore.Status.Phase = phase
-	restore.Status.Message = message
-	restore.Status.SpecHash = specHash
-	restore.Status.ObservedGeneration = restore.Generation
-
-	if phase == "Running" && restore.Status.StartedAt == nil {
-		now := metav1.Now()
-		restore.Status.StartedAt = &now
-	}
-
-	// Granting is only entered from a fresh Job success, so the grant attempt
-	// budget starts over here rather than carrying over from an earlier run.
-	if phase == "Granting" {
-		restore.Status.GrantAttempts = 0
-	}
-
-	if err := r.Status().Patch(ctx, restore, patch); err != nil {
+	if err := r.patchRunStatus(ctx, restore, func(status *databasesv1alpha1.RestoreStatus) {
+		status.Phase = phase
+		status.Message = message
+		status.SpecHash = specHash
+		status.ObservedGeneration = restore.Generation
+		// Granting is entered only from a fresh Job success, so the attempt budget restarts.
+		if phase == "Granting" {
+			status.GrantAttempts = 0
+		}
+	}); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -573,52 +706,30 @@ func (r *RestoreReconciler) updateStatus(
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-func (r *RestoreReconciler) updateStatusWithJob(
-	ctx context.Context,
-	restore *databasesv1alpha1.Restore,
-	phase, message, specHash, jobName, runID, sourcePath string,
-) (ctrl.Result, error) {
-	patch := client.MergeFrom(restore.DeepCopy())
-
-	restore.Status.Phase = phase
-	restore.Status.Message = message
-	restore.Status.SpecHash = specHash
-	restore.Status.JobName = jobName
-	restore.Status.RunID = runID
-	restore.Status.SourcePath = sourcePath
-	restore.Status.ObservedGeneration = restore.Generation
-
-	now := metav1.Now()
-	restore.Status.StartedAt = &now
-
-	if err := r.Status().Patch(ctx, restore, patch); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-}
-
 func (r *RestoreReconciler) updateStatusCompleted(
 	ctx context.Context,
 	restore *databasesv1alpha1.Restore,
 	specHash, message string,
 ) (ctrl.Result, error) {
-	patch := client.MergeFrom(restore.DeepCopy())
-
-	restore.Status.Phase = "Completed"
-	restore.Status.Message = message
-	restore.Status.SpecHash = specHash
-	restore.Status.Duration = restoreDuration(restore)
-	restore.Status.ObservedGeneration = restore.Generation
-
-	now := metav1.Now()
-	restore.Status.CompletedAt = &now
-
-	if err := r.Status().Patch(ctx, restore, patch); err != nil {
+	if err := r.patchRunStatus(ctx, restore, func(status *databasesv1alpha1.RestoreStatus) {
+		now := metav1.Now()
+		status.Phase = "Completed"
+		status.Message = message
+		status.SpecHash = specHash
+		status.Duration = restoreDuration(restore)
+		status.ObservedGeneration = restore.Generation
+		status.CompletedAt = &now
+	}); err != nil {
 		return ctrl.Result{}, err
 	}
-
 	return ctrl.Result{}, nil
+}
+
+// Conditional on the version read, so a decision taken on a stale read never lands.
+func (r *RestoreReconciler) patchRunStatus(ctx context.Context, restore *databasesv1alpha1.Restore, mutate func(*databasesv1alpha1.RestoreStatus)) error {
+	patch := client.MergeFromWithOptions(restore.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	mutate(&restore.Status)
+	return r.Status().Patch(ctx, restore, patch)
 }
 
 func (r *RestoreReconciler) computeSpecHash(restore *databasesv1alpha1.Restore) string {
@@ -633,7 +744,7 @@ func (r *RestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&databasesv1alpha1.Restore{}).
-		// Jobs don't have OwnerReference (cross-namespace), so we watch by labels
+		// Jobs carry no OwnerReference (cross-namespace), so watch by labels.
 		Watches(&batchv1.Job{}, r.jobEventHandler()).
 		Complete(r)
 }
@@ -645,7 +756,7 @@ func (r *RestoreReconciler) jobEventHandler() handler.EventHandler {
 			return nil
 		}
 
-		restoreName := job.Labels[LabelRestoreName]
+		restoreName := job.Annotations[AnnotationRestoreName]
 		restoreNamespace := job.Labels[LabelRestoreNamespace]
 		if restoreName == "" || restoreNamespace == "" {
 			return nil
@@ -660,28 +771,34 @@ func (r *RestoreReconciler) jobEventHandler() handler.EventHandler {
 	})
 }
 
-func (r *RestoreReconciler) findExistingJob(ctx context.Context, restore *databasesv1alpha1.Restore) (*batchv1.Job, error) {
-	var jobs batchv1.JobList
-	if err := r.List(ctx, &jobs, client.InNamespace(r.Namespace), client.MatchingLabels{
-		LabelRestoreName:      restore.Name,
+func restoreJobSelector(restore *databasesv1alpha1.Restore) client.MatchingLabels {
+	return client.MatchingLabels{
+		LabelRestoreName:      boundedLabelValue(restore.Name),
 		LabelRestoreNamespace: restore.Namespace,
-	}); err != nil {
-		return nil, err
 	}
-
-	if len(jobs.Items) == 0 {
-		return nil, nil
-	}
-
-	return &jobs.Items[0], nil
 }
 
-func (r *RestoreReconciler) extractRunIDFromJobName(jobName, restoreName string) string {
-	prefix := fmt.Sprintf("restore-%s-", restoreName)
-	if len(jobName) > len(prefix) {
-		return jobName[len(prefix):]
-	}
-	return ""
+// "restore-" + name + "-" + 8-char run id must fit a 63-char DNS label (the job-name pod label).
+const maxRestoreJobNamePart = 63 - len("restore-") - 1 - 8
+
+func restoreJobName(restoreName, runID string) string {
+	return fmt.Sprintf("restore-%s-%s", boundedName(strings.ReplaceAll(restoreName, ".", "-"), maxRestoreJobNamePart), runID)
+}
+
+// Permanent: no retry can make this source restorable.
+type invalidSourceError struct {
+	msg string
+}
+
+func (e *invalidSourceError) Error() string { return e.msg }
+
+func newInvalidSource(format string, args ...any) error {
+	return &invalidSourceError{msg: fmt.Sprintf(format, args...)}
+}
+
+func isInvalidRestoreSource(err error) bool {
+	var i *invalidSourceError
+	return stderrors.As(err, &i)
 }
 
 func (r *RestoreReconciler) finishGranting(ctx context.Context, restore *databasesv1alpha1.Restore, specHash string) (ctrl.Result, error) {
@@ -692,8 +809,7 @@ func (r *RestoreReconciler) finishGranting(ctx context.Context, restore *databas
 
 	failures, err := r.regrantDatabaseUsers(grantCtx, restore)
 	if err != nil {
-		// There is nothing left to grant on, so retrying can only spin — and the data
-		// itself did land, which is what Completed reports.
+		// Nothing left to grant on; retrying only spins, and the data did land.
 		if reason, ok := unrecoverableRegrantReason(err); ok {
 			logger.Error(err, "completing restore without re-applying grants", "reason", reason)
 			r.recordGrantsSkipped(restore, reason)
@@ -747,9 +863,7 @@ func (r *RestoreReconciler) handleGrantFailures(
 	return ctrl.Result{RequeueAfter: grantRetryDelay}, nil
 }
 
-// patchGrantingProgress keeps the phase at Granting while grants are retried and
-// persists the attempt budget so it survives operator restarts. It stays silent when
-// nothing changed so a wedged cluster can't churn the API server.
+// Silent when nothing changed so a wedged cluster can't churn the API server.
 func (r *RestoreReconciler) patchGrantingProgress(
 	ctx context.Context,
 	restore *databasesv1alpha1.Restore,
@@ -760,12 +874,11 @@ func (r *RestoreReconciler) patchGrantingProgress(
 		return nil
 	}
 
-	patch := client.MergeFrom(restore.DeepCopy())
-	restore.Status.Phase = "Granting"
-	restore.Status.Message = message
-	restore.Status.GrantAttempts = attempts
-
-	return r.Status().Patch(ctx, restore, patch)
+	return r.patchRunStatus(ctx, restore, func(status *databasesv1alpha1.RestoreStatus) {
+		status.Phase = "Granting"
+		status.Message = message
+		status.GrantAttempts = attempts
+	})
 }
 
 func (r *RestoreReconciler) recordGrantsSkipped(restore *databasesv1alpha1.Restore, reason string) {
@@ -776,9 +889,7 @@ func (r *RestoreReconciler) recordGrantsSkipped(restore *databasesv1alpha1.Resto
 		fmt.Sprintf("Restore completed but grants were not re-applied: %s", reason))
 }
 
-// pg_restore imports as the cluster admin with --no-owner --no-acl, and
-// onConflict=drop recreates the database — both wipe existing grants.
-// A returned error means the round could not run; per-subject failures come back in the slice so one bad subject does not starve the rest.
+// pg_restore (--no-owner --no-acl) and onConflict=drop wipe grants, so they are re-applied.
 func (r *RestoreReconciler) regrantDatabaseUsers(
 	ctx context.Context,
 	restore *databasesv1alpha1.Restore,
@@ -829,7 +940,7 @@ func (r *RestoreReconciler) regrantDatabaseUsers(
 	}
 
 	return append(failures, applyRestoredGrants(ctx, pgClient, users.Items, &db,
-		controllers.ElectOwner(users.Items, db.Namespace, db.Name))...), nil
+		controllers.ElectOwner(users.Items, &db))...), nil
 }
 
 func applyRestoredGrants(
@@ -845,7 +956,7 @@ func applyRestoredGrants(
 	for i := range users {
 		user := &users[i]
 
-		grants, ok := controllers.ResolveUserGrantsForDatabase(user, db.Namespace, db.Name)
+		grants, ok := controllers.GrantsOnDatabase(user, db)
 		if !ok {
 			continue
 		}
@@ -870,9 +981,7 @@ func applyRestoredGrants(
 			grants = controllers.LoserGrants(grants)
 		}
 
-		// The role decides, not the CR phase: a Failed user can still own a live
-		// role whose grants the restore just wiped, and a freshly Ready one may not
-		// be visible in this controller's cache yet.
+		// The role decides, not the CR phase: a Failed user may own a live role, a fresh Ready one may be uncached.
 		exists, err := pgClient.UserExists(ctx, grants.Username)
 		if err != nil {
 			failures = append(failures, grantFailure{
@@ -887,7 +996,7 @@ func applyRestoredGrants(
 			continue
 		}
 
-		if err := controllers.ApplyUserGrants(ctx, pgClient, db.Status.DatabaseName, grants); err != nil {
+		if err := controllers.ApplyUserGrants(ctx, pgClient, db.Status.DatabaseName, grants, controllers.OwnerRole(ownerWinner)); err != nil {
 			failures = append(failures, grantFailure{subject: grants.Username, err: err})
 			continue
 		}
@@ -921,8 +1030,7 @@ func failedGrantSubjects(failures []grantFailure) string {
 	return strings.Join(names, ", ")
 }
 
-// unrecoverableRegrantError marks a regrant failure that no amount of retrying can
-// fix, so the restore completes with the reason recorded instead of spinning.
+// Marks a failure no retry can fix, so the restore completes with the reason recorded.
 type unrecoverableRegrantError struct {
 	reason string
 	err    error

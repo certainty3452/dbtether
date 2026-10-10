@@ -14,36 +14,21 @@ import (
 	"github.com/certainty3452/dbtether/pkg/storage"
 )
 
-// BackupFile represents a backup file in storage
 type BackupFile struct {
-	Key       string    // Full S3 key
-	Timestamp time.Time // Parsed from filename
+	Key       string
+	Timestamp time.Time
 	Size      int64
 }
 
-// RetentionManager handles backup retention policy
 type RetentionManager struct {
 	Log *zap.SugaredLogger
-	// Now is a function that returns the current time.
-	// If nil, time.Now() is used. Set this for testing.
-	Now func() time.Time
 }
 
-// NewRetentionManager creates a new RetentionManager
 func NewRetentionManager(log *zap.SugaredLogger) *RetentionManager {
 	return &RetentionManager{Log: log}
 }
 
-func (m *RetentionManager) now() time.Time {
-	if m.Now != nil {
-		return m.Now()
-	}
-	return time.Now()
-}
-
-// ApplyRetention applies retention policy and returns files to delete.
-// If filenameFilter is non-nil, only files whose key matches the pattern are
-// considered for retention; all other files are left untouched.
+// Objects that are not direct children of prefix or fail filenameFilter are never deleted.
 func (m *RetentionManager) ApplyRetention(
 	ctx context.Context,
 	storageClient storage.StorageClient,
@@ -55,9 +40,7 @@ func (m *RetentionManager) ApplyRetention(
 		return nil, nil
 	}
 
-	// A policy with no active rule would produce an empty keepSet, marking every
-	// backup for deletion. Admission validation should reject this, but old objects
-	// can predate the CEL rule, so guard here too rather than trust the CRD alone.
+	// No active rule would mark every backup for deletion; old objects can predate the CEL rule.
 	if !HasActiveRule(policy) {
 		m.Log.Warnw("retention policy has no active rule; nothing will be deleted",
 			"prefix", prefix,
@@ -65,7 +48,6 @@ func (m *RetentionManager) ApplyRetention(
 		return nil, nil
 	}
 
-	// List backup files, optionally filtered by filename pattern
 	files, err := m.listBackupFiles(ctx, storageClient, prefix, filenameFilter)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list backup files: %w", err)
@@ -75,15 +57,12 @@ func (m *RetentionManager) ApplyRetention(
 		return nil, nil
 	}
 
-	// Sort by timestamp descending (newest first)
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].Timestamp.After(files[j].Timestamp)
 	})
 
-	// Calculate which files to keep
-	keepSet := m.calculateKeepSet(files, policy)
+	keepSet := KeepSet(files, policy)
 
-	// Find files to delete
 	var toDelete []string
 	for _, f := range files {
 		if !keepSet[f.Key] {
@@ -100,12 +79,10 @@ func (m *RetentionManager) ApplyRetention(
 	return toDelete, nil
 }
 
-// DeleteFiles deletes the specified files from storage
 func (m *RetentionManager) DeleteFiles(ctx context.Context, storageClient storage.StorageClient, keys []string) error {
 	for _, key := range keys {
 		if err := storageClient.Delete(ctx, key); err != nil {
 			m.Log.Warnw("failed to delete backup file", "key", key, "error", err)
-			// Continue with other deletions
 		} else {
 			m.Log.Infow("deleted backup file", "key", key)
 		}
@@ -121,16 +98,17 @@ func (m *RetentionManager) listBackupFiles(ctx context.Context, storageClient st
 
 	files := make([]BackupFile, 0, len(objects))
 	for _, obj := range objects {
-		// Skip files that don't match the schedule's filename pattern
-		if filenameFilter != nil && !filenameFilter.MatchString(obj.Key) {
+		name, ok := strings.CutPrefix(obj.Key, prefix)
+		if !ok || name == "" || strings.Contains(name, "/") {
+			continue
+		}
+		if filenameFilter != nil && !filenameFilter.MatchString(name) {
 			m.Log.Debugw("skipping file not matching schedule pattern", "key", obj.Key)
 			continue
 		}
 
-		// Try to parse timestamp from filename first
-		timestamp, err := parseTimestampFromKey(obj.Key)
+		timestamp, err := parseTimestampFromKey(name)
 		if err != nil {
-			// Fallback to storage LastModified if filename doesn't contain timestamp
 			if obj.LastModified.IsZero() {
 				m.Log.Debugw("skipping file without timestamp", "key", obj.Key)
 				continue
@@ -141,7 +119,7 @@ func (m *RetentionManager) listBackupFiles(ctx context.Context, storageClient st
 
 		files = append(files, BackupFile{
 			Key:       obj.Key,
-			Timestamp: timestamp,
+			Timestamp: timestamp.UTC(),
 			Size:      obj.Size,
 		})
 	}
@@ -149,99 +127,66 @@ func (m *RetentionManager) listBackupFiles(ctx context.Context, storageClient st
 	return files, nil
 }
 
-func (m *RetentionManager) calculateKeepSet(files []BackupFile, policy *dbtether.RetentionPolicy) map[string]bool {
+// Windows end at the newest file, not the wall clock, so a stalled schedule keeps its last backups.
+func KeepSet(files []BackupFile, policy *dbtether.RetentionPolicy) map[string]bool {
 	keep := make(map[string]bool)
-	now := m.now()
+	if len(files) == 0 || !HasActiveRule(policy) {
+		return keep
+	}
+	newest := files[0].Timestamp
+	keep[files[0].Key] = true
 
-	m.applyKeepLast(files, policy, keep)
-	m.applyKeepDaily(files, policy, keep, now)
-	m.applyKeepWeekly(files, policy, keep, now)
-	m.applyKeepMonthly(files, policy, keep, now)
+	if policy.KeepLast != nil {
+		for i := 0; i < *policy.KeepLast && i < len(files); i++ {
+			keep[files[i].Key] = true
+		}
+	}
+	keepNewestPerPeriod(files, policy.KeepDaily, keep, func(n int) time.Time { return newest.AddDate(0, 0, -n) }, dayKey)
+	keepNewestPerPeriod(files, policy.KeepWeekly, keep, func(n int) time.Time { return newest.AddDate(0, 0, -7*n) }, isoWeekKey)
+	keepNewestPerPeriod(files, policy.KeepMonthly, keep, func(n int) time.Time { return newest.AddDate(0, -n, 0) }, monthKey)
 
 	return keep
 }
 
-// applyKeepLast keeps the N most recent backups
-func (m *RetentionManager) applyKeepLast(files []BackupFile, policy *dbtether.RetentionPolicy, keep map[string]bool) {
-	if policy.KeepLast == nil || *policy.KeepLast <= 0 {
+func keepNewestPerPeriod(
+	files []BackupFile,
+	count *int,
+	keep map[string]bool,
+	cutoffFor func(int) time.Time,
+	periodKey func(time.Time) string,
+) {
+	if count == nil || *count <= 0 {
 		return
 	}
-	for i := 0; i < *policy.KeepLast && i < len(files); i++ {
-		keep[files[i].Key] = true
-	}
-}
-
-// applyKeepDaily keeps first backup of each day for N days
-func (m *RetentionManager) applyKeepDaily(files []BackupFile, policy *dbtether.RetentionPolicy, keep map[string]bool, now time.Time) {
-	if policy.KeepDaily == nil || *policy.KeepDaily <= 0 {
-		return
-	}
-	cutoff := now.AddDate(0, 0, -*policy.KeepDaily)
-	seenDays := make(map[string]bool)
-
+	cutoff := cutoffFor(*count)
+	seen := make(map[string]bool)
 	for _, f := range files {
-		if f.Timestamp.Before(cutoff) {
+		if !f.Timestamp.After(cutoff) {
 			continue
 		}
-		dayKey := f.Timestamp.Format("2006-01-02")
-		if !seenDays[dayKey] {
-			seenDays[dayKey] = true
+		key := periodKey(f.Timestamp)
+		if !seen[key] {
+			seen[key] = true
 			keep[f.Key] = true
 		}
 	}
 }
 
-// applyKeepWeekly keeps first backup of each week for N weeks
-func (m *RetentionManager) applyKeepWeekly(files []BackupFile, policy *dbtether.RetentionPolicy, keep map[string]bool, now time.Time) {
-	if policy.KeepWeekly == nil || *policy.KeepWeekly <= 0 {
-		return
-	}
-	cutoff := now.AddDate(0, 0, -*policy.KeepWeekly*7)
-	seenWeeks := make(map[string]bool)
+func dayKey(t time.Time) string { return t.Format("2006-01-02") }
 
-	for _, f := range files {
-		if f.Timestamp.Before(cutoff) {
-			continue
-		}
-		year, week := f.Timestamp.ISOWeek()
-		weekKey := fmt.Sprintf("%d-W%02d", year, week)
-		if !seenWeeks[weekKey] {
-			seenWeeks[weekKey] = true
-			keep[f.Key] = true
-		}
-	}
+func isoWeekKey(t time.Time) string {
+	year, week := t.ISOWeek()
+	return fmt.Sprintf("%d-W%02d", year, week)
 }
 
-// applyKeepMonthly keeps first backup of each month for N months
-func (m *RetentionManager) applyKeepMonthly(files []BackupFile, policy *dbtether.RetentionPolicy, keep map[string]bool, now time.Time) {
-	if policy.KeepMonthly == nil || *policy.KeepMonthly <= 0 {
-		return
-	}
-	cutoff := now.AddDate(0, -*policy.KeepMonthly, 0)
-	seenMonths := make(map[string]bool)
+func monthKey(t time.Time) string { return t.Format("2006-01") }
 
-	for _, f := range files {
-		if f.Timestamp.Before(cutoff) {
-			continue
-		}
-		monthKey := f.Timestamp.Format("2006-01")
-		if !seenMonths[monthKey] {
-			seenMonths[monthKey] = true
-			keep[f.Key] = true
-		}
-	}
-}
-
-// FilenameTemplateToRegex converts a Go template filename pattern (e.g. "{{ .Timestamp }}.sql.gz")
-// into a regexp that matches files produced by that template.
-// Files not matching the returned pattern are excluded from retention cleanup,
-// protecting manually-created backups that use a different naming convention.
+// Non-matching files are excluded from retention, protecting manually named backups.
 func FilenameTemplateToRegex(tmpl string) (*regexp.Regexp, error) {
 	if tmpl == "" {
 		return nil, nil
 	}
 
-	// Replace known template variables with regex equivalents
 	replacements := map[string]string{
 		"{{ .Timestamp }}":    `\d{8}-\d{6}`,
 		"{{.Timestamp}}":      `\d{8}-\d{6}`,
@@ -267,11 +212,6 @@ func FilenameTemplateToRegex(tmpl string) (*regexp.Regexp, error) {
 	return regexp.Compile("(?:^|/)" + pattern + "$")
 }
 
-// parseTimestampFromKey extracts timestamp from backup filename
-// Expected formats:
-// - YYYYMMDD-HHMMSS.sql.gz
-// - YYYYMMDD-HHMMSS-runid.sql.gz
-// - prefix/path/YYYYMMDD-HHMMSS.sql.gz
 var timestampRegex = regexp.MustCompile(`(\d{8}-\d{6})`)
 
 func parseTimestampFromKey(key string) (time.Time, error) {
@@ -283,8 +223,7 @@ func parseTimestampFromKey(key string) (time.Time, error) {
 	return time.Parse("20060102-150405", matches[1])
 }
 
-// HasActiveRule reports whether the policy would keep anything; without an
-// active rule retention must delete nothing rather than everything.
+// Without an active rule retention must delete nothing rather than everything.
 func HasActiveRule(policy *dbtether.RetentionPolicy) bool {
 	return (policy.KeepLast != nil && *policy.KeepLast > 0) ||
 		(policy.KeepDaily != nil && *policy.KeepDaily > 0) ||

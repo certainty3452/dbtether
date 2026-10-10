@@ -775,7 +775,6 @@ func TestDatabaseUserReconciler_ShouldReconcileWhenSecretMissing(t *testing.T) {
 				},
 			}
 
-			// Simulate the early exit logic
 			shouldSkip := false
 			if user.Status.Phase == "Ready" && user.Status.ObservedGeneration == user.Generation {
 				if tt.secretExists {
@@ -860,7 +859,7 @@ func TestDatabaseUserReconciler_ShouldRotatePassword(t *testing.T) {
 	}
 }
 
-func TestDatabaseUserReconciler_CalculateRequeueAfter(t *testing.T) {
+func TestDatabaseUserReconciler_RotationRequeueAfter(t *testing.T) {
 	r := &DatabaseUserReconciler{}
 
 	now := metav1.Now()
@@ -922,9 +921,9 @@ func TestDatabaseUserReconciler_CalculateRequeueAfter(t *testing.T) {
 				},
 			}
 
-			got := r.calculateRequeueAfter(user)
+			got := r.rotationRequeueAfter(user)
 			if got <= tt.expectGT || got >= tt.expectLT {
-				t.Errorf("calculateRequeueAfter() = %v, expected between %v and %v", got, tt.expectGT, tt.expectLT)
+				t.Errorf("rotationRequeueAfter() = %v, expected between %v and %v", got, tt.expectGT, tt.expectLT)
 			}
 		})
 	}
@@ -983,7 +982,6 @@ func TestDatabaseUserReconciler_CheckAndTriggerRotation(t *testing.T) {
 				},
 			}
 
-			// Test shouldRotatePassword which is called by checkAndTriggerRotation
 			shouldRotate := r.shouldRotatePassword(user)
 			if shouldRotate != tt.expectTrigger {
 				t.Errorf("shouldRotatePassword() = %v, want %v", shouldRotate, tt.expectTrigger)
@@ -1032,7 +1030,7 @@ func TestDatabaseUserReconciler_RequeueAfterReturned(t *testing.T) {
 				},
 			}
 
-			requeue := r.calculateRequeueAfter(user)
+			requeue := r.rotationRequeueAfter(user)
 
 			if tt.expectRequeue {
 				if requeue <= 0 {
@@ -1043,6 +1041,34 @@ func TestDatabaseUserReconciler_RequeueAfterReturned(t *testing.T) {
 				}
 			} else if requeue > 0 {
 				t.Errorf("expected no requeue (0), got %v", requeue)
+			}
+		})
+	}
+}
+
+func TestDatabaseUserReconciler_CalculateRequeueAfterCapsAtReverifyInterval(t *testing.T) {
+	r := &DatabaseUserReconciler{}
+	tenDaysAgo := metav1.NewTime(time.Now().Add(-10 * 24 * time.Hour))
+	dueSoon := metav1.NewTime(time.Now().Add(-30*24*time.Hour + 5*time.Minute))
+
+	tests := []struct {
+		name      string
+		rotation  *databasesv1alpha1.RotationConfig
+		updatedAt *metav1.Time
+		min, max  time.Duration
+	}{
+		{"no rotation", nil, &tenDaysAgo, ReverifyInterval, ReverifyInterval},
+		{"rotation due later than the reverify", &databasesv1alpha1.RotationConfig{Days: 30}, &tenDaysAgo, ReverifyInterval, ReverifyInterval},
+		{"rotation due sooner than the reverify", &databasesv1alpha1.RotationConfig{Days: 30}, &dueSoon, 4 * time.Minute, 5 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			user := &databasesv1alpha1.DatabaseUser{
+				Spec:   databasesv1alpha1.DatabaseUserSpec{Rotation: tt.rotation},
+				Status: databasesv1alpha1.DatabaseUserStatus{PasswordUpdatedAt: tt.updatedAt},
+			}
+			if got := r.calculateRequeueAfter(user); got < tt.min || got > tt.max {
+				t.Errorf("calculateRequeueAfter() = %v, want between %v and %v", got, tt.min, tt.max)
 			}
 		})
 	}
@@ -1075,7 +1101,7 @@ func TestDatabaseUserReconciler_PasswordUpdatedAtOnReady(t *testing.T) {
 			phase:            "Ready",
 			passwordUpdated:  false,
 			existingPwdTime:  &metav1.Time{Time: time.Now().Add(-24 * time.Hour)},
-			expectPwdTimeSet: true, // keeps existing
+			expectPwdTimeSet: true,
 		},
 		{
 			name:             "subsequent Ready with passwordUpdated=true updates timestamp",
@@ -1101,7 +1127,6 @@ func TestDatabaseUserReconciler_PasswordUpdatedAtOnReady(t *testing.T) {
 				},
 			}
 
-			// Simulate setStatus logic
 			if tt.passwordUpdated || (user.Status.PasswordUpdatedAt == nil && tt.phase == "Ready") {
 				now := metav1.Now()
 				user.Status.PasswordUpdatedAt = &now
@@ -1179,7 +1204,6 @@ func TestDatabaseUserReconciler_GetClusterFromStatus(t *testing.T) {
 				},
 			}
 
-			// Simulate getClusterAndDatabasesForDeletion logic (status check only)
 			clusterName := ""
 			var databaseNames []string
 			if user.Status.ClusterName != "" {
@@ -1277,7 +1301,6 @@ func TestDatabaseUserReconciler_StatusUpdate(t *testing.T) {
 				Status: databasesv1alpha1.DatabaseUserStatus{},
 			}
 
-			// Simulate applyStatusFields logic
 			if tt.update.ClusterName != "" {
 				user.Status.ClusterName = tt.update.ClusterName
 			}
@@ -1303,8 +1326,6 @@ func TestDatabaseUserReconciler_StatusUpdate(t *testing.T) {
 	}
 }
 
-// TestDatabaseUserStatusChangeDetection verifies that status is only updated when meaningful changes occur
-// This prevents unnecessary reconciliation loops caused by status patches
 func TestDatabaseUserStatusChangeDetection(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -1477,7 +1498,6 @@ func TestDatabaseUserStatusChangeDetection(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Simulate the statusChanged check from setStatus
 			statusChanged := tt.currentStatus.Phase != tt.update.Phase ||
 				tt.currentStatus.Message != tt.update.Message ||
 				tt.currentStatus.ObservedGeneration != tt.generation ||
@@ -1494,7 +1514,6 @@ func TestDatabaseUserStatusChangeDetection(t *testing.T) {
 	}
 }
 
-// TestShouldDeleteOldSecret verifies the logic for determining when to delete old secrets
 func TestShouldDeleteOldSecret(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -1539,7 +1558,6 @@ func TestShouldDeleteOldSecret(t *testing.T) {
 	}
 }
 
-// Helper to create a fake reconciler with a fake k8s client
 func newTestReconciler(objects ...runtime.Object) *DatabaseUserReconciler {
 	scheme := runtime.NewScheme()
 	_ = databasesv1alpha1.AddToScheme(scheme)
@@ -2015,11 +2033,9 @@ func TestDatabaseUserReconciler_DeleteOldSecret(t *testing.T) {
 				r = newTestReconciler()
 			}
 
-			// Should not panic
 			r.deleteOldSecret(ctx, "default", tt.secretName, tt.user)
 
 			if tt.shouldDelete && tt.secret != nil {
-				// Verify secret was deleted
 				var secret corev1.Secret
 				err := r.Get(ctx, types.NamespacedName{Name: tt.secretName, Namespace: "default"}, &secret)
 				if err == nil {
@@ -2118,7 +2134,6 @@ func TestDatabaseUserReconciler_CreateDatabaseSecret(t *testing.T) {
 			}
 
 			if !tt.wantErr { //nolint:nestif // test verification requires multiple checks
-				// Verify secret was created
 				var secret corev1.Secret
 				err := r.Get(ctx, types.NamespacedName{Name: tt.secretName, Namespace: "default"}, &secret)
 				if err != nil {
@@ -2126,7 +2141,6 @@ func TestDatabaseUserReconciler_CreateDatabaseSecret(t *testing.T) {
 					return
 				}
 
-				// Verify secret has expected keys based on template
 				hostKey, portKey, dbKey, userKey, pwdKey := r.getSecretKeys(tt.user)
 				if string(secret.Data[hostKey]) != cluster.Spec.Endpoint {
 					t.Errorf("secret host = %q, want %q", secret.Data[hostKey], cluster.Spec.Endpoint)
@@ -2370,7 +2384,7 @@ func TestDatabaseUserReconciler_ReassignOwnershipForRemovedDatabases(t *testing.
 		name           string
 		statusDBs      []databasesv1alpha1.DatabaseAccessStatus
 		currentDBNames []string
-		expectReassign []string // databases that should have ReassignOwnership called
+		expectReassign []string
 	}{
 		{
 			name: "no databases removed",
@@ -2434,7 +2448,9 @@ func TestDatabaseUserReconciler_ReassignOwnershipForRemovedDatabases(t *testing.
 			}
 
 			r := &DatabaseUserReconciler{}
-			r.reassignOwnershipForRemovedDatabases(ctx, mockPG, user, "test_user", tt.currentDBNames)
+			if _, err := r.revokeRemovedDatabases(ctx, mockPG, user, "test_user", tt.currentDBNames); err != nil {
+				t.Fatalf("revokeRemovedDatabases() error = %v", err)
+			}
 
 			wantMembershipCalls := 0
 			if len(tt.expectReassign) > 0 {
@@ -2445,7 +2461,6 @@ func TestDatabaseUserReconciler_ReassignOwnershipForRemovedDatabases(t *testing.
 					mockPG.EnsureRoleMembershipCalls, wantMembershipCalls)
 			}
 
-			// Verify correct databases had ReassignOwnership called
 			if len(mockPG.reassignedDatabases) != len(tt.expectReassign) {
 				t.Errorf("expected %d reassign calls, got %d: %v",
 					len(tt.expectReassign), len(mockPG.reassignedDatabases), mockPG.reassignedDatabases)
@@ -2469,7 +2484,6 @@ func TestDatabaseUserReconciler_ReassignOwnershipForRemovedDatabases(t *testing.
 	}
 }
 
-// mockPGClientWithReassign tracks ReassignOwnership calls
 type mockPGClientWithReassign struct {
 	*postgres.MockClient
 	reassignedDatabases []string
@@ -2512,8 +2526,6 @@ func TestDatabaseUserReconciler_OwnerPrivilegesValidation(t *testing.T) {
 }
 
 func TestDatabaseUserReconciler_DropUserWithOwnerPrivileges(t *testing.T) {
-	// This test verifies that when deleting a user, ReassignOwnership is called
-	// for each database before DropUser
 	ctx := context.Background()
 
 	mockPG := &mockPGClientWithDeletionTracking{
@@ -2523,11 +2535,9 @@ func TestDatabaseUserReconciler_DropUserWithOwnerPrivileges(t *testing.T) {
 		droppedUsers:        make([]string, 0),
 	}
 
-	// Simulate deletion flow
 	username := "owner_user"
 	databaseNames := []string{"db1", "db2"}
 
-	// This simulates what dropUserFromPostgres does
 	for _, dbName := range databaseNames {
 		if err := mockPG.ReassignOwnership(ctx, username, dbName); err != nil {
 			t.Errorf("ReassignOwnership failed: %v", err)
@@ -2540,7 +2550,6 @@ func TestDatabaseUserReconciler_DropUserWithOwnerPrivileges(t *testing.T) {
 		t.Errorf("DropUser failed: %v", err)
 	}
 
-	// Verify order of operations
 	if len(mockPG.reassignedDatabases) != 2 {
 		t.Errorf("expected 2 ReassignOwnership calls, got %d", len(mockPG.reassignedDatabases))
 	}
@@ -2555,7 +2564,6 @@ func TestDatabaseUserReconciler_DropUserWithOwnerPrivileges(t *testing.T) {
 	}
 }
 
-// mockPGClientWithDeletionTracking tracks all deletion-related calls
 type mockPGClientWithDeletionTracking struct {
 	*postgres.MockClient
 	reassignedDatabases []string
@@ -3068,6 +3076,10 @@ func TestSyncRuntimeParams_WrapsErrors(t *testing.T) {
 	}
 }
 
+func grantedDatabases(user *databasesv1alpha1.DatabaseUser, databases []*databasesv1alpha1.Database) *userDatabases {
+	return &userDatabases{granted: databases, accesses: user.Spec.GetDatabases()}
+}
+
 func TestApplyPerDatabasePrivileges(t *testing.T) {
 	ctx := context.Background()
 	user := &databasesv1alpha1.DatabaseUser{
@@ -3088,7 +3100,7 @@ func TestApplyPerDatabasePrivileges(t *testing.T) {
 	r := newTestReconciler()
 	mock := postgres.NewMockClient()
 
-	statuses, applyFailures := r.applyPerDatabasePrivileges(ctx, mock, user, databases, ownerConflicts{})
+	statuses, applyFailures := r.applyPerDatabasePrivileges(ctx, mock, user, grantedDatabases(user, databases), ownerConflicts{})
 	if len(statuses) != 2 {
 		t.Fatalf("got %d statuses, want 2", len(statuses))
 	}
@@ -3126,7 +3138,7 @@ func TestApplyPerDatabasePrivileges_PerDBError(t *testing.T) {
 	mock.ShouldFail = true
 	mock.FailError = errors.New("boom")
 
-	statuses, applyFailures := r.applyPerDatabasePrivileges(ctx, mock, user, databases, ownerConflicts{})
+	statuses, applyFailures := r.applyPerDatabasePrivileges(ctx, mock, user, grantedDatabases(user, databases), ownerConflicts{})
 	if statuses[0].Phase != "Failed" {
 		t.Errorf("phase = %q, want Failed", statuses[0].Phase)
 	}
@@ -3154,7 +3166,7 @@ func TestApplyPerDatabasePrivileges_GrantsConnectBeforePrivileges(t *testing.T) 
 	r := newTestReconciler()
 	mock := &recordingPGClient{MockClient: postgres.NewMockClient()}
 
-	if _, applyFailures := r.applyPerDatabasePrivileges(ctx, mock, user, databases, ownerConflicts{}); len(applyFailures) != 0 {
+	if _, applyFailures := r.applyPerDatabasePrivileges(ctx, mock, user, grantedDatabases(user, databases), ownerConflicts{}); len(applyFailures) != 0 {
 		t.Fatalf("applyFailures = %v, want none", applyFailures)
 	}
 
@@ -3524,32 +3536,24 @@ func TestDatabaseUserReconciler_DeletionPolicyDelete_NoResolvableClusterRemovesF
 	}
 }
 
-func TestDatabaseUserReconciler_ReadyRotationConfigured_FastPathRequeuesPositive(t *testing.T) {
+func TestDatabaseUserReconciler_ReadyRotationDueSoonerThanReverifyRequeuesForRotation(t *testing.T) {
 	ctx := context.Background()
+	clusterSecret, cluster, db := newOwnerConflictFixture()
+	user := newOwnerConflictUser("rotation-steady", time.Now().Add(-time.Hour), "readwrite")
+	user.Spec.Rotation = &databasesv1alpha1.RotationConfig{Days: 30}
+	r, _ := newRecordingReconciler(clusterSecret, cluster, db, user)
+	reconcilePastFinalizer(t, r, "rotation-steady")
 
-	user := &databasesv1alpha1.DatabaseUser{
-		ObjectMeta: metav1.ObjectMeta{Name: "rotation-steady", Namespace: "default"},
-		Spec: databasesv1alpha1.DatabaseUserSpec{
-			Database: &databasesv1alpha1.DatabaseAccess{Name: "db1"},
-			Rotation: &databasesv1alpha1.RotationConfig{Days: 30},
-		},
-	}
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "rotation-steady-credentials", Namespace: "default"},
-		Data:       map[string][]byte{"password": []byte("pw")},
-	}
-
-	r := newTestReconciler(user, secret)
 	key := types.NamespacedName{Name: "rotation-steady", Namespace: "default"}
-
 	var stored databasesv1alpha1.DatabaseUser
 	if err := r.Get(ctx, key, &stored); err != nil {
 		t.Fatalf("failed to get user: %v", err)
 	}
-	now := metav1.Now()
-	stored.Status.Phase = "Ready"
-	stored.Status.ObservedGeneration = stored.Generation
-	stored.Status.PasswordUpdatedAt = &now
+	if stored.Status.Phase != "Ready" {
+		t.Fatalf("Phase = %q, want Ready (message %q)", stored.Status.Phase, stored.Status.Message)
+	}
+	updatedAt := metav1.NewTime(time.Now().Add(-30*24*time.Hour + 3*time.Minute))
+	stored.Status.PasswordUpdatedAt = &updatedAt
 	if err := r.Status().Update(ctx, &stored); err != nil {
 		t.Fatalf("failed to seed status: %v", err)
 	}
@@ -3558,8 +3562,8 @@ func TestDatabaseUserReconciler_ReadyRotationConfigured_FastPathRequeuesPositive
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.RequeueAfter <= 0 {
-		t.Errorf("expected positive RequeueAfter for steady Ready state with rotation configured, got %v", result.RequeueAfter)
+	if result.RequeueAfter < 2*time.Minute || result.RequeueAfter > 3*time.Minute {
+		t.Errorf("RequeueAfter = %v, want the ~3m rotation timer ahead of the %v reverify", result.RequeueAfter, ReverifyInterval)
 	}
 }
 
@@ -3601,11 +3605,9 @@ func TestDatabaseUserReconciler_RotationDue_FullReconcileRotatesPassword(t *test
 	key := types.NamespacedName{Name: "rotation-due-user", Namespace: "default"}
 	req := reconcile.Request{NamespacedName: key}
 
-	// 1st reconcile: only adds the finalizer.
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("finalizer reconcile: %v", err)
 	}
-	// 2nd reconcile: creates the secret and reaches Ready.
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("initial reconcile: %v", err)
 	}
@@ -3620,7 +3622,6 @@ func TestDatabaseUserReconciler_RotationDue_FullReconcileRotatesPassword(t *test
 		t.Fatal("expected an initial password to be set")
 	}
 
-	// Age the password past the 30-day rotation window.
 	var stored databasesv1alpha1.DatabaseUser
 	if err := r.Get(ctx, key, &stored); err != nil {
 		t.Fatalf("failed to get user: %v", err)
@@ -3631,7 +3632,6 @@ func TestDatabaseUserReconciler_RotationDue_FullReconcileRotatesPassword(t *test
 		t.Fatalf("failed to age PasswordUpdatedAt: %v", err)
 	}
 
-	// 3rd reconcile: rotation is due, fast path must be skipped.
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("rotation reconcile: %v", err)
 	}
@@ -3748,7 +3748,7 @@ type mockPGClientPerDBFailure struct {
 	failDatabase string
 }
 
-func (m *mockPGClientPerDBFailure) ApplyPrivileges(ctx context.Context, username, database, preset string, additionalGrants []postgres.TableGrant) error {
+func (m *mockPGClientPerDBFailure) ApplyPrivileges(ctx context.Context, username, database, preset, ownerRole string, additionalGrants []postgres.TableGrant) error {
 	if database == m.failDatabase {
 		return fmt.Errorf("permission denied for database %s", database)
 	}
@@ -3795,7 +3795,7 @@ func TestDatabaseUserReconciler_ReconcileUser_PerDatabaseFailureSetsTopLevelFail
 		t.Fatalf("failed to get user: %v", err)
 	}
 
-	_, err := r.reconcileUser(ctx, &fetchedUser, databases, cluster, ownerConflicts{})
+	_, err := r.reconcileUser(ctx, &fetchedUser, grantedDatabases(&fetchedUser, databases), cluster, ownerConflicts{})
 	if err == nil {
 		t.Fatal("expected error when a per-database privilege apply fails")
 	}
@@ -3867,13 +3867,13 @@ type appliedPrivilege struct {
 	privileges string
 }
 
-func (m *recordingPGClient) ApplyPrivileges(ctx context.Context, username, database, preset string, additionalGrants []postgres.TableGrant) error {
+func (m *recordingPGClient) ApplyPrivileges(ctx context.Context, username, database, preset, ownerRole string, additionalGrants []postgres.TableGrant) error {
 	m.applied = append(m.applied, appliedPrivilege{database: database, privileges: preset})
 	m.sequence = append(m.sequence, "apply:"+database)
 	if err, ok := m.failDatabases[database]; ok {
 		return err
 	}
-	return m.MockClient.ApplyPrivileges(ctx, username, database, preset, additionalGrants)
+	return m.MockClient.ApplyPrivileges(ctx, username, database, preset, ownerRole, additionalGrants)
 }
 
 func (m *recordingPGClient) GrantDatabaseAccess(ctx context.Context, username, database string) error {
@@ -4080,8 +4080,8 @@ func TestDatabaseUserReconciler_ReadyOwnerLoserIsDemoted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.RequeueAfter != 0 {
-		t.Errorf("RequeueAfter = %v, want 0", result.RequeueAfter)
+	if result.RequeueAfter != ReverifyInterval {
+		t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, ReverifyInterval)
 	}
 
 	status := getUserStatus(t, r, "owner-loser")
@@ -4111,7 +4111,7 @@ func TestDatabaseUserReconciler_TerminatingHolderYieldsOwner(t *testing.T) {
 	assertApplied(t, mock, "owner_conflict_db", "owner")
 }
 
-func TestDatabaseUserReconciler_ContestedWinnerSkipsTheFastPath(t *testing.T) {
+func TestDatabaseUserReconciler_ContestedWinnerReappliesOwner(t *testing.T) {
 	ctx := context.Background()
 	clusterSecret, cluster, db := newOwnerConflictFixture()
 	base := time.Now().Add(-time.Hour)
@@ -4134,14 +4134,14 @@ func TestDatabaseUserReconciler_ContestedWinnerSkipsTheFastPath(t *testing.T) {
 
 	applied := mock.appliedTo("owner_conflict_db")
 	if applied == nil {
-		t.Fatal("a contested winner must re-apply its privileges instead of taking the fast path")
+		t.Fatal("a contested winner must re-apply its privileges")
 	}
 	if applied.privileges != "owner" {
 		t.Errorf("privileges = %q, want owner", applied.privileges)
 	}
 }
 
-func TestDatabaseUserReconciler_UncontestedOwnerTakesTheFastPath(t *testing.T) {
+func TestDatabaseUserReconciler_ReadyReverifyReappliesWithoutWrites(t *testing.T) {
 	ctx := context.Background()
 	clusterSecret, cluster, db := newOwnerConflictFixture()
 	holder := newOwnerConflictUser("owner-holder", time.Now().Add(-time.Hour), "owner")
@@ -4152,19 +4152,43 @@ func TestDatabaseUserReconciler_UncontestedOwnerTakesTheFastPath(t *testing.T) {
 	if status := getUserStatus(t, r, "owner-holder"); status.Phase != "Ready" {
 		t.Fatalf("Phase = %q, want Ready (message %q)", status.Phase, status.Message)
 	}
+	key := types.NamespacedName{Name: "owner-holder", Namespace: "default"}
+	var userBefore databasesv1alpha1.DatabaseUser
+	var secretBefore corev1.Secret
+	if err := r.Get(ctx, key, &userBefore); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if err := r.Get(ctx, types.NamespacedName{Name: "owner-holder-credentials", Namespace: "default"}, &secretBefore); err != nil {
+		t.Fatalf("get secret: %v", err)
+	}
+	setPasswordCalls := mock.SetPasswordCalls
 
 	mock.reset()
-	if _, err := r.Reconcile(ctx, reconcile.Request{
-		NamespacedName: types.NamespacedName{Name: "owner-holder", Namespace: "default"},
-	}); err != nil {
+	if _, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(mock.applied) != 0 {
-		t.Errorf("an uncontested Ready owner must take the fast path, got %+v", mock.applied)
+
+	assertApplied(t, mock, "owner_conflict_db", "owner")
+	if mock.SetPasswordCalls != setPasswordCalls {
+		t.Errorf("SetPassword calls = %d, want %d: a steady reverify must not touch the password", mock.SetPasswordCalls, setPasswordCalls)
+	}
+	var userAfter databasesv1alpha1.DatabaseUser
+	var secretAfter corev1.Secret
+	if err := r.Get(ctx, key, &userAfter); err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if err := r.Get(ctx, types.NamespacedName{Name: "owner-holder-credentials", Namespace: "default"}, &secretAfter); err != nil {
+		t.Fatalf("get secret: %v", err)
+	}
+	if userAfter.ResourceVersion != userBefore.ResourceVersion {
+		t.Error("a steady reverify must not write the DatabaseUser status")
+	}
+	if secretAfter.ResourceVersion != secretBefore.ResourceVersion {
+		t.Error("a steady reverify must not write the Secret")
 	}
 }
 
-func TestDatabaseUserReconciler_PerDatabaseUserTakesTheFastPath(t *testing.T) {
+func TestDatabaseUserReconciler_PerDatabaseUserRecreatesMissingSecrets(t *testing.T) {
 	ctx := context.Background()
 	clusterSecret, cluster, firstDB := newOwnerConflictFixture()
 	secondDB := &databasesv1alpha1.Database{
@@ -4196,7 +4220,7 @@ func TestDatabaseUserReconciler_PerDatabaseUserTakesTheFastPath(t *testing.T) {
 		t.Fatalf("SecretName = %q, want %q", status.SecretName, firstSecret)
 	}
 	if secretExists(t, r, "per-db-user-credentials") {
-		t.Fatal("perDatabase mode must not create a primary secret; the fast path has nothing else to key on")
+		t.Fatal("perDatabase mode must not create a primary secret")
 	}
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "per-db-user", Namespace: "default"}}
@@ -4209,21 +4233,18 @@ func TestDatabaseUserReconciler_PerDatabaseUserTakesTheFastPath(t *testing.T) {
 		return mock.applied
 	}
 
-	if applied := reconcileApplied(); len(applied) != 0 {
-		t.Errorf("a Ready perDatabase user with every secret present must take the fast path, got %+v", applied)
-	}
-
 	deleteSecret(t, r, secondSecret)
 	if applied := reconcileApplied(); len(applied) == 0 {
-		t.Error("a missing secondary per-database secret must drop the user back to the full reconcile")
+		t.Error("a Ready perDatabase user must re-apply its privileges")
 	}
 	if !secretExists(t, r, secondSecret) {
-		t.Error("the full reconcile must recreate the deleted secondary secret")
+		t.Error("the reconcile must recreate the deleted secondary secret")
 	}
 
 	deleteSecret(t, r, firstSecret)
-	if applied := reconcileApplied(); len(applied) == 0 {
-		t.Error("a missing primary per-database secret must drop the user back to the full reconcile")
+	reconcileApplied()
+	if !secretExists(t, r, firstSecret) {
+		t.Error("the reconcile must recreate the deleted primary per-database secret")
 	}
 }
 
@@ -4318,13 +4339,13 @@ func TestDatabaseUserReconciler_EnqueueOwnerPeers(t *testing.T) {
 	}
 
 	got := requestNames(r.enqueueOwnerPeers(ctx, holder))
-	want := []string{"default/owner-loser", "team-b/remote-owner"}
+	want := []string{"default/owner-loser", "default/owner-writer", "team-b/remote-owner"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("owner event enqueued %v, want %v", got, want)
 	}
 
 	got = requestNames(r.enqueueOwnerPeers(ctx, remote))
-	want = []string{"default/owner-holder", "default/owner-loser"}
+	want = []string{"default/owner-holder", "default/owner-loser", "default/owner-writer"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("cross-namespace owner event enqueued %v, want %v", got, want)
 	}
@@ -4438,4 +4459,46 @@ func TestDatabaseUserReconciler_DuplicateRefYieldsOwner(t *testing.T) {
 		t.Errorf("Phase = %q, want %q (message %q)", status.Phase, "Ready", status.Message)
 	}
 	assertApplied(t, mock, "owner_conflict_db", "owner")
+}
+
+func TestDatabaseUserReconciler_EnqueueClusterUsers(t *testing.T) {
+	ctx := context.Background()
+	clusterSecret, cluster, db := newOwnerConflictFixture()
+	otherDB := &databasesv1alpha1.Database{
+		ObjectMeta: metav1.ObjectMeta{Name: "elsewhere-db", Namespace: "default"},
+		Spec:       databasesv1alpha1.DatabaseSpec{ClusterRef: databasesv1alpha1.ClusterReference{Name: "other-cluster"}},
+	}
+	local := newOwnerConflictUser("local-user", time.Now(), "readonly")
+	remote := &databasesv1alpha1.DatabaseUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "remote-user", Namespace: "team-b"},
+		Spec: databasesv1alpha1.DatabaseUserSpec{
+			Database: &databasesv1alpha1.DatabaseAccess{Name: db.Name, Namespace: "default"},
+		},
+	}
+	unrelated := newOwnerConflictUser("unrelated-user", time.Now(), "readonly")
+	unrelated.Spec.Database = &databasesv1alpha1.DatabaseAccess{Name: otherDB.Name}
+
+	r := newTestReconciler(clusterSecret, cluster, db, otherDB, local, remote, unrelated)
+
+	got := requestNames(r.enqueueClusterUsers(ctx, cluster))
+	want := []string{"default/local-user", "team-b/remote-user"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("cluster event enqueued %v, want %v", got, want)
+	}
+}
+
+func TestDatabaseUserReconciler_TransientPostgresErrorIsReturned(t *testing.T) {
+	ctx := context.Background()
+	r, mock := newReadyUser(t)
+	mock.ShouldFail = true
+	mock.FailError = errors.New("connection reset")
+
+	_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: readyUserName, Namespace: "default"}})
+
+	if !errors.Is(err, mock.FailError) {
+		t.Errorf("error = %v, want the PostgreSQL failure returned for a retry with backoff", err)
+	}
+	if status := getUserStatus(t, r, readyUserName); status.Phase != "Failed" {
+		t.Errorf("Phase = %q, want Failed", status.Phase)
+	}
 }

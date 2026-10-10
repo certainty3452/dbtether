@@ -30,9 +30,7 @@ const (
 	peekLimitBytes = 1 << 20
 )
 
-// RestoreConfig contains all parameters needed for a restore operation
 type RestoreConfig struct {
-	// Database connection
 	Host     string
 	Port     int
 	Database string
@@ -40,19 +38,14 @@ type RestoreConfig struct {
 	Password string
 	SSLMode  string
 
-	// Source
 	SourcePath string
 
-	// Storage configuration
 	StorageType string
 
-	// S3 config
 	S3Config *storage.S3Config
 
-	// GCS config
 	GCSConfig *storage.GCSConfig
 
-	// Azure config
 	AzureConfig *storage.AzureConfig
 
 	OnConflict string
@@ -60,7 +53,6 @@ type RestoreConfig struct {
 	Logger *slog.Logger
 }
 
-// RunRestore executes the restore operation
 func RunRestore(ctx context.Context, cfg *RestoreConfig) error {
 	logger := cfg.Logger
 	if logger == nil {
@@ -88,7 +80,6 @@ func RunRestore(ctx context.Context, cfg *RestoreConfig) error {
 		return err
 	}
 
-	// Download backup file from storage
 	backupData, err := downloadBackup(ctx, cfg, logger)
 	if err != nil {
 		return fmt.Errorf("failed to download backup: %w", err)
@@ -120,7 +111,6 @@ func runRestoreStream(ctx context.Context, cfg *RestoreConfig, psql string, back
 		return err
 	}
 
-	// Handle conflict strategy
 	switch cfg.OnConflict {
 	case onConflictDrop:
 		if err := dropAndRecreateDatabase(ctx, cfg, psql, logger); err != nil {
@@ -339,7 +329,7 @@ func runPsqlRestore(ctx context.Context, cfg *RestoreConfig, psql string, dump i
 
 	// -f - instead of plain stdin so psql errors carry the dump line number.
 	args := append(psqlArgs(cfg, cfg.Database), "-v", "ON_ERROR_STOP=1", "--single-transaction", "-f", "-")
-	//nolint:gosec // args come from the CRD spec
+	// #nosec G204 -- args come from the CRD spec
 	cmd := exec.CommandContext(ctx, psql, args...)
 	cmd.Stdin = dump
 	cmd.Env = psqlEnv(cfg)
@@ -359,7 +349,7 @@ func runPsqlRestore(ctx context.Context, cfg *RestoreConfig, psql string, dump i
 }
 
 func runPsql(ctx context.Context, psql string, env, args []string, stdout io.Writer) (string, error) {
-	//nolint:gosec // args come from the CRD spec
+	// #nosec G204 -- args come from the CRD spec
 	cmd := exec.CommandContext(ctx, psql, args...)
 	cmd.Env = env
 	cmd.Stdout = stdout

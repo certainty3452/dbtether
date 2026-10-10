@@ -62,7 +62,7 @@ func TestMockClient_EnsureDatabaseWithOwner(t *testing.T) {
 			ownerName:          "duplicate",
 			expectedTracked:    false,
 			expectError:        true,
-			expectedOwnerAfter: "team-a/original", // unchanged
+			expectedOwnerAfter: "team-a/original",
 		},
 		{
 			name:               "force adopt from different owner",
@@ -100,7 +100,6 @@ func TestMockClient_EnsureDatabaseWithOwner(t *testing.T) {
 				t.Errorf("ownershipTracked: expected %v, got %v", tt.expectedTracked, tracked)
 			}
 
-			// Check final owner state
 			actualOwner := mock.dbOwners[tt.dbName]
 			if actualOwner != tt.expectedOwnerAfter {
 				t.Errorf("owner: expected %q, got %q", tt.expectedOwnerAfter, actualOwner)
@@ -171,7 +170,6 @@ func TestMockClient_ClearDatabaseOwner(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	// Owner should be cleared
 	if owner := mock.dbOwners["mydb"]; owner != "" {
 		t.Errorf("owner should be empty after clear, got %q", owner)
 	}
@@ -247,8 +245,7 @@ func TestMockClient_ApplyPrivileges_Owner(t *testing.T) {
 	ctx := context.Background()
 	mock := NewMockClient()
 
-	// Test that owner privilege is accepted
-	err := mock.ApplyPrivileges(ctx, "testuser", "testdb", "owner", nil)
+	err := mock.ApplyPrivileges(ctx, "testuser", "testdb", "owner", "", nil)
 	if err != nil {
 		t.Errorf("unexpected error applying owner privileges: %v", err)
 	}
@@ -293,14 +290,12 @@ func TestMockClient_SyncDatabaseAccess(t *testing.T) {
 				t.Errorf("unexpected error: %v", err)
 			}
 
-			// Check final access state
 			for db, expected := range tt.expectedAccess {
 				if mock.userAccess["testuser"][db] != expected {
 					t.Errorf("database %s: expected access=%v, got %v", db, expected, mock.userAccess["testuser"][db])
 				}
 			}
 
-			// Check that removed databases are not accessible
 			for db := range tt.initialAccess {
 				if !tt.expectedAccess[db] && mock.userAccess["testuser"][db] {
 					t.Errorf("database %s should have been revoked but still has access", db)

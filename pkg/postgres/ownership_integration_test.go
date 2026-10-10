@@ -133,7 +133,7 @@ func TestOwnershipTransfer(t *testing.T) {
 		t.Fatal("expected the creator's implicit grant to carry no USAGE before ApplyPrivileges")
 	}
 
-	if err := client.ApplyPrivileges(ctx, app, dbName, "owner", nil); err != nil {
+	if err := client.ApplyPrivileges(ctx, app, dbName, "owner", "", nil); err != nil {
 		t.Fatalf("ApplyPrivileges(owner) failed: %v", err)
 	}
 
@@ -277,7 +277,7 @@ func assertNoInheritOperatorRejected(t *testing.T, admin *pgx.Conn, dsn string) 
 	mustExec(t, conn, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD %s",
 		pq.QuoteIdentifier(app), pq.QuoteLiteral(password)))
 
-	err = client.ApplyPrivileges(ctx, app, dbName, "owner", nil)
+	err = client.ApplyPrivileges(ctx, app, dbName, "owner", "", nil)
 	if err == nil {
 		t.Fatal("expected ApplyPrivileges(owner) to fail while the operator role is NOINHERIT")
 	}

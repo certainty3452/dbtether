@@ -43,16 +43,12 @@ type BackupJobConfig struct {
 	// +optional
 	BackoffLimit *int32 `json:"backoffLimit,omitempty"`
 
-	// ActiveDeadlineSeconds specifies the duration in seconds relative to the startTime
-	// that the backup job may be active before the system tries to terminate it.
-	// This is a hard timeout for the entire backup operation.
+	// ActiveDeadlineSeconds is the hard timeout in seconds for the entire backup operation.
 	// +kubebuilder:validation:Minimum=60
 	// +optional
 	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`
 
-	// TTLSecondsAfterFailed specifies the TTL for the Job after it fails.
-	// This allows keeping failed jobs longer for debugging.
-	// Defaults to 12 hours (43200 seconds).
+	// TTLSecondsAfterFailed is the TTL of the Job after it fails. Defaults to 12 hours (43200 seconds).
 	// +optional
 	TTLSecondsAfterFailed *int32 `json:"ttlSecondsAfterFailed,omitempty"`
 }

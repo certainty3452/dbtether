@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -30,17 +32,17 @@ import (
 const (
 	UserFinalizerName = "databaseusers.dbtether.io/finalizer"
 
-	// Soft-ownership signal — lets us re-attach OwnerRef without rotating the
-	// password when stripped externally (ArgoCD/Flux managedFields rewrite).
+	// Lets us re-attach OwnerRef without rotating the password after ArgoCD/Flux strips it.
 	ManagedByAnnotation = "dbtether.io/managed-by"
 
-	// Without this marker the next reconcile after mergeSecret degrades Merge
-	// into Adopt (full-replace nukes foreign keys).
+	// Without it the next reconcile degrades Merge into Adopt and nukes foreign keys.
 	ConflictPolicyAnnotation = "dbtether.io/conflict-policy"
 
-	// Lets Merge mode tell foreign keys from ours: drop stale ones we
-	// previously owned, preserve everything else.
+	// Lets Merge drop stale keys we owned and preserve foreign ones.
 	ManagedKeysAnnotation = "dbtether.io/managed-keys"
+
+	// Bounds how long an out-of-band role drop or privilege change goes unrepaired.
+	ReverifyInterval = 10 * time.Minute
 )
 
 type DatabaseUserReconciler struct {
@@ -48,13 +50,6 @@ type DatabaseUserReconciler struct {
 	Scheme        *runtime.Scheme
 	PGClientCache postgres.ClientCacheInterface
 }
-
-// +kubebuilder:rbac:groups=dbtether.io,resources=databaseusers,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=dbtether.io,resources=databaseusers/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=dbtether.io,resources=databaseusers/finalizers,verbs=update
-// +kubebuilder:rbac:groups=dbtether.io,resources=databases,verbs=get;list;watch
-// +kubebuilder:rbac:groups=dbtether.io,resources=dbclusters,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 
 func (r *DatabaseUserReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -68,7 +63,6 @@ func (r *DatabaseUserReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.handleDeletion(ctx, &user)
 	}
 
-	// Ahead of the fast path: a Ready user whose spec turned invalid must not stay Ready.
 	if err := ValidateUserSpec(&user); err != nil {
 		return r.setStatus(ctx, &user, &statusUpdate{
 			Phase:   "Failed",
@@ -76,136 +70,223 @@ func (r *DatabaseUserReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		})
 	}
 
-	// Ahead of the fast path: a Ready owner must still be demoted when an older claim appears.
-	conflicts, err := r.evaluateOwnerConflicts(ctx, &user)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if conflicts.empty() {
-		if result := r.readyFastPath(ctx, &user); result != nil {
-			return *result, nil
-		}
-	}
 	logger.V(1).Info("reconciling", "username", r.getUsername(&user))
 
 	if result, err := r.ensureFinalizer(ctx, &user); result != nil || err != nil {
 		return *result, err
 	}
 
-	// Fetch all databases and validate they are on the same cluster
-	databases, cluster, result, err := r.validateAndFetchDatabases(ctx, &user)
-	if result != nil || err != nil {
-		return *result, err
+	databases, cluster, blocked, err := r.validateAndFetchDatabases(ctx, &user)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if blocked != nil {
+		return r.withdrawDeniedWhileBlocked(ctx, &user, databases.deniedNames, blocked)
+	}
+	if len(databases.granted) == 0 {
+		return r.withdrawAllAccess(ctx, &user, databases.denied)
 	}
 
-	return r.reconcileUser(ctx, &user, databases, cluster, conflicts)
+	conflicts, err := r.evaluateOwnerConflicts(ctx, &user, databases.granted)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return r.reconcileUser(ctx, &user, &databases, cluster, conflicts)
 }
 
-func (r *DatabaseUserReconciler) readyFastPath(ctx context.Context, user *databasesv1alpha1.DatabaseUser) *ctrl.Result {
-	if user.Status.Phase != "Ready" || user.Status.ObservedGeneration != user.Generation {
-		return nil
-	}
+func (r *DatabaseUserReconciler) converged(user *databasesv1alpha1.DatabaseUser) bool {
+	return user.Status.Phase == "Ready" && user.Status.ObservedGeneration == user.Generation
+}
 
-	secretNames := r.fastPathSecretNames(user)
-	if len(secretNames) == 0 {
-		return nil
-	}
-	for _, secretName := range secretNames {
-		var secret corev1.Secret
-		if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: user.Namespace}, &secret); err != nil {
-			log.FromContext(ctx).Info("secret missing, triggering reconciliation", "secret", secretName)
-			return nil
+func (r *DatabaseUserReconciler) secretNames(user *databasesv1alpha1.DatabaseUser) []string {
+	candidates := []string{user.Status.SecretName}
+	if user.Spec.SecretGeneration == "perDatabase" {
+		for _, access := range user.Spec.GetDatabases() {
+			candidates = append(candidates, r.getSecretNameForDatabase(user, access.Name))
 		}
+	} else {
+		candidates = append(candidates, r.getSecretName(user))
 	}
-	if r.shouldRotatePassword(user) {
-		return nil
+	for _, db := range user.Status.Databases {
+		candidates = append(candidates, db.SecretName)
 	}
-	// Rotation is time-driven: re-arm the requeue this fast path would otherwise swallow.
-	return &ctrl.Result{RequeueAfter: r.calculateRequeueAfter(user)}
-}
 
-func (r *DatabaseUserReconciler) fastPathSecretNames(user *databasesv1alpha1.DatabaseUser) []string {
-	if user.Spec.SecretGeneration != "perDatabase" {
-		return []string{r.getSecretName(user)}
-	}
-	accesses := user.Spec.GetDatabases()
-	names := make([]string, 0, len(accesses))
-	for _, access := range accesses {
-		names = append(names, r.getSecretNameForDatabase(user, access.Name))
+	names := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, name := range candidates {
+		if _, dup := seen[name]; dup || name == "" {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
 	}
 	return names
 }
 
-// validateAndFetchDatabases fetches all databases and validates they are on the same cluster
+// granted/accesses and denied/deniedNames are index-parallel.
+type userDatabases struct {
+	granted     []*databasesv1alpha1.Database
+	accesses    []databasesv1alpha1.DatabaseAccess
+	denied      []string
+	deniedNames []string
+}
+
+// A non-nil blocked status means some dependency is not usable yet; denied databases are collected regardless.
 func (r *DatabaseUserReconciler) validateAndFetchDatabases(ctx context.Context, user *databasesv1alpha1.DatabaseUser) (
-	[]*databasesv1alpha1.Database, *databasesv1alpha1.DBCluster, *ctrl.Result, error) {
+	userDatabases, *databasesv1alpha1.DBCluster, *statusUpdate, error) {
 
-	dbAccesses := user.Spec.GetDatabases()
-	databases := make([]*databasesv1alpha1.Database, 0, len(dbAccesses))
-	var clusterName string
-
-	for _, dbAccess := range dbAccesses {
-		dbNamespace := dbAccess.Namespace
-		if dbNamespace == "" {
-			dbNamespace = user.Namespace
-		}
-
-		var db databasesv1alpha1.Database
-		if err := r.Get(ctx, types.NamespacedName{
-			Name:      dbAccess.Name,
-			Namespace: dbNamespace,
-		}, &db); err != nil {
-			if apierrors.IsNotFound(err) {
-				result, err := r.setStatus(ctx, user, &statusUpdate{
-					Phase: "Pending", Message: fmt.Sprintf("waiting for Database '%s'", dbAccess.Name), RequeueAfter: 30 * time.Second,
-				})
-				return nil, nil, &result, err
-			}
-			return nil, nil, &ctrl.Result{}, err
-		}
-
-		if db.Status.Phase != "Ready" {
-			result, err := r.setStatus(ctx, user, &statusUpdate{
-				Phase: "Pending", Message: fmt.Sprintf("waiting for Database '%s' to be ready", db.Name), RequeueAfter: 20 * time.Second,
-			})
-			return nil, nil, &result, err
-		}
-
-		// Validate all databases are on the same cluster
-		if clusterName == "" {
-			clusterName = db.Spec.ClusterRef.Name
-		} else if db.Spec.ClusterRef.Name != clusterName {
-			result, err := r.setStatus(ctx, user, &statusUpdate{
-				Phase:   "Failed",
-				Message: fmt.Sprintf("all databases must be on the same cluster: '%s' is on '%s', but '%s' is on '%s'", databases[0].Name, clusterName, db.Name, db.Spec.ClusterRef.Name),
-			})
-			return nil, nil, &result, err
-		}
-
-		databases = append(databases, &db)
+	resolved, blocked, err := r.resolveSpecDatabases(ctx, user)
+	if err != nil || blocked != nil || len(resolved.granted) == 0 {
+		return resolved, nil, blocked, err
 	}
 
-	// Fetch the cluster
+	clusterName := resolved.granted[0].Spec.ClusterRef.Name
 	var cluster databasesv1alpha1.DBCluster
 	if err := r.Get(ctx, types.NamespacedName{Name: clusterName}, &cluster); err != nil {
 		if apierrors.IsNotFound(err) {
-			result, err := r.setStatus(ctx, user, &statusUpdate{
+			return resolved, nil, &statusUpdate{
 				Phase: "Pending", Message: fmt.Sprintf("waiting for DBCluster '%s'", clusterName), RequeueAfter: 30 * time.Second,
-			})
-			return nil, nil, &result, err
+			}, nil
 		}
-		return nil, nil, &ctrl.Result{}, err
+		return resolved, nil, nil, err
 	}
 
 	if cluster.Status.Phase != "Connected" {
-		result, err := r.setStatus(ctx, user, &statusUpdate{
+		return resolved, nil, &statusUpdate{
 			Phase: "Pending", Message: fmt.Sprintf("waiting for DBCluster '%s' to be connected", cluster.Name), RequeueAfter: 20 * time.Second,
-		})
-		return nil, nil, &result, err
+		}, nil
 	}
 
-	return databases, &cluster, nil, nil
+	return resolved, &cluster, nil, nil
+}
+
+func (r *DatabaseUserReconciler) resolveSpecDatabases(ctx context.Context, user *databasesv1alpha1.DatabaseUser) (
+	resolved userDatabases, blocked *statusUpdate, err error) {
+
+	for _, dbAccess := range user.Spec.GetDatabases() {
+		var db databasesv1alpha1.Database
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      dbAccess.Name,
+			Namespace: databaseAccessNamespace(user, dbAccess),
+		}, &db); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return userDatabases{}, nil, err
+			}
+			if blocked == nil {
+				blocked = &statusUpdate{
+					Phase: "Pending", Message: fmt.Sprintf("waiting for Database '%s'", dbAccess.Name), RequeueAfter: 30 * time.Second,
+				}
+			}
+			continue
+		}
+
+		if err := CheckReferenceConsent(&db, user.Namespace); err != nil {
+			resolved.denied = append(resolved.denied, err.Error())
+			resolved.deniedNames = append(resolved.deniedNames, DatabaseNameFor(&db))
+			continue
+		}
+		if blocked != nil {
+			continue
+		}
+
+		if db.Status.Phase != "Ready" {
+			blocked = &statusUpdate{
+				Phase: "Pending", Message: fmt.Sprintf("waiting for Database '%s' to be ready", db.Name), RequeueAfter: 20 * time.Second,
+			}
+			continue
+		}
+
+		if len(resolved.granted) > 0 && db.Spec.ClusterRef.Name != resolved.granted[0].Spec.ClusterRef.Name {
+			first := resolved.granted[0]
+			blocked = &statusUpdate{
+				Phase:   "Failed",
+				Message: fmt.Sprintf("all databases must be on the same cluster: '%s' is on '%s', but '%s' is on '%s'", first.Name, first.Spec.ClusterRef.Name, db.Name, db.Spec.ClusterRef.Name),
+			}
+			continue
+		}
+
+		resolved.granted = append(resolved.granted, &db)
+		resolved.accesses = append(resolved.accesses, dbAccess)
+	}
+	return resolved, blocked, nil
+}
+
+// Withdrawn consent is enforced even while another dependency keeps the user from converging.
+func (r *DatabaseUserReconciler) withdrawDeniedWhileBlocked(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	deniedNames []string, blocked *statusUpdate) (ctrl.Result, error) {
+
+	keep := make([]string, 0, len(user.Status.Databases))
+	for _, db := range user.Status.Databases {
+		if db.DatabaseName != "" && !slices.Contains(deniedNames, db.DatabaseName) {
+			keep = append(keep, db.DatabaseName)
+		}
+	}
+
+	remaining, err := r.revokeDatabaseAccess(ctx, user, keep)
+	blocked.Databases = remaining
+	if err != nil {
+		blocked.Phase = "Failed"
+		blocked.Message = appendStatusMessage(blocked.Message, err.Error())
+		return r.failAndRetry(ctx, user, blocked, err)
+	}
+	return r.setStatus(ctx, user, blocked)
+}
+
+func (r *DatabaseUserReconciler) withdrawAllAccess(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	denied []string) (ctrl.Result, error) {
+
+	remaining, err := r.revokeDatabaseAccess(ctx, user, nil)
+	update := &statusUpdate{
+		Phase:        "Failed",
+		Message:      strings.Join(denied, "; "),
+		Databases:    remaining,
+		RequeueAfter: r.calculateRequeueAfter(user),
+	}
+	if err != nil {
+		update.Message = appendStatusMessage(update.Message, err.Error())
+		return r.failAndRetry(ctx, user, update, err)
+	}
+	return r.setStatus(ctx, user, update)
+}
+
+func (r *DatabaseUserReconciler) revokeDatabaseAccess(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	keep []string) ([]databasesv1alpha1.DatabaseAccessStatus, error) {
+
+	if len(removedDatabaseNames(user, keep)) == 0 || user.Status.ClusterName == "" {
+		return statusEntriesFor(user, keep), nil
+	}
+
+	var cluster databasesv1alpha1.DBCluster
+	if err := r.Get(ctx, types.NamespacedName{Name: user.Status.ClusterName}, &cluster); err != nil {
+		if apierrors.IsNotFound(err) {
+			return statusEntriesFor(user, keep), nil
+		}
+		return user.Status.Databases, err
+	}
+	pgClient, err := GetPostgresClient(ctx, r.Client, r.PGClientCache, &cluster)
+	if err != nil {
+		return user.Status.Databases, fmt.Errorf("connection error: %w", err)
+	}
+
+	return r.revokeFromRole(ctx, pgClient, user, keep)
+}
+
+func (r *DatabaseUserReconciler) revokeFromRole(ctx context.Context, pgClient postgres.ClientInterface,
+	user *databasesv1alpha1.DatabaseUser, keep []string) ([]databasesv1alpha1.DatabaseAccessStatus, error) {
+
+	if len(removedDatabaseNames(user, keep)) == 0 {
+		return statusEntriesFor(user, keep), nil
+	}
+	username := r.getUsername(user)
+	exists, err := pgClient.UserExists(ctx, username)
+	if err != nil {
+		return user.Status.Databases, fmt.Errorf("failed to check user: %w", err)
+	}
+	if !exists {
+		return statusEntriesFor(user, keep), nil
+	}
+	return r.revokeRemovedDatabases(ctx, pgClient, user, username, keep)
 }
 
 func (r *DatabaseUserReconciler) getUsername(user *databasesv1alpha1.DatabaseUser) string {
@@ -260,18 +341,13 @@ func strOr(override, fallback string) string {
 	return fallback
 }
 
-// shouldIncludeDatabasesList returns true if the secret should include a "databases" field
-// Only for: secretGeneration=primary + template=raw (or empty) + more than 1 database
 func (r *DatabaseUserReconciler) shouldIncludeDatabasesList(user *databasesv1alpha1.DatabaseUser, dbCount int) bool {
-	// perDatabase mode - no databases list needed
 	if user.Spec.SecretGeneration == "perDatabase" {
 		return false
 	}
-	// Only for multiple databases
 	if dbCount <= 1 {
 		return false
 	}
-	// Only for raw template (or no template specified)
 	template := ""
 	if user.Spec.Secret != nil {
 		template = user.Spec.Secret.Template
@@ -288,9 +364,7 @@ func (r *DatabaseUserReconciler) isSecretOwnedByUser(secret *corev1.Secret, user
 	return false
 }
 
-// Annotation match + no foreign controller OwnerReference; see ManagedByAnnotation.
-// Rejects any other controller-ref (not just DatabaseUser) — SetControllerReference
-// would fail later with "already has a controller", and re-claim would mis-fire.
+// Rejects any foreign controller-ref: SetControllerReference would fail later and re-claim would mis-fire.
 func (r *DatabaseUserReconciler) isSecretSoftOwnedByUser(secret *corev1.Secret, user *databasesv1alpha1.DatabaseUser) bool {
 	if secret.Annotations[ManagedByAnnotation] != user.Name {
 		return false
@@ -314,8 +388,7 @@ func (r *DatabaseUserReconciler) getOnConflictPolicy(user *databasesv1alpha1.Dat
 	return "Fail"
 }
 
-// Recomputed from spec every reconcile — template/keys changes take effect on
-// the next tick without inference from secret.Data.
+// Recomputed from spec each reconcile, never inferred from secret.Data.
 func (r *DatabaseUserReconciler) buildSecretData(user *databasesv1alpha1.DatabaseUser,
 	cluster *databasesv1alpha1.DBCluster, databases []*databasesv1alpha1.Database,
 	username, password string) map[string][]byte {
@@ -338,11 +411,7 @@ func (r *DatabaseUserReconciler) buildSecretData(user *databasesv1alpha1.Databas
 		pwdKey:  []byte(password),
 	}
 	if r.shouldIncludeDatabasesList(user, len(databases)) {
-		dbNames := make([]string, len(databases))
-		for i, db := range databases {
-			dbNames[i] = DatabaseNameFor(db)
-		}
-		data["databases"] = []byte(strings.Join(dbNames, ","))
+		data["databases"] = []byte(strings.Join(databaseNames(databases), ","))
 	}
 	return data
 }
@@ -367,8 +436,7 @@ func (r *DatabaseUserReconciler) buildPerDatabaseSecretData(user *databasesv1alp
 	}
 }
 
-// DBCluster.Endpoint and DatabaseName aren't pattern-validated; net/url escaping
-// prevents crafted values from producing a DSN pointing at a different host.
+// Endpoint/DatabaseName aren't pattern-validated; net/url escaping blocks host redirection.
 func buildDSN(cluster *databasesv1alpha1.DBCluster, username, password, dbName string) string {
 	u := &url.URL{
 		Scheme: "postgres",
@@ -379,8 +447,6 @@ func buildDSN(cluster *databasesv1alpha1.DBCluster, username, password, dbName s
 	return u.String()
 }
 
-// Returns "" if no password is recoverable; custom-keyed secrets whose pwdKey
-// was renamed are treated as corrupted (caller will regenerate).
 func (r *DatabaseUserReconciler) extractPasswordFromSecret(secret *corev1.Secret, user *databasesv1alpha1.DatabaseUser) string {
 	if secret == nil || len(secret.Data) == 0 {
 		return ""
@@ -420,7 +486,6 @@ func passwordFromDSN(data []byte) string {
 	return pwd
 }
 
-// Full-replace; companion to reconcileSecretMerge for Merge-policy secrets.
 func (r *DatabaseUserReconciler) reconcileSecretShape(ctx context.Context, secret *corev1.Secret, desired map[string][]byte) (bool, error) {
 	prevKeys := parseManagedKeysAnnotation(secret)
 	if secretDataEqual(secret.Data, desired) && managedKeysMatch(prevKeys, desired) {
@@ -435,8 +500,7 @@ func (r *DatabaseUserReconciler) reconcileSecretShape(ctx context.Context, secre
 	return true, nil
 }
 
-// Overlay converge for Merge-policy secrets. Without per-reconcile awareness
-// of Merge mode the cycle would full-replace and degrade Merge into Adopt.
+// Without per-reconcile Merge awareness the cycle would full-replace and degrade Merge into Adopt.
 func (r *DatabaseUserReconciler) reconcileSecretMerge(ctx context.Context, secret *corev1.Secret, desired map[string][]byte) (bool, error) {
 	if secret.Data == nil {
 		secret.Data = map[string][]byte{}
@@ -480,8 +544,7 @@ func secretDataEqual(a, b map[string][]byte) bool {
 	return true
 }
 
-// Detects annotation drift independent of secret.Data — needed so legacy
-// secrets (no annotation yet) get stamped on next reconcile.
+// Independent of secret.Data so Secrets without the annotation get stamped.
 func managedKeysMatch(prev map[string]struct{}, desired map[string][]byte) bool {
 	if prev == nil {
 		return false
@@ -517,9 +580,7 @@ func (r *DatabaseUserReconciler) resolvePassword(ctx context.Context, user *data
 		return "", false, fmt.Errorf("failed to generate password: %w", err)
 	}
 
-	// Skip SetPassword on first-time creation — ensureUserInPostgres will
-	// CREATE USER WITH PASSWORD. Otherwise the PG user has a stale password
-	// (regenerated secret or post-Ready deletion) and must be updated.
+	// Skipped on first creation (ensureUserInPostgres sets it); otherwise PG keeps a stale password.
 	needSetPassword := found || user.Status.Phase == "Ready"
 	if needSetPassword {
 		if err := pgClient.SetPassword(ctx, username, newPwd); err != nil {
@@ -554,8 +615,7 @@ func (r *DatabaseUserReconciler) createOwnedSecret(ctx context.Context, user *da
 	return nil
 }
 
-// Sorted so the annotation is stable across reconciles — Go map iteration
-// order otherwise causes spurious Updates.
+// Sorted: map iteration order would cause spurious Updates.
 func setManagedKeysAnnotation(secret *corev1.Secret, data map[string][]byte) {
 	keys := make([]string, 0, len(data))
 	for k := range data {
@@ -568,8 +628,7 @@ func setManagedKeysAnnotation(secret *corev1.Secret, data map[string][]byte) {
 	secret.Annotations[ManagedKeysAnnotation] = strings.Join(keys, ",")
 }
 
-// nil ⇒ annotation absent (legacy secret); distinct from empty ⇒ annotation
-// present with zero keys tracked.
+// nil means the annotation is absent; empty means present with zero keys.
 func parseManagedKeysAnnotation(secret *corev1.Secret) map[string]struct{} {
 	raw, ok := secret.Annotations[ManagedKeysAnnotation]
 	if !ok {
@@ -585,8 +644,7 @@ func parseManagedKeysAnnotation(secret *corev1.Secret) map[string]struct{} {
 	return out
 }
 
-// Adopting/merging a secret we previously stamped means the OwnerReference
-// was stripped externally (e.g. ArgoCD overwriting managedFields).
+// A stamped Secret without an OwnerReference lost it to another writer (e.g. ArgoCD).
 func (r *DatabaseUserReconciler) warnIfOwnershipStripped(ctx context.Context, secret *corev1.Secret, user *databasesv1alpha1.DatabaseUser, op string) {
 	if secret.Annotations[ManagedByAnnotation] == user.Name {
 		log.FromContext(ctx).Info(
@@ -609,14 +667,12 @@ func (r *DatabaseUserReconciler) ensureFinalizer(ctx context.Context, user *data
 }
 
 func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
-	databases []*databasesv1alpha1.Database, cluster *databasesv1alpha1.DBCluster,
+	resolved *userDatabases, cluster *databasesv1alpha1.DBCluster,
 	conflicts ownerConflicts) (ctrl.Result, error) {
 
+	databases := resolved.granted
 	username := r.getUsername(user)
-	dbNames := make([]string, len(databases))
-	for i, db := range databases {
-		dbNames[i] = DatabaseNameFor(db)
-	}
+	dbNames := databaseNames(databases)
 	baseStatus := statusUpdate{ClusterName: cluster.Name, Username: username}
 
 	pgClient, err := GetPostgresClient(ctx, r.Client, r.PGClientCache, cluster)
@@ -627,15 +683,19 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 		return r.setStatus(ctx, user, &baseStatus)
 	}
 
+	// Withdrawal must not depend on Secret writes succeeding.
+	if err := r.withdrawRemovedAccess(ctx, pgClient, user, dbNames, &baseStatus); err != nil {
+		return r.failAndRetry(ctx, user, &baseStatus, err)
+	}
+
 	password, secretName, passwordChanged, err := r.ensureSecrets(ctx, user, databases, cluster, pgClient)
 	if err != nil {
 		baseStatus.Phase = "Failed"
 		baseStatus.Message = fmt.Sprintf("secret error: %s", err.Error())
-		// passwordChanged=true on partial rotation prevents a re-rotation loop
-		// when a per-DB secret write failed.
+		// Partial rotation must report passwordChanged, else a failed per-DB write loops re-rotation.
 		baseStatus.PasswordUpdated = passwordChanged
 		baseStatus.SecretName = secretName
-		return r.setStatus(ctx, user, &baseStatus)
+		return r.failAndRetry(ctx, user, &baseStatus, err)
 	}
 	if user.Status.SecretName != "" && user.Status.SecretName != secretName {
 		r.deleteOldSecret(ctx, user.Namespace, user.Status.SecretName, user)
@@ -645,15 +705,15 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 	if err := r.syncPostgresUser(ctx, pgClient, user, username, password, dbNames); err != nil {
 		baseStatus.Phase = "Failed"
 		baseStatus.Message = err.Error()
-		return r.setStatus(ctx, user, &baseStatus)
+		return r.failAndRetry(ctx, user, &baseStatus, err)
 	}
 
-	dbStatuses, applyFailures := r.applyPerDatabasePrivileges(ctx, pgClient, user, databases, conflicts)
+	dbStatuses, applyFailures := r.applyPerDatabasePrivileges(ctx, pgClient, user, resolved, conflicts)
 
 	if err := r.syncRuntimeParams(ctx, pgClient, user, username); err != nil {
 		baseStatus.Phase = "Failed"
 		baseStatus.Message = err.Error()
-		return r.setStatus(ctx, user, &baseStatus)
+		return r.failAndRetry(ctx, user, &baseStatus, err)
 	}
 
 	r.verifyIsolation(ctx, pgClient, username, dbNames)
@@ -661,20 +721,15 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 	baseStatus.PasswordUpdated = passwordChanged
 	baseStatus.Databases = dbStatuses
 
-	// A per-database apply failure must not read as Ready: surface it top-level
-	// and return an error so controller-runtime retries with backoff.
 	if len(applyFailures) > 0 {
 		msg := fmt.Sprintf("failed to apply privileges for database(s): %s", strings.Join(applyFailures, ", "))
 		baseStatus.Phase = "Failed"
 		baseStatus.Message = msg
-		if _, err := r.setStatus(ctx, user, &baseStatus); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, errors.New(msg)
+		return r.failAndRetry(ctx, user, &baseStatus, errors.New(msg))
 	}
 
-	// Recovery arrives through enqueueOwnerPeers; the requeue is the rotation timer alone.
-	if messages := conflicts.messages(); len(messages) > 0 {
+	// Recovery arrives through the peer and Database watches; no error, so the user waits without backoff.
+	if messages := slices.Concat(resolved.denied, conflicts.messages()); len(messages) > 0 {
 		baseStatus.Phase = "Failed"
 		baseStatus.Message = strings.Join(messages, "; ")
 		baseStatus.RequeueAfter = r.calculateRequeueAfter(user)
@@ -689,14 +744,42 @@ func (r *DatabaseUserReconciler) reconcileUser(ctx context.Context, user *databa
 	return r.setStatus(ctx, user, &baseStatus)
 }
 
-// Mutates the PG role itself before per-DB privileges are applied.
+func databaseNames(databases []*databasesv1alpha1.Database) []string {
+	names := make([]string, len(databases))
+	for i, db := range databases {
+		names[i] = DatabaseNameFor(db)
+	}
+	return names
+}
+
+func (r *DatabaseUserReconciler) withdrawRemovedAccess(ctx context.Context, pgClient postgres.ClientInterface,
+	user *databasesv1alpha1.DatabaseUser, keep []string, update *statusUpdate) error {
+
+	remaining, err := r.revokeFromRole(ctx, pgClient, user, keep)
+	update.Databases = remaining
+	if err != nil {
+		update.Phase = "Failed"
+		update.Message = err.Error()
+	}
+	return err
+}
+
+func (r *DatabaseUserReconciler) failAndRetry(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	update *statusUpdate, cause error) (ctrl.Result, error) {
+
+	if _, err := r.setStatus(ctx, user, update); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, cause
+}
+
 func (r *DatabaseUserReconciler) syncPostgresUser(ctx context.Context, pgClient postgres.ClientInterface,
 	user *databasesv1alpha1.DatabaseUser, username, password string, dbNames []string) error {
 
-	if err := r.ensureUserInPostgres(ctx, pgClient, username, password); err != nil {
+	// A converged user skips ALTER ROLE PASSWORD: the periodic reverify must not touch credentials.
+	if err := r.ensureUserInPostgres(ctx, pgClient, username, password, !r.converged(user)); err != nil {
 		return err
 	}
-	r.reassignOwnershipForRemovedDatabases(ctx, pgClient, user, username, dbNames)
 	if err := pgClient.SyncDatabaseAccess(ctx, username, dbNames); err != nil {
 		return fmt.Errorf("failed to sync database access: %w", err)
 	}
@@ -704,13 +787,13 @@ func (r *DatabaseUserReconciler) syncPostgresUser(ctx context.Context, pgClient 
 }
 
 func (r *DatabaseUserReconciler) applyPerDatabasePrivileges(ctx context.Context, pgClient postgres.ClientInterface,
-	user *databasesv1alpha1.DatabaseUser, databases []*databasesv1alpha1.Database,
+	user *databasesv1alpha1.DatabaseUser, resolved *userDatabases,
 	conflicts ownerConflicts) (dbStatuses []databasesv1alpha1.DatabaseAccessStatus, applyFailures []string) {
 
-	dbStatuses = make([]databasesv1alpha1.DatabaseAccessStatus, len(databases))
-	dbAccesses := user.Spec.GetDatabases()
+	dbStatuses = make([]databasesv1alpha1.DatabaseAccessStatus, len(resolved.granted))
+	dbAccesses := resolved.accesses
 
-	for i, db := range databases {
+	for i, db := range resolved.granted {
 		dbName := DatabaseNameFor(db)
 		grants := ResolveUserGrants(user, dbAccesses[i])
 		lost := conflicts.lossFor(db.Namespace, db.Name)
@@ -729,7 +812,11 @@ func (r *DatabaseUserReconciler) applyPerDatabasePrivileges(ctx context.Context,
 			status.Phase = "Failed"
 			status.Message = lost
 		}
-		if err := ApplyUserGrants(ctx, pgClient, dbName, grants); err != nil {
+		ownerRole, err := r.electedOwnerRole(ctx, user, db)
+		if err == nil {
+			err = ApplyUserGrants(ctx, pgClient, dbName, grants, ownerRole)
+		}
+		if err != nil {
 			status.Phase = "Failed"
 			status.Message = appendStatusMessage(status.Message, err.Error())
 			applyFailures = append(applyFailures, dbName)
@@ -761,8 +848,7 @@ func (r *DatabaseUserReconciler) syncRuntimeParams(ctx context.Context, pgClient
 	return nil
 }
 
-// Read-before-write to avoid ALTER USER on every reconcile. CRD blocks
-// ConnectionLimit=0, so the int zero-value is "unset" → -1 (PG default).
+// Read-before-write; CRD blocks ConnectionLimit=0, so zero means unset (-1, PG default).
 func (r *DatabaseUserReconciler) syncConnectionLimit(ctx context.Context,
 	pgClient postgres.ClientInterface, username string, user *databasesv1alpha1.DatabaseUser) error {
 
@@ -780,7 +866,7 @@ func (r *DatabaseUserReconciler) syncConnectionLimit(ctx context.Context,
 	return pgClient.SetConnectionLimit(ctx, username, desired)
 }
 
-// Read-before-write so RESET isn't sent on every reconcile when field is unset.
+// Read-before-write so RESET isn't sent every reconcile.
 func (r *DatabaseUserReconciler) syncIdleInTransactionTimeout(ctx context.Context,
 	pgClient postgres.ClientInterface, username string, user *databasesv1alpha1.DatabaseUser) error {
 
@@ -816,6 +902,13 @@ func (r *DatabaseUserReconciler) shouldRotatePassword(user *databasesv1alpha1.Da
 }
 
 func (r *DatabaseUserReconciler) calculateRequeueAfter(user *databasesv1alpha1.DatabaseUser) time.Duration {
+	if rotation := r.rotationRequeueAfter(user); rotation > 0 && rotation < ReverifyInterval {
+		return rotation
+	}
+	return ReverifyInterval
+}
+
+func (r *DatabaseUserReconciler) rotationRequeueAfter(user *databasesv1alpha1.DatabaseUser) time.Duration {
 	if user.Spec.Rotation == nil || user.Spec.Rotation.Days == 0 {
 		return 0
 	}
@@ -828,13 +921,13 @@ func (r *DatabaseUserReconciler) calculateRequeueAfter(user *databasesv1alpha1.D
 	requeue := time.Until(nextRotation)
 
 	if requeue <= 0 {
-		return time.Minute // Rotation overdue, check again soon
+		return time.Minute
 	}
 	return requeue
 }
 
 func (r *DatabaseUserReconciler) ensureUserInPostgres(ctx context.Context, pgClient postgres.ClientInterface,
-	username, password string) error {
+	username, password string, syncPassword bool) error {
 
 	exists, err := pgClient.UserExists(ctx, username)
 	if err != nil {
@@ -842,6 +935,9 @@ func (r *DatabaseUserReconciler) ensureUserInPostgres(ctx context.Context, pgCli
 	}
 
 	if exists {
+		if !syncPassword {
+			return nil
+		}
 		if err := pgClient.SetPassword(ctx, username, password); err != nil {
 			return fmt.Errorf("failed to set password: %w", err)
 		}
@@ -864,13 +960,11 @@ func (r *DatabaseUserReconciler) verifyIsolation(ctx context.Context, pgClient p
 		return
 	}
 
-	// Build expected set
 	expected := make(map[string]bool, len(expectedDatabases))
 	for _, db := range expectedDatabases {
 		expected[db] = true
 	}
 
-	// Check for unexpected access
 	for _, db := range accessibleDatabases {
 		if !expected[db] {
 			logger.V(1).Info("user has access to unexpected database (may be inherited from PUBLIC role)",
@@ -879,11 +973,7 @@ func (r *DatabaseUserReconciler) verifyIsolation(ctx context.Context, pgClient p
 	}
 }
 
-// Converge contract:
-//   - owned + extractable: keep password, rebuild shape from spec.
-//   - owned + corrupt: regenerate + SetPassword.
-//   - missing: generate (+ SetPassword if previously Ready) + create.
-//   - unowned: Adopt/Merge/Fail per onConflict.
+// An owned Secret keeps its password; only a missing or corrupt one is regenerated.
 func (r *DatabaseUserReconciler) ensureSecrets(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
 	databases []*databasesv1alpha1.Database, cluster *databasesv1alpha1.DBCluster,
 	pgClient postgres.ClientInterface) (password, primarySecretName string, passwordChanged bool, err error) {
@@ -912,7 +1002,6 @@ func (r *DatabaseUserReconciler) ensurePrimarySecret(ctx context.Context, user *
 		if out := r.handleUnownedPrimarySecret(ctx, user, &existing, cluster, databases, pgClient, username); out.Done {
 			return out.Password, out.SecretName, out.PasswordChanged, out.Err
 		}
-		// Fall through to the standard sync path — re-claim only fixed ownership.
 	}
 
 	if found && r.shouldRotatePassword(user) {
@@ -932,8 +1021,7 @@ func (r *DatabaseUserReconciler) ensurePrimarySecret(ctx context.Context, user *
 		}
 		return password, primarySecretName, true, nil
 	}
-	// Merge-policy secrets stay on the overlay path — full-replace here would
-	// drop the foreign keys mergeSecret preserved.
+	// Merge-policy secrets stay on the overlay path: full-replace would drop foreign keys.
 	if existing.Annotations[ConflictPolicyAnnotation] == "Merge" {
 		if _, err := r.reconcileSecretMerge(ctx, &existing, desired); err != nil {
 			return "", "", false, err
@@ -946,9 +1034,7 @@ func (r *DatabaseUserReconciler) ensurePrimarySecret(ctx context.Context, user *
 	return password, primarySecretName, passwordChanged, nil
 }
 
-// Re-attaches OwnerReference on a soft-owned secret (annotation matches, no
-// foreign controller). Used wherever an unowned-but-managed secret can be
-// healed in place — primary path, perDatabase first secret, per-DB loop.
+// Heals an unowned-but-managed secret in place (annotation matches, no foreign controller).
 func (r *DatabaseUserReconciler) doSoftReclaim(ctx context.Context, user *databasesv1alpha1.DatabaseUser, secret *corev1.Secret) error {
 	log.FromContext(ctx).Info("re-claiming soft-owned secret", "secret", secret.Name, "user", user.Name)
 	if err := controllerutil.SetControllerReference(user, secret, r.Scheme); err != nil {
@@ -960,8 +1046,7 @@ func (r *DatabaseUserReconciler) doSoftReclaim(ctx context.Context, user *databa
 	return nil
 }
 
-// Soft-owned re-claim path for perDatabase mode, where Adopt/Merge isn't
-// supported. Restores OwnerReference if the annotation matches; otherwise fails.
+// Soft-owned re-claim for perDatabase, where Adopt/Merge isn't supported; otherwise fails.
 func (r *DatabaseUserReconciler) reclaimOrFail(ctx context.Context, user *databasesv1alpha1.DatabaseUser, secret *corev1.Secret) error {
 	if !r.isSecretSoftOwnedByUser(secret, user) {
 		return fmt.Errorf("secret %s already exists and is not owned by this DatabaseUser", secret.Name)
@@ -969,9 +1054,7 @@ func (r *DatabaseUserReconciler) reclaimOrFail(ctx context.Context, user *databa
 	return r.doSoftReclaim(ctx, user, secret)
 }
 
-// unownedOutcome carries the result of handleUnownedPrimarySecret. Done=false
-// means the secret was self-healed (soft-owned re-claim) and the caller should
-// continue down the normal sync path.
+// Done=false means the secret was self-healed and the caller continues the normal sync path.
 type unownedOutcome struct {
 	Done            bool
 	Password        string
@@ -1044,8 +1127,6 @@ func (r *DatabaseUserReconciler) ensurePerDatabaseSecrets(ctx context.Context, u
 	return password, primarySecretName, passwordChanged, nil
 }
 
-// Idempotent reconcile for one per-DB secret: create if missing, soft-reclaim
-// if OwnerRef stripped, then converge shape.
 func (r *DatabaseUserReconciler) syncPerDatabaseSecret(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
 	cluster *databasesv1alpha1.DBCluster, db *databasesv1alpha1.Database, username, password string) error {
 
@@ -1138,9 +1219,7 @@ func (r *DatabaseUserReconciler) rotatePerDatabasePassword(ctx context.Context, 
 		secretName = r.getSecretNameForDatabase(user, databases[0].Name)
 	}
 
-	// Return passwordChanged=true even on partial failure — PG has already
-	// rotated, so PasswordUpdatedAt must bump or shouldRotatePassword fires
-	// again next reconcile and churns PG until the broken secret heals.
+	// PG already rotated: bump PasswordUpdatedAt even on partial failure, or rotation re-fires each reconcile.
 	var rotationErrs []error
 	for _, db := range databases {
 		dbSecretName := r.getSecretNameForDatabase(user, db.Name)
@@ -1173,12 +1252,7 @@ func (r *DatabaseUserReconciler) generateAndSetPassword(ctx context.Context, use
 	return password, nil
 }
 
-// adoptSecret takes over an unowned secret in one Update — ownership claim,
-// password, and data all in a single transaction. If the Update fails after
-// SetPassword, the next reconcile re-Adopts (potentially generating a fresh
-// password). Avoiding two-phase claim+data prevents the worse failure mode:
-// claim succeeds → secret looks owned → resolvePassword keeps the OLD value
-// indefinitely while PG holds the NEW one.
+// Single Update: claim-then-data would leave an owned secret holding the OLD password while PG has the NEW one.
 func (r *DatabaseUserReconciler) adoptSecret(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
 	secret *corev1.Secret, cluster *databasesv1alpha1.DBCluster, databases []*databasesv1alpha1.Database,
 	pgClient postgres.ClientInterface, username string) (password, secretName string, passwordChanged bool, err error) {
@@ -1186,13 +1260,13 @@ func (r *DatabaseUserReconciler) adoptSecret(ctx context.Context, user *database
 	log.FromContext(ctx).Info("adopting existing secret", "secret", secret.Name)
 	r.warnIfOwnershipStripped(ctx, secret, user, "adopt")
 
+	// Claim first so a foreign controller fails us before PostgreSQL is touched.
+	if err = controllerutil.SetControllerReference(user, secret, r.Scheme); err != nil {
+		return "", "", false, fmt.Errorf("failed to set controller reference: %w", err)
+	}
 	password, err = r.generateAndSetPassword(ctx, user, pgClient, username)
 	if err != nil {
 		return "", "", false, err
-	}
-
-	if err = controllerutil.SetControllerReference(user, secret, r.Scheme); err != nil {
-		return "", "", false, fmt.Errorf("failed to set controller reference: %w", err)
 	}
 	secret.Data = r.buildSecretData(user, cluster, databases, username, password)
 	secret.StringData = nil
@@ -1210,21 +1284,20 @@ func (r *DatabaseUserReconciler) mergeSecret(ctx context.Context, user *database
 	log.FromContext(ctx).Info("merging into existing secret", "secret", secret.Name)
 	r.warnIfOwnershipStripped(ctx, secret, user, "merge")
 
+	// Claim first so a foreign controller fails us before PostgreSQL is touched.
+	if err = controllerutil.SetControllerReference(user, secret, r.Scheme); err != nil {
+		return "", "", false, fmt.Errorf("failed to set controller reference: %w", err)
+	}
 	password, err = r.generateAndSetPassword(ctx, user, pgClient, username)
 	if err != nil {
 		return "", "", false, err
-	}
-
-	if err = controllerutil.SetControllerReference(user, secret, r.Scheme); err != nil {
-		return "", "", false, fmt.Errorf("failed to set controller reference: %w", err)
 	}
 	if secret.Annotations == nil {
 		secret.Annotations = map[string]string{}
 	}
 	secret.Annotations[ConflictPolicyAnnotation] = "Merge"
 
-	// Overlay; foreign keys stay. managed-keys annotation lets future
-	// reconciles drop our orphans without touching the user's keys.
+	// Foreign keys stay; managed-keys lets later reconciles drop our orphans.
 	if secret.Data == nil {
 		secret.Data = make(map[string][]byte)
 	}
@@ -1250,17 +1323,47 @@ func (r *DatabaseUserReconciler) handleDeletion(ctx context.Context, user *datab
 
 	if user.Spec.DeletionPolicy != "Retain" {
 		if err := r.dropUserFromPostgres(ctx, user, username); err != nil {
-			// Keep the finalizer and requeue: the CR must not disappear while the
-			// PostgreSQL role still exists (e.g. Postgres unreachable at Exec).
+			// Keep the finalizer: the CR must not disappear while the PG role still exists.
 			return ctrl.Result{}, err
 		}
 	} else {
 		logger.Info("retaining user in PostgreSQL due to deletionPolicy", "username", username)
+		if err := r.releaseSecrets(ctx, user); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	patch := client.MergeFrom(user.DeepCopy())
 	controllerutil.RemoveFinalizer(user, UserFinalizerName)
 	return ctrl.Result{}, r.Patch(ctx, user, patch)
+}
+
+// Garbage collection would otherwise delete the only copy of the retained role's password.
+func (r *DatabaseUserReconciler) releaseSecrets(ctx context.Context, user *databasesv1alpha1.DatabaseUser) error {
+	for _, name := range r.secretNames(user) {
+		var secret corev1.Secret
+		if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: user.Namespace}, &secret); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("get secret %s: %w", name, err)
+		}
+		kept := make([]metav1.OwnerReference, 0, len(secret.OwnerReferences))
+		for _, ref := range secret.OwnerReferences {
+			if ref.Kind != "DatabaseUser" || ref.UID != user.UID {
+				kept = append(kept, ref)
+			}
+		}
+		if len(kept) == len(secret.OwnerReferences) {
+			continue
+		}
+		secret.OwnerReferences = kept
+		if err := r.Update(ctx, &secret); err != nil {
+			return fmt.Errorf("release secret %s: %w", name, err)
+		}
+		log.FromContext(ctx).Info("released secret of retained user", "secret", name)
+	}
+	return nil
 }
 
 func (r *DatabaseUserReconciler) dropUserFromPostgres(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
@@ -1270,8 +1373,7 @@ func (r *DatabaseUserReconciler) dropUserFromPostgres(ctx context.Context, user 
 
 	clusterName, databaseNames := r.getClusterAndDatabasesForDeletion(ctx, user)
 	if clusterName == "" {
-		// No resolvable cluster (never provisioned, or all referenced Databases
-		// gone) — cleanup is impossible by design, so release the finalizer.
+		// No resolvable cluster: cleanup is impossible by design, so release the finalizer.
 		logger.Info("no cluster resolvable for cleanup, skipping user drop")
 		return nil
 	}
@@ -1290,9 +1392,7 @@ func (r *DatabaseUserReconciler) dropUserFromPostgres(ctx context.Context, user 
 		return fmt.Errorf("failed to get postgres client for cleanup: %w", err)
 	}
 
-	// Reassign ownership and revoke privileges from all databases. These are
-	// best-effort: if the role still owns objects, the DropUser below fails and
-	// gates finalizer removal, so a transient failure here is retried anyway.
+	// Best-effort: if the role still owns objects, DropUser below fails and gates the finalizer.
 	if exists, err := pgClient.UserExists(ctx, username); err != nil {
 		logger.Error(err, "failed to check whether the role still exists", "username", username)
 	} else if exists {
@@ -1317,7 +1417,6 @@ func (r *DatabaseUserReconciler) dropUserFromPostgres(ctx context.Context, user 
 }
 
 func (r *DatabaseUserReconciler) getClusterAndDatabasesForDeletion(ctx context.Context, user *databasesv1alpha1.DatabaseUser) (clusterName string, databaseNames []string) {
-	// First try to get from status
 	if user.Status.ClusterName != "" {
 		databaseNames = make([]string, len(user.Status.Databases))
 		for i, db := range user.Status.Databases {
@@ -1326,23 +1425,20 @@ func (r *DatabaseUserReconciler) getClusterAndDatabasesForDeletion(ctx context.C
 		return user.Status.ClusterName, databaseNames
 	}
 
-	// Fall back to fetching from spec
 	dbAccesses := user.Spec.GetDatabases()
 	if len(dbAccesses) == 0 {
 		return "", nil
 	}
 
 	for _, dbAccess := range dbAccesses {
-		dbNamespace := dbAccess.Namespace
-		if dbNamespace == "" {
-			dbNamespace = user.Namespace
-		}
-
 		var db databasesv1alpha1.Database
 		if err := r.Get(ctx, types.NamespacedName{
 			Name:      dbAccess.Name,
-			Namespace: dbNamespace,
+			Namespace: databaseAccessNamespace(user, dbAccess),
 		}, &db); err != nil {
+			continue
+		}
+		if CheckReferenceConsent(&db, user.Namespace) != nil {
 			continue
 		}
 
@@ -1375,45 +1471,58 @@ func (r *DatabaseUserReconciler) deleteOldSecret(ctx context.Context, namespace,
 	}
 }
 
-// reassignOwnershipForRemovedDatabases transfers ownership of objects back to master
-// for databases that were previously in the user's access list but are now removed.
-// This prevents orphan objects when a database is removed from the spec.
-func (r *DatabaseUserReconciler) reassignOwnershipForRemovedDatabases(ctx context.Context,
-	pgClient postgres.ClientInterface, user *databasesv1alpha1.DatabaseUser, username string, currentDBNames []string) {
+func (r *DatabaseUserReconciler) revokeRemovedDatabases(ctx context.Context, pgClient postgres.ClientInterface,
+	user *databasesv1alpha1.DatabaseUser, username string, keep []string) ([]databasesv1alpha1.DatabaseAccessStatus, error) {
 
-	logger := log.FromContext(ctx)
-
-	// Build set of current database names for O(1) lookup
-	currentDBSet := make(map[string]bool, len(currentDBNames))
-	for _, db := range currentDBNames {
-		currentDBSet[db] = true
+	uncleaned, reassignErr := reassignRemovedOwnership(ctx, pgClient, username, removedDatabaseNames(user, keep))
+	// DROP OWNED in a removed database also revokes CONNECT on the kept ones, so the sync runs even after a failed reassignment.
+	if err := pgClient.SyncDatabaseAccess(ctx, username, keep); err != nil {
+		return user.Status.Databases, errors.Join(reassignErr, fmt.Errorf("failed to sync database access: %w", err))
 	}
-
-	// Databases that were in status but are not in the current spec
-	removed := make([]string, 0, len(user.Status.Databases))
-	for _, dbStatus := range user.Status.Databases {
-		if dbStatus.DatabaseName == "" || currentDBSet[dbStatus.DatabaseName] {
-			continue
-		}
-		removed = append(removed, dbStatus.DatabaseName)
-	}
-	if len(removed) == 0 {
-		return
-	}
-
-	if err := pgClient.EnsureRoleMembership(ctx, username); err != nil {
-		logger.Error(err, "failed to ensure role membership before reassigning ownership", "username", username)
-	}
-	for _, dbName := range removed {
-		logger.Info("reassigning ownership for removed database", "database", dbName, "username", username)
-		if err := pgClient.ReassignOwnership(ctx, username, dbName); err != nil {
-			logger.Error(err, "failed to reassign ownership for removed database", "database", dbName)
-			// Continue anyway - best effort cleanup
-		}
-	}
+	return statusEntriesFor(user, slices.Concat(keep, uncleaned)), reassignErr
 }
 
-// statusUpdate contains all parameters for updating DatabaseUser status
+func reassignRemovedOwnership(ctx context.Context, pgClient postgres.ClientInterface,
+	username string, removed []string) (failed []string, err error) {
+
+	if len(removed) == 0 {
+		return nil, nil
+	}
+	if err := pgClient.EnsureRoleMembership(ctx, username); err != nil {
+		return removed, fmt.Errorf("failed to ensure role membership before reassigning ownership: %w", err)
+	}
+
+	var errs []error
+	for _, dbName := range removed {
+		log.FromContext(ctx).Info("reassigning ownership for removed database", "database", dbName, "username", username)
+		if err := pgClient.ReassignOwnership(ctx, username, dbName); err != nil {
+			failed = append(failed, dbName)
+			errs = append(errs, fmt.Errorf("failed to reassign ownership in removed database %s: %w", dbName, err))
+		}
+	}
+	return failed, errors.Join(errs...)
+}
+
+func removedDatabaseNames(user *databasesv1alpha1.DatabaseUser, keep []string) []string {
+	var removed []string
+	for _, db := range user.Status.Databases {
+		if db.DatabaseName != "" && !slices.Contains(keep, db.DatabaseName) {
+			removed = append(removed, db.DatabaseName)
+		}
+	}
+	return removed
+}
+
+func statusEntriesFor(user *databasesv1alpha1.DatabaseUser, names []string) []databasesv1alpha1.DatabaseAccessStatus {
+	entries := make([]databasesv1alpha1.DatabaseAccessStatus, 0, len(user.Status.Databases))
+	for _, db := range user.Status.Databases {
+		if slices.Contains(names, db.DatabaseName) {
+			entries = append(entries, db)
+		}
+	}
+	return entries
+}
+
 type statusUpdate struct {
 	Phase           string
 	Message         string
@@ -1426,23 +1535,12 @@ type statusUpdate struct {
 }
 
 func (r *DatabaseUserReconciler) setStatus(ctx context.Context, user *databasesv1alpha1.DatabaseUser, update *statusUpdate) (ctrl.Result, error) {
-	// Snapshot before any status mutation — handlePendingTimeout writes
-	// PendingSince, which must be part of the patch diff to reach the API server.
+	// Snapshot first: handlePendingTimeout's PendingSince must be part of the patch diff.
 	patch := client.MergeFrom(user.DeepCopy())
 
 	pendingChanged := r.handlePendingTimeout(user, update)
 
-	statusChanged := pendingChanged ||
-		user.Status.Phase != update.Phase ||
-		user.Status.Message != update.Message ||
-		user.Status.ObservedGeneration != user.Generation ||
-		(update.ClusterName != "" && user.Status.ClusterName != update.ClusterName) ||
-		(update.Username != "" && user.Status.Username != update.Username) ||
-		(update.SecretName != "" && user.Status.SecretName != update.SecretName) ||
-		update.PasswordUpdated ||
-		len(update.Databases) > 0
-
-	if statusChanged {
+	if pendingChanged || statusDiffers(user, update) {
 		user.Status.Phase = update.Phase
 		user.Status.Message = update.Message
 		user.Status.ObservedGeneration = user.Generation
@@ -1460,6 +1558,18 @@ func (r *DatabaseUserReconciler) setStatus(ctx context.Context, user *databasesv
 	return ctrl.Result{}, nil
 }
 
+func statusDiffers(user *databasesv1alpha1.DatabaseUser, update *statusUpdate) bool {
+	return user.Status.Phase != update.Phase ||
+		user.Status.Message != update.Message ||
+		user.Status.ObservedGeneration != user.Generation ||
+		(update.ClusterName != "" && user.Status.ClusterName != update.ClusterName) ||
+		(update.Username != "" && user.Status.Username != update.Username) ||
+		(update.SecretName != "" && user.Status.SecretName != update.SecretName) ||
+		update.PasswordUpdated ||
+		(update.Phase == "Ready" && user.Status.PasswordUpdatedAt == nil) ||
+		(update.Databases != nil && !equality.Semantic.DeepEqual(user.Status.Databases, update.Databases))
+}
+
 func (r *DatabaseUserReconciler) handlePendingTimeout(user *databasesv1alpha1.DatabaseUser, update *statusUpdate) (pendingChanged bool) {
 	if update.Phase == "Pending" {
 		now := metav1.Now()
@@ -1470,8 +1580,7 @@ func (r *DatabaseUserReconciler) handlePendingTimeout(user *databasesv1alpha1.Da
 		if now.Sub(user.Status.PendingSince.Time) > PendingTimeout {
 			update.Phase = "Failed"
 			update.Message = fmt.Sprintf("timeout: %s (pending for over 10 minutes)", update.Message)
-			// Transitioning out of Pending — reset the clock so a later Pending
-			// episode starts fresh instead of re-timing-out immediately.
+			// Reset so a later Pending episode does not time out immediately.
 			user.Status.PendingSince = nil
 			return true
 		}
@@ -1494,7 +1603,7 @@ func (r *DatabaseUserReconciler) applyStatusFields(user *databasesv1alpha1.Datab
 	if update.SecretName != "" {
 		user.Status.SecretName = update.SecretName
 	}
-	if len(update.Databases) > 0 {
+	if update.Databases != nil {
 		user.Status.Databases = update.Databases
 		user.Status.DatabasesSummary = r.buildDatabasesSummary(update.Databases)
 	}
@@ -1524,5 +1633,61 @@ func (r *DatabaseUserReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&databasesv1alpha1.DatabaseUser{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueOwnerPeers),
 			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Watches(&databasesv1alpha1.DBCluster{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueClusterUsers),
+			builder.WithPredicates(dbClusterChanged)).
+		Watches(&databasesv1alpha1.Database{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueDatabaseUsers),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Complete(r)
+}
+
+func (r *DatabaseUserReconciler) enqueueDatabaseUsers(ctx context.Context, obj client.Object) []ctrl.Request {
+	requests, err := r.usersReferencing(ctx, obj.GetNamespace(), obj.GetName(), map[types.NamespacedName]struct{}{})
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed to enqueue DatabaseUsers of database", "database", obj.GetNamespace()+"/"+obj.GetName())
+	}
+	return requests
+}
+
+func (r *DatabaseUserReconciler) usersReferencing(ctx context.Context, namespace, name string,
+	seen map[types.NamespacedName]struct{}) ([]ctrl.Request, error) {
+
+	var users databasesv1alpha1.DatabaseUserList
+	if err := r.List(ctx, &users, client.MatchingFields{
+		DatabaseUserDatabaseRefIndex: DatabaseUserDatabaseRefKey(namespace, name),
+	}); err != nil {
+		return nil, err
+	}
+	requests := make([]ctrl.Request, 0, len(users.Items))
+	for i := range users.Items {
+		key := types.NamespacedName{Namespace: users.Items[i].Namespace, Name: users.Items[i].Name}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		requests = append(requests, ctrl.Request{NamespacedName: key})
+	}
+	return requests, nil
+}
+
+func (r *DatabaseUserReconciler) enqueueClusterUsers(ctx context.Context, obj client.Object) []ctrl.Request {
+	databases, err := databasesOnCluster(ctx, r.Client, obj.GetName())
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed to enqueue DatabaseUsers of cluster", "cluster", obj.GetName())
+		return nil
+	}
+
+	var requests []ctrl.Request
+	seen := make(map[types.NamespacedName]struct{})
+	for i := range databases {
+		db := &databases[i]
+		users, err := r.usersReferencing(ctx, db.Namespace, db.Name, seen)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "failed to enqueue DatabaseUsers of database", "database", db.Namespace+"/"+db.Name)
+			continue
+		}
+		requests = append(requests, users...)
+	}
+	return requests
 }

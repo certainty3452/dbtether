@@ -13,7 +13,7 @@ import (
 )
 
 // Oldest CreationTimestamp wins, ties by namespace/name, so every controller elects the same owner.
-func ElectOwner(users []databasesv1alpha1.DatabaseUser, dbNamespace, dbName string) *databasesv1alpha1.DatabaseUser {
+func ElectOwner(users []databasesv1alpha1.DatabaseUser, db *databasesv1alpha1.Database) *databasesv1alpha1.DatabaseUser {
 	var winner *databasesv1alpha1.DatabaseUser
 	for i := range users {
 		candidate := &users[i]
@@ -25,7 +25,7 @@ func ElectOwner(users []databasesv1alpha1.DatabaseUser, dbNamespace, dbName stri
 		if ValidateUserSpec(candidate) != nil {
 			continue
 		}
-		grants, ok := ResolveUserGrantsForDatabase(candidate, dbNamespace, dbName)
+		grants, ok := GrantsOnDatabase(candidate, db)
 		if !ok || grants.Privileges != "owner" {
 			continue
 		}
@@ -34,6 +34,13 @@ func ElectOwner(users []databasesv1alpha1.DatabaseUser, dbNamespace, dbName stri
 		}
 	}
 	return winner
+}
+
+func OwnerRole(owner *databasesv1alpha1.DatabaseUser) string {
+	if owner == nil {
+		return ""
+	}
+	return UsernameForUser(owner)
 }
 
 func SameUser(a, b *databasesv1alpha1.DatabaseUser) bool {
@@ -55,12 +62,7 @@ type ownerLoss struct {
 }
 
 type ownerConflicts struct {
-	losses    []ownerLoss
-	contested bool
-}
-
-func (c ownerConflicts) empty() bool {
-	return len(c.losses) == 0 && !c.contested
+	losses []ownerLoss
 }
 
 func (c ownerConflicts) lossFor(namespace, name string) string {
@@ -95,29 +97,27 @@ func ownedDatabaseRefs(user *databasesv1alpha1.DatabaseUser) []types.NamespacedN
 }
 
 func (r *DatabaseUserReconciler) evaluateOwnerConflicts(ctx context.Context,
-	user *databasesv1alpha1.DatabaseUser) (ownerConflicts, error) {
+	user *databasesv1alpha1.DatabaseUser, databases []*databasesv1alpha1.Database) (ownerConflicts, error) {
 
 	var conflicts ownerConflicts
-	for _, db := range ownedDatabaseRefs(user) {
-		others, err := r.listOwnerPeers(ctx, user, db)
+	for _, db := range databases {
+		if grants, ok := GrantsOnDatabase(user, db); !ok || grants.Privileges != "owner" {
+			continue
+		}
+		ref := types.NamespacedName{Namespace: db.Namespace, Name: db.Name}
+		others, err := r.listOwnerPeers(ctx, user, ref)
 		if err != nil {
 			return ownerConflicts{}, err
 		}
 
-		other := ElectOwner(others, db.Namespace, db.Name)
-		if other == nil {
-			continue
+		if other := ElectOwner(others, db); other != nil && ownerCandidateWins(other, user) {
+			conflicts.losses = append(conflicts.losses, ownerLoss{database: ref, message: ownerConflictMessage(other, ref)})
 		}
-		if ownerCandidateWins(other, user) {
-			conflicts.losses = append(conflicts.losses, ownerLoss{database: db, message: ownerConflictMessage(other, db)})
-			continue
-		}
-		conflicts.contested = true
 	}
 	return conflicts, nil
 }
 
-// Wakes the other owners so a loser recovers on the holder's downgrade or deletion.
+// Wakes every peer: a moved owner claim changes losers' grants and every member's FOR ROLE <owner> default privileges.
 func (r *DatabaseUserReconciler) enqueueOwnerPeers(ctx context.Context, obj client.Object) []ctrl.Request {
 	user, ok := obj.(*databasesv1alpha1.DatabaseUser)
 	if !ok {
@@ -134,10 +134,6 @@ func (r *DatabaseUserReconciler) enqueueOwnerPeers(ctx context.Context, obj clie
 		}
 
 		for i := range others {
-			grants, referenced := ResolveUserGrantsForDatabase(&others[i], db.Namespace, db.Name)
-			if !referenced || grants.Privileges != "owner" {
-				continue
-			}
 			peer := types.NamespacedName{Namespace: others[i].Namespace, Name: others[i].Name}
 			if _, duplicate := seen[peer]; duplicate {
 				continue
@@ -147,6 +143,16 @@ func (r *DatabaseUserReconciler) enqueueOwnerPeers(ctx context.Context, obj clie
 		}
 	}
 	return requests
+}
+
+func (r *DatabaseUserReconciler) electedOwnerRole(ctx context.Context, user *databasesv1alpha1.DatabaseUser,
+	db *databasesv1alpha1.Database) (string, error) {
+
+	peers, err := r.listOwnerPeers(ctx, user, types.NamespacedName{Namespace: db.Namespace, Name: db.Name})
+	if err != nil {
+		return "", err
+	}
+	return OwnerRole(ElectOwner(append(peers, *user), db)), nil
 }
 
 // Namespace-wide List: a DatabaseUser may live elsewhere than the Database it points at.

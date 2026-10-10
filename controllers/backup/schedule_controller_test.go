@@ -77,18 +77,15 @@ func TestCronParsing(t *testing.T) {
 func TestNextScheduledTime(t *testing.T) {
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 
-	// Parse testCronSchedule (daily at 2:00 AM)
 	schedule, err := parser.Parse(testCronSchedule)
 	require.NoError(t, err)
 
-	// If last run was today at 1:00 AM, next should be today at 2:00 AM
 	now := time.Date(2026, 1, 20, 1, 0, 0, 0, time.UTC)
 	next := schedule.Next(now)
 	assert.Equal(t, 2, next.Hour())
 	assert.Equal(t, 0, next.Minute())
 	assert.Equal(t, 20, next.Day())
 
-	// If last run was today at 3:00 AM, next should be tomorrow at 2:00 AM
 	now = time.Date(2026, 1, 20, 3, 0, 0, 0, time.UTC)
 	next = schedule.Next(now)
 	assert.Equal(t, 2, next.Hour())
@@ -146,17 +143,14 @@ func TestGenerateBackupName(t *testing.T) {
 		},
 	}
 
-	// Test deterministic name generation based on scheduled time
 	scheduledTime := time.Date(2026, 1, 20, 14, 45, 0, 0, time.UTC)
 	name := r.generateBackupName(schedule, scheduledTime)
 
 	assert.Equal(t, "nightly-backup-20260120-1445", name)
 
-	// Same scheduled time should produce the same name (deterministic)
 	name2 := r.generateBackupName(schedule, scheduledTime)
 	assert.Equal(t, name, name2)
 
-	// Different time should produce different name
 	differentTime := time.Date(2026, 1, 20, 15, 0, 0, 0, time.UTC)
 	name3 := r.generateBackupName(schedule, differentTime)
 	assert.NotEqual(t, name, name3)
@@ -173,14 +167,12 @@ func TestGenerateBackupName_DifferentTimezones(t *testing.T) {
 		},
 	}
 
-	// Test that times are normalized to UTC
 	localTime := time.Date(2026, 1, 20, 16, 30, 0, 0, time.FixedZone("CET", 3600))
 	utcTime := time.Date(2026, 1, 20, 15, 30, 0, 0, time.UTC)
 
 	localName := r.generateBackupName(schedule, localTime)
 	utcName := r.generateBackupName(schedule, utcTime)
 
-	// Should produce same name because both are 15:30 UTC
 	assert.Equal(t, localName, utcName)
 	assert.Equal(t, "my-schedule-20260120-1530", localName)
 }
@@ -226,7 +218,6 @@ func TestGenerateBackupName_EdgeCases(t *testing.T) {
 }
 
 func TestRetentionPolicy_Fields(t *testing.T) {
-	// Test that all retention fields work
 	policy := &dbtether.RetentionPolicy{
 		KeepLast:    intPtr(5),
 		KeepDaily:   intPtr(7),
@@ -306,7 +297,7 @@ func TestBuildStoragePath(t *testing.T) {
 			name:         "invalid template",
 			pathTemplate: "{{ .InvalidField }}",
 			expected:     "",
-			expectError:  false, // template executes but produces "<no value>"
+			expectError:  false,
 		},
 	}
 
@@ -344,10 +335,9 @@ func TestBuildStoragePath_InvalidTemplate(t *testing.T) {
 		Status: dbtether.DatabaseStatus{DatabaseName: "my_database"},
 	}
 
-	// Malformed template syntax should return error
 	storage := &dbtether.BackupStorage{
 		Spec: dbtether.BackupStorageSpec{
-			PathTemplate: "{{ .ClusterName", // Unclosed template
+			PathTemplate: "{{ .ClusterName",
 		},
 	}
 
@@ -357,7 +347,6 @@ func TestBuildStoragePath_InvalidTemplate(t *testing.T) {
 }
 
 func TestRetentionCleanup_NoPolicy(t *testing.T) {
-	// Schedule without retention policy should not trigger cleanup
 	schedule := &dbtether.BackupSchedule{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-schedule",
@@ -367,16 +356,14 @@ func TestRetentionCleanup_NoPolicy(t *testing.T) {
 			DatabaseRef: dbtether.DatabaseReference{Name: "test-db"},
 			StorageRef:  dbtether.StorageReference{Name: "test-storage"},
 			Schedule:    testCronSchedule,
-			Retention:   nil, // No retention policy
+			Retention:   nil,
 		},
 	}
 
-	// Just verify struct is valid and Retention is nil
 	assert.Nil(t, schedule.Spec.Retention)
 }
 
 func TestRetentionPolicy_AllFieldsCombined(t *testing.T) {
-	// Test that all retention fields can be set together
 	policy := &dbtether.RetentionPolicy{
 		KeepLast:    intPtr(10),
 		KeepDaily:   intPtr(14),
@@ -396,7 +383,6 @@ func TestRetentionPolicy_AllFieldsCombined(t *testing.T) {
 }
 
 func TestScheduleReconciler_HandleScheduledBackup_DeterministicName(t *testing.T) {
-	// Test that scheduled backup names are deterministic
 	r := &BackupScheduleReconciler{}
 
 	schedule := &dbtether.BackupSchedule{
@@ -406,7 +392,6 @@ func TestScheduleReconciler_HandleScheduledBackup_DeterministicName(t *testing.T
 		},
 	}
 
-	// Same schedule time should always produce same name
 	scheduleTime := time.Date(2026, 1, 20, 14, 30, 0, 0, time.UTC)
 
 	name1 := r.generateBackupName(schedule, scheduleTime)
@@ -415,7 +400,6 @@ func TestScheduleReconciler_HandleScheduledBackup_DeterministicName(t *testing.T
 	assert.Equal(t, name1, name2)
 	assert.Equal(t, "my-app-backup-20260120-1430", name1)
 
-	// Different time produces different name
 	differentTime := time.Date(2026, 1, 20, 15, 0, 0, 0, time.UTC)
 	name3 := r.generateBackupName(schedule, differentTime)
 	assert.NotEqual(t, name1, name3)
@@ -425,7 +409,7 @@ func TestScheduleReconciler_HandleScheduledBackup_DeterministicName(t *testing.T
 func TestScheduleReconciler_CalculateNextRun(t *testing.T) {
 	r := &BackupScheduleReconciler{}
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	cronSchedule, err := parser.Parse("0 2 * * *") // Daily at 2am
+	cronSchedule, err := parser.Parse("0 2 * * *")
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -477,38 +461,32 @@ func ptrToTime(t time.Time) *metav1.Time {
 }
 
 func TestCleanupBackupCRDs_KeepLast(t *testing.T) {
-	// Test that cleanupBackupCRDs respects keepLast policy
 
-	// With keepLast=3, we should keep 3 newest and delete the rest
 	policy := &dbtether.RetentionPolicy{
 		KeepLast: intPtr(3),
 	}
 
-	// Verify policy struct is correct
 	require.NotNil(t, policy.KeepLast)
 	assert.Equal(t, 3, *policy.KeepLast)
 
-	// Test sorting logic: backups should be sorted newest-first
 	now := time.Now()
 	backups := []struct {
 		name      string
 		timestamp time.Time
 	}{
-		{backupName1, now.Add(-1 * time.Hour)}, // newest
-		{backupName2, now.Add(-2 * time.Hour)}, // 2nd
-		{backupName3, now.Add(-3 * time.Hour)}, // 3rd (kept)
-		{backupName4, now.Add(-4 * time.Hour)}, // 4th (deleted)
-		{backupName5, now.Add(-5 * time.Hour)}, // 5th (deleted)
+		{backupName1, now.Add(-1 * time.Hour)},
+		{backupName2, now.Add(-2 * time.Hour)},
+		{backupName3, now.Add(-3 * time.Hour)},
+		{backupName4, now.Add(-4 * time.Hour)},
+		{backupName5, now.Add(-5 * time.Hour)},
 	}
 
-	// Simulate sorting (newest first)
 	sorted := make([]struct {
 		name      string
 		timestamp time.Time
 	}, len(backups))
 	copy(sorted, backups)
 
-	// Sort newest first (already sorted in this case)
 	for i := 0; i < len(sorted)-1; i++ {
 		for j := i + 1; j < len(sorted); j++ {
 			if sorted[j].timestamp.After(sorted[i].timestamp) {
@@ -517,14 +495,12 @@ func TestCleanupBackupCRDs_KeepLast(t *testing.T) {
 		}
 	}
 
-	// Verify sorting
 	assert.Equal(t, backupName1, sorted[0].name)
 	assert.Equal(t, backupName2, sorted[1].name)
 	assert.Equal(t, backupName3, sorted[2].name)
 	assert.Equal(t, backupName4, sorted[3].name)
 	assert.Equal(t, backupName5, sorted[4].name)
 
-	// With keepLast=3, items at index 3+ should be deleted
 	keepCount := *policy.KeepLast
 	toDelete := []string{}
 	for i := keepCount; i < len(sorted); i++ {
@@ -537,12 +513,11 @@ func TestCleanupBackupCRDs_KeepLast(t *testing.T) {
 }
 
 func TestCleanupBackupCRDs_NoKeepLast(t *testing.T) {
-	// When keepLast is not set, no CRDs should be deleted
 
 	policies := []*dbtether.RetentionPolicy{
 		nil,
-		{},                     // empty policy
-		{KeepDaily: intPtr(7)}, // only keepDaily, no keepLast
+		{},
+		{KeepDaily: intPtr(7)},
 	}
 
 	for i, policy := range policies {
@@ -630,7 +605,6 @@ func TestCleanupBackupCRDs_NoActiveRule(t *testing.T) {
 }
 
 func TestCleanupBackupCRDs_OnlyCompletedOrFailed(t *testing.T) {
-	// Verify that only Completed/Failed backups are considered for deletion
 
 	statuses := []string{
 		"Pending",   // should NOT be deleted
@@ -657,7 +631,6 @@ func TestCleanupBackupCRDs_OnlyCompletedOrFailed(t *testing.T) {
 func TestShouldRunRetentionCleanup_NoAnnotation(t *testing.T) {
 	r := &BackupScheduleReconciler{}
 
-	// Schedule without annotations - should allow cleanup
 	schedule := &dbtether.BackupSchedule{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-schedule",
@@ -671,7 +644,6 @@ func TestShouldRunRetentionCleanup_NoAnnotation(t *testing.T) {
 func TestShouldRunRetentionCleanup_EmptyAnnotations(t *testing.T) {
 	r := &BackupScheduleReconciler{}
 
-	// Schedule with empty annotations - should allow cleanup
 	schedule := &dbtether.BackupSchedule{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        "test-schedule",
@@ -686,7 +658,6 @@ func TestShouldRunRetentionCleanup_EmptyAnnotations(t *testing.T) {
 func TestShouldRunRetentionCleanup_RecentCleanup(t *testing.T) {
 	r := &BackupScheduleReconciler{}
 
-	// Cleanup happened 30 seconds ago - should NOT allow cleanup (debounce=60s)
 	schedule := &dbtether.BackupSchedule{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-schedule",
@@ -703,7 +674,6 @@ func TestShouldRunRetentionCleanup_RecentCleanup(t *testing.T) {
 func TestShouldRunRetentionCleanup_OldCleanup(t *testing.T) {
 	r := &BackupScheduleReconciler{}
 
-	// Cleanup happened 2 minutes ago - should allow cleanup
 	schedule := &dbtether.BackupSchedule{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-schedule",
@@ -720,7 +690,6 @@ func TestShouldRunRetentionCleanup_OldCleanup(t *testing.T) {
 func TestShouldRunRetentionCleanup_ExactlyAtDebounce(t *testing.T) {
 	r := &BackupScheduleReconciler{}
 
-	// Cleanup happened exactly at debounce time - should allow cleanup
 	schedule := &dbtether.BackupSchedule{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-schedule",
@@ -737,7 +706,6 @@ func TestShouldRunRetentionCleanup_ExactlyAtDebounce(t *testing.T) {
 func TestShouldRunRetentionCleanup_InvalidTimestamp(t *testing.T) {
 	r := &BackupScheduleReconciler{}
 
-	// Invalid timestamp format - should allow cleanup (fail-safe)
 	schedule := &dbtether.BackupSchedule{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-schedule",
@@ -752,17 +720,14 @@ func TestShouldRunRetentionCleanup_InvalidTimestamp(t *testing.T) {
 }
 
 func TestRetentionCleanupDebounce_Constant(t *testing.T) {
-	// Verify debounce constant is 60 seconds
 	assert.Equal(t, 60*time.Second, RetentionCleanupDebounce)
 }
 
 func TestAnnotationLastRetentionClean_Constant(t *testing.T) {
-	// Verify annotation name constant
 	assert.Equal(t, "dbtether.io/last-retention-cleanup", AnnotationLastRetentionClean)
 }
 
 func TestBackupScheduleSpec_WithJobConfig(t *testing.T) {
-	// Test that BackupSchedule can have JobConfig which should be inherited by Backups
 	backoffLimit := int32(5)
 	activeDeadline := int64(7200)
 	ttlAfterFailed := int32(86400)
@@ -784,7 +749,6 @@ func TestBackupScheduleSpec_WithJobConfig(t *testing.T) {
 		},
 	}
 
-	// Verify JobConfig is set correctly
 	require.NotNil(t, schedule.Spec.JobConfig)
 	assert.Equal(t, int32(5), *schedule.Spec.JobConfig.BackoffLimit)
 	assert.Equal(t, int64(7200), *schedule.Spec.JobConfig.ActiveDeadlineSeconds)
@@ -792,7 +756,6 @@ func TestBackupScheduleSpec_WithJobConfig(t *testing.T) {
 }
 
 func TestBackupInheritsJobConfigFromSchedule(t *testing.T) {
-	// Test that when creating a Backup from Schedule, JobConfig is inherited
 	backoffLimit := int32(5)
 	activeDeadline := int64(14400)
 	ttlAfterFailed := int32(172800)
@@ -815,7 +778,6 @@ func TestBackupInheritsJobConfigFromSchedule(t *testing.T) {
 		},
 	}
 
-	// Simulate what createBackup does (without k8s client)
 	backup := &dbtether.Backup{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-schedule-20260120-0200",
@@ -831,30 +793,25 @@ func TestBackupInheritsJobConfigFromSchedule(t *testing.T) {
 		},
 	}
 
-	// Inherit filename template if specified
 	if schedule.Spec.FilenameTemplate != "" {
 		backup.Spec.FilenameTemplate = schedule.Spec.FilenameTemplate
 	}
 
-	// Inherit job config if specified (this is what we're testing)
 	if schedule.Spec.JobConfig != nil {
 		backup.Spec.JobConfig = schedule.Spec.JobConfig
 	}
 
-	// Verify JobConfig was inherited
 	require.NotNil(t, backup.Spec.JobConfig)
 	assert.Equal(t, int32(5), *backup.Spec.JobConfig.BackoffLimit)
 	assert.Equal(t, int64(14400), *backup.Spec.JobConfig.ActiveDeadlineSeconds)
 	assert.Equal(t, int32(172800), *backup.Spec.JobConfig.TTLSecondsAfterFailed)
 
-	// Verify other fields
 	assert.Equal(t, "test-db", backup.Spec.DatabaseRef.Name)
 	assert.Equal(t, "test-storage", backup.Spec.StorageRef.Name)
 	assert.Equal(t, "{{ .Timestamp }}.sql.gz", backup.Spec.FilenameTemplate)
 }
 
 func TestBackupWithoutJobConfigFromSchedule(t *testing.T) {
-	// Test that Backup without JobConfig in Schedule gets nil JobConfig
 	schedule := &dbtether.BackupSchedule{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "simple-schedule",
@@ -864,11 +821,10 @@ func TestBackupWithoutJobConfigFromSchedule(t *testing.T) {
 			DatabaseRef: dbtether.DatabaseReference{Name: "simple-db"},
 			StorageRef:  dbtether.StorageReference{Name: "simple-storage"},
 			Schedule:    "0 3 * * *",
-			JobConfig:   nil, // No JobConfig
+			JobConfig:   nil,
 		},
 	}
 
-	// Simulate backup creation
 	backup := &dbtether.Backup{
 		Spec: dbtether.BackupSpec{
 			DatabaseRef: schedule.Spec.DatabaseRef,
@@ -876,12 +832,10 @@ func TestBackupWithoutJobConfigFromSchedule(t *testing.T) {
 		},
 	}
 
-	// Inherit job config only if specified
 	if schedule.Spec.JobConfig != nil {
 		backup.Spec.JobConfig = schedule.Spec.JobConfig
 	}
 
-	// JobConfig should remain nil
 	assert.Nil(t, backup.Spec.JobConfig)
 }
 
@@ -890,15 +844,15 @@ func TestCalculateBackupKeepSet_KeepLast(t *testing.T) {
 	now := time.Date(2026, 2, 6, 12, 0, 0, 0, time.UTC)
 
 	backups := createTestBackups([]time.Time{
-		now.Add(-1 * time.Hour), // backup-0: newest
-		now.Add(-2 * time.Hour), // backup-1
-		now.Add(-3 * time.Hour), // backup-2
-		now.Add(-4 * time.Hour), // backup-3
-		now.Add(-5 * time.Hour), // backup-4: oldest
+		now.Add(-1 * time.Hour),
+		now.Add(-2 * time.Hour),
+		now.Add(-3 * time.Hour),
+		now.Add(-4 * time.Hour),
+		now.Add(-5 * time.Hour),
 	})
 
 	policy := &dbtether.RetentionPolicy{KeepLast: intPtr(3)}
-	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+	keepSet := r.calculateBackupKeepSet(backups, policy)
 
 	assert.Len(t, keepSet, 3)
 	assert.True(t, keepSet["backup-0"])
@@ -921,14 +875,14 @@ func TestCalculateBackupKeepSet_KeepDaily(t *testing.T) {
 	})
 
 	policy := &dbtether.RetentionPolicy{KeepDaily: intPtr(3)}
-	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+	keepSet := r.calculateBackupKeepSet(backups, policy)
 
 	assert.Len(t, keepSet, 3)
-	assert.True(t, keepSet["backup-0"])  // today
-	assert.True(t, keepSet["backup-1"])  // yesterday (first)
-	assert.False(t, keepSet["backup-2"]) // yesterday (second - not kept)
-	assert.True(t, keepSet["backup-3"])  // 2 days ago
-	assert.False(t, keepSet["backup-4"]) // outside 3-day window
+	assert.True(t, keepSet["backup-0"])
+	assert.True(t, keepSet["backup-1"])
+	assert.False(t, keepSet["backup-2"])
+	assert.True(t, keepSet["backup-3"])
+	assert.False(t, keepSet["backup-4"])
 }
 
 func TestCalculateBackupKeepSet_KeepWeekly(t *testing.T) {
@@ -944,15 +898,15 @@ func TestCalculateBackupKeepSet_KeepWeekly(t *testing.T) {
 	})
 
 	policy := &dbtether.RetentionPolicy{KeepWeekly: intPtr(2)}
-	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+	keepSet := r.calculateBackupKeepSet(backups, policy)
 
 	// keepWeekly=2 means 14 days window, so only this week and last week are kept
 	assert.Len(t, keepSet, 2)
-	assert.True(t, keepSet["backup-0"])  // this week (first)
-	assert.False(t, keepSet["backup-1"]) // this week (second)
-	assert.True(t, keepSet["backup-2"])  // last week
-	assert.False(t, keepSet["backup-3"]) // outside 14-day window
-	assert.False(t, keepSet["backup-4"]) // outside window
+	assert.True(t, keepSet["backup-0"])
+	assert.False(t, keepSet["backup-1"])
+	assert.True(t, keepSet["backup-2"])
+	assert.False(t, keepSet["backup-3"])
+	assert.False(t, keepSet["backup-4"])
 }
 
 func TestCalculateBackupKeepSet_KeepMonthly(t *testing.T) {
@@ -967,13 +921,13 @@ func TestCalculateBackupKeepSet_KeepMonthly(t *testing.T) {
 	})
 
 	policy := &dbtether.RetentionPolicy{KeepMonthly: intPtr(1)}
-	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+	keepSet := r.calculateBackupKeepSet(backups, policy)
 
 	assert.Len(t, keepSet, 2)
-	assert.True(t, keepSet["backup-0"])  // Feb (first)
-	assert.True(t, keepSet["backup-1"])  // Jan (first)
-	assert.False(t, keepSet["backup-2"]) // Jan (second)
-	assert.False(t, keepSet["backup-3"]) // outside 1-month window
+	assert.True(t, keepSet["backup-0"])
+	assert.True(t, keepSet["backup-1"])
+	assert.False(t, keepSet["backup-2"])
+	assert.False(t, keepSet["backup-3"])
 }
 
 func TestCalculateBackupKeepSet_CombinedPolicies(t *testing.T) {
@@ -981,24 +935,22 @@ func TestCalculateBackupKeepSet_CombinedPolicies(t *testing.T) {
 	now := time.Date(2026, 2, 6, 12, 0, 0, 0, time.UTC)
 
 	backups := createTestBackups([]time.Time{
-		now.Add(-1 * time.Hour),        // backup-0: newest
-		now.Add(-25 * time.Hour),       // backup-1: yesterday
-		now.Add(-8 * 24 * time.Hour),   // backup-2: last week
-		now.Add(-40 * 24 * time.Hour),  // backup-3: last month
-		now.Add(-100 * 24 * time.Hour), // backup-4: old
+		now.Add(-1 * time.Hour),
+		now.Add(-25 * time.Hour),
+		now.Add(-8 * 24 * time.Hour),
+		now.Add(-40 * 24 * time.Hour),
+		now.Add(-100 * 24 * time.Hour),
 	})
 
-	// keepDaily=1, keepWeekly=1, keepMonthly=1
 	policy := &dbtether.RetentionPolicy{
 		KeepDaily:   intPtr(1),
 		KeepWeekly:  intPtr(1),
 		KeepMonthly: intPtr(1),
 	}
-	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+	keepSet := r.calculateBackupKeepSet(backups, policy)
 
-	// Should keep: backup-0 (today/this week/this month), backup-3 (last month)
 	assert.True(t, keepSet["backup-0"])
-	assert.False(t, keepSet["backup-4"]) // too old
+	assert.False(t, keepSet["backup-4"])
 }
 
 func TestCalculateBackupKeepSet_EmptyPolicy(t *testing.T) {
@@ -1011,7 +963,7 @@ func TestCalculateBackupKeepSet_EmptyPolicy(t *testing.T) {
 	})
 
 	policy := &dbtether.RetentionPolicy{}
-	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+	keepSet := r.calculateBackupKeepSet(backups, policy)
 
 	assert.Len(t, keepSet, 0)
 }
@@ -1024,14 +976,13 @@ func TestCalculateBackupKeepSet_NilValues(t *testing.T) {
 		now.Add(-1 * time.Hour),
 	})
 
-	// All nil values
 	policy := &dbtether.RetentionPolicy{
 		KeepLast:    nil,
 		KeepDaily:   nil,
 		KeepWeekly:  nil,
 		KeepMonthly: nil,
 	}
-	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+	keepSet := r.calculateBackupKeepSet(backups, policy)
 
 	assert.Len(t, keepSet, 0)
 }
@@ -1044,7 +995,6 @@ func TestCalculateBackupKeepSet_ZeroValues(t *testing.T) {
 		now.Add(-1 * time.Hour),
 	})
 
-	// Zero values should be treated as "not set"
 	zero := 0
 	policy := &dbtether.RetentionPolicy{
 		KeepLast:    &zero,
@@ -1052,18 +1002,17 @@ func TestCalculateBackupKeepSet_ZeroValues(t *testing.T) {
 		KeepWeekly:  &zero,
 		KeepMonthly: &zero,
 	}
-	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+	keepSet := r.calculateBackupKeepSet(backups, policy)
 
 	assert.Len(t, keepSet, 0)
 }
 
 func TestCalculateBackupKeepSet_EmptyBackupsList(t *testing.T) {
 	r := &BackupScheduleReconciler{}
-	now := time.Date(2026, 2, 6, 12, 0, 0, 0, time.UTC)
 
 	backups := []dbtether.Backup{}
 	policy := &dbtether.RetentionPolicy{KeepLast: intPtr(5)}
-	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+	keepSet := r.calculateBackupKeepSet(backups, policy)
 
 	assert.Len(t, keepSet, 0)
 }
@@ -1077,9 +1026,8 @@ func TestCalculateBackupKeepSet_KeepLastMoreThanTotal(t *testing.T) {
 		now.Add(-2 * time.Hour),
 	})
 
-	// keepLast=10 but only 2 backups exist
 	policy := &dbtether.RetentionPolicy{KeepLast: intPtr(10)}
-	keepSet := r.calculateBackupKeepSet(backups, policy, now)
+	keepSet := r.calculateBackupKeepSet(backups, policy)
 
 	assert.Len(t, keepSet, 2)
 	assert.True(t, keepSet["backup-0"])

@@ -7,7 +7,6 @@ metadata:
     {{- include "dbtether.labels" . | nindent 4 }}
 data:
   config.yaml: |
-    # Backup job configuration
     backup:
       maxConcurrentPerCluster: {{ .Values.backup.maxConcurrentPerCluster | default 3 }}
       {{- if .Values.backup.podAnnotations }}

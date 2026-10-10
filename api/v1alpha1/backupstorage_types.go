@@ -89,7 +89,6 @@ type BackupStorage struct {
 	Status BackupStorageStatus `json:"status,omitempty"`
 }
 
-// GetProvider returns the provider type based on which config is set
 func (b *BackupStorage) GetProvider() string {
 	if b.Spec.S3 != nil {
 		return "s3"

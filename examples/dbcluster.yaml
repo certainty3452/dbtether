@@ -1,4 +1,3 @@
-# Microservices cluster - credentials from Kubernetes Secret
 apiVersion: dbtether.io/v1alpha1
 kind: DBCluster
 metadata:
@@ -10,9 +9,6 @@ spec:
     name: microservices-credentials
     namespace: dbtether
 ---
-# Platform cluster - self-hosted PostgreSQL with credentials from ENV
-# The operator reads ENV vars from its own pod environment.
-# Useful with External Secrets Operator, Vault Agent, etc.
 apiVersion: dbtether.io/v1alpha1
 kind: DBCluster
 metadata:
@@ -20,6 +16,7 @@ metadata:
 spec:
   endpoint: postgres-primary.internal.company.local
   port: 5432
+  # Values are env var names read from the operator pod
   credentialsFromEnv:
-    username: PLATFORM_DB_USERNAME  # ENV variable name, not the value
-    password: PLATFORM_DB_PASSWORD  # ENV variable name, not the value
+    username: PLATFORM_DB_USERNAME
+    password: PLATFORM_DB_PASSWORD
