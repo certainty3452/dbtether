@@ -93,7 +93,7 @@ func (c *GCSClient) Exists(ctx context.Context, key string) (bool, error) {
 }
 
 func (c *GCSClient) Delete(ctx context.Context, key string) error {
-	if err := c.client.Bucket(c.bucket).Object(key).Delete(ctx); err != nil {
+	if err := c.client.Bucket(c.bucket).Object(key).Delete(ctx); err != nil && !errors.Is(err, gcs.ErrObjectNotExist) {
 		return fmt.Errorf("failed to delete from GCS: %w", err)
 	}
 	return nil

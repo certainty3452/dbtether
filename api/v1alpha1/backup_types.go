@@ -14,7 +14,7 @@ type BackupSpec struct {
 	StorageRef StorageReference `json:"storageRef"`
 
 	// Filename template for the backup file
-	// Available: .DatabaseName, .Timestamp, .Random (6 chars lowercase alphanumeric)
+	// Available: .ClusterName, .DatabaseName, .Timestamp, .Year, .Month, .Day, .RunID
 	// +kubebuilder:default="{{ .Timestamp }}.sql.gz"
 	// +optional
 	FilenameTemplate string `json:"filenameTemplate,omitempty"`
@@ -31,6 +31,11 @@ type BackupSpec struct {
 	// Job configuration for backup execution
 	// +optional
 	JobConfig *BackupJobConfig `json:"jobConfig,omitempty"`
+
+	// Retain (default) keeps the backup file when the Backup is deleted, Delete removes it.
+	// +kubebuilder:validation:Enum=Delete;Retain
+	// +kubebuilder:default=Retain
+	DeletionPolicy string `json:"deletionPolicy,omitempty"`
 }
 
 // BackupJobConfig configures the Kubernetes Job that performs the backup

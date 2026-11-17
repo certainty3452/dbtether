@@ -61,7 +61,7 @@ spec:
 |-------|------|---------|-------------|
 | `source.backupRef.name` | string | | A specific Backup. The Restore waits in `Pending` while it runs, fails if it `Failed` or has no `status.path` |
 | `source.backupRef.namespace` | string | Restore's namespace | Namespace of that Backup |
-| `source.latestFrom.databaseRef` | object | | The newest `Completed` Backup of that Database (by `completedAt`). Backups already pruned by retention are invisible |
+| `source.latestFrom.databaseRef` | object | | The newest `Completed` Backup of that Database (by `completedAt`). Backups already pruned by retention or being deleted are invisible |
 | `source.latestFrom.namespace` | string | Restore's namespace | Where to search for Backups; also the default namespace of `databaseRef` |
 | `source.path` | string | | Object key in storage. Requires `storageRef` |
 | `source.storageRef.name` | string | | BackupStorage for `path` |

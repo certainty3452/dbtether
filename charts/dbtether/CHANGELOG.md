@@ -2,6 +2,11 @@
 
 All notable changes to the dbtether Helm chart will be documented in this file.
 
+## [0.11.0] - 2026-11-17
+
+### Added
+- A Backup can remove its file from storage when it is deleted; off by default.
+
 ## [0.10.0] - 2026-10-10
 
 ### Breaking

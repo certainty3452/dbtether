@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +40,8 @@ const (
 	finalizerRequeueDelay = 1 * time.Second
 	// rerunRequeueDelay starts a pending re-run without relying on our own status patch to enqueue one.
 	rerunRequeueDelay = 1 * time.Second
+	// storageDeleteTimeout keeps an unresponsive storage from pinning a reconcile worker.
+	storageDeleteTimeout = 30 * time.Second
 )
 
 const (
@@ -69,15 +72,19 @@ type BackupReconciler struct {
 	JobLabels map[string]string
 
 	PodResources corev1.ResourceRequirements
+
+	NewStorageClient StorageClientFactory
 }
 
 const (
-	EventReasonBackupStarted   = "BackupStarted"
-	EventReasonBackupCompleted = "BackupCompleted"
-	EventReasonBackupFailed    = "BackupFailed"
-	EventReasonBackupThrottled = "BackupThrottled"
-	ReasonResultNotRecorded    = "ResultNotRecorded"
-	ReasonJobNameCollision     = "JobNameCollision"
+	EventReasonBackupStarted    = "BackupStarted"
+	EventReasonBackupCompleted  = "BackupCompleted"
+	EventReasonBackupFailed     = "BackupFailed"
+	EventReasonBackupThrottled  = "BackupThrottled"
+	EventReasonFileDeleteFailed = "FileDeleteFailed"
+	EventReasonFileOrphaned     = "FileOrphaned"
+	ReasonResultNotRecorded     = "ResultNotRecorded"
+	ReasonJobNameCollision      = "JobNameCollision"
 )
 
 func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -418,7 +425,10 @@ func (r *BackupReconciler) handleJobCreationError(ctx context.Context, backup *d
 
 // A changed output re-runs every Backup in the fleet after an upgrade.
 func (r *BackupReconciler) computeSpecHash(backup *databasesv1alpha1.Backup) string {
-	data, _ := json.Marshal(backup.Spec) //nolint:errcheck // hash doesn't need to be perfect
+	spec := backup.Spec
+	// Changing the policy must not re-run the Backup.
+	spec.DeletionPolicy = ""
+	data, _ := json.Marshal(spec) //nolint:errcheck // hash doesn't need to be perfect
 	hash := sha256.Sum256(data)
 	return hex.EncodeToString(hash[:8])
 }
@@ -446,6 +456,12 @@ func (r *BackupReconciler) handleDeletion(ctx context.Context, backup *databases
 		logger.Error(err, "failed to delete backup job during cleanup")
 	}
 
+	if backup.Spec.DeletionPolicy == "Delete" {
+		if err := r.deleteBackupFile(ctx, backup); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	patch := client.MergeFrom(backup.DeepCopy())
 	controllerutil.RemoveFinalizer(backup, backupFinalizer)
 	if err := r.Patch(ctx, backup, patch); err != nil {
@@ -454,6 +470,61 @@ func (r *BackupReconciler) handleDeletion(ctx context.Context, backup *databases
 
 	logger.Info("backup deleted, job cleaned up")
 	return ctrl.Result{}, nil
+}
+
+// A missing BackupStorage is reported, not retried: it would block deletion forever.
+func (r *BackupReconciler) deleteBackupFile(ctx context.Context, backup *databasesv1alpha1.Backup) error {
+	path := backup.Status.Path
+	if path == "" {
+		return nil
+	}
+	logger := log.FromContext(ctx)
+
+	ctx, cancel := context.WithTimeout(ctx, storageDeleteTimeout)
+	defer cancel()
+
+	var bs databasesv1alpha1.BackupStorage
+	if err := r.Get(ctx, types.NamespacedName{Name: backup.Spec.StorageRef.Name}, &bs); err != nil {
+		if !errors.IsNotFound(err) {
+			if r.Recorder != nil {
+				r.Recorder.Event(backup, corev1.EventTypeWarning, EventReasonFileDeleteFailed,
+					fmt.Sprintf("Failed to delete %s: cannot read BackupStorage %s: %v", path, backup.Spec.StorageRef.Name, err))
+			}
+			return fmt.Errorf("failed to get BackupStorage %s: %w", backup.Spec.StorageRef.Name, err)
+		}
+		logger.Info("backup storage not found, leaving file in place", "storage", backup.Spec.StorageRef.Name, "path", path)
+		if r.Recorder != nil {
+			r.Recorder.Event(backup, corev1.EventTypeWarning, EventReasonFileOrphaned,
+				fmt.Sprintf("BackupStorage %s not found, file %s left in storage", backup.Spec.StorageRef.Name, path))
+		}
+		return nil
+	}
+
+	factory := r.NewStorageClient
+	if factory == nil {
+		factory = defaultStorageClientFactory
+	}
+	storageClient, err := factory(ctx, r.Client, &bs)
+	if err != nil {
+		if r.Recorder != nil {
+			r.Recorder.Event(backup, corev1.EventTypeWarning, EventReasonFileDeleteFailed,
+				fmt.Sprintf("Failed to delete %s: %v", path, err))
+		}
+		return fmt.Errorf("failed to build storage client for BackupStorage %s: %w", bs.Name, err)
+	}
+	if closer, ok := storageClient.(io.Closer); ok {
+		defer func() { _ = closer.Close() }()
+	}
+
+	if err := storageClient.Delete(ctx, path); err != nil {
+		if r.Recorder != nil {
+			r.Recorder.Event(backup, corev1.EventTypeWarning, EventReasonFileDeleteFailed,
+				fmt.Sprintf("Failed to delete %s: %v", path, err))
+		}
+		return fmt.Errorf("failed to delete backup file %s: %w", path, err)
+	}
+	logger.Info("deleted backup file", "storage", bs.Name, "path", path)
+	return nil
 }
 
 func (r *BackupReconciler) deleteBackupJob(ctx context.Context, backup *databasesv1alpha1.Backup) error {

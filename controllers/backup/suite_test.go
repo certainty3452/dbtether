@@ -4,7 +4,9 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -23,6 +25,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	databasesv1alpha1 "github.com/certainty3452/dbtether/api/v1alpha1"
+	"github.com/certainty3452/dbtether/pkg/storage"
 )
 
 var (
@@ -32,6 +35,9 @@ var (
 	ctx       context.Context
 	cancel    context.CancelFunc
 	zapLogger *zap.SugaredLogger
+
+	envtestFiles          = storage.NewMockClient()
+	envtestStorageFailing atomic.Bool
 )
 
 func TestBackupControllers(t *testing.T) {
@@ -89,8 +95,15 @@ var _ = BeforeSuite(func() {
 		Client:    k8sManager.GetClient(),
 		APIReader: k8sManager.GetAPIReader(),
 		Scheme:    k8sManager.GetScheme(),
+		Recorder:  k8sManager.GetEventRecorderFor("backup-controller"),
 		Namespace: "default",
 		Image:     "dbtether:test",
+		NewStorageClient: func(context.Context, client.Client, *databasesv1alpha1.BackupStorage) (storage.StorageClient, error) {
+			if envtestStorageFailing.Load() {
+				return nil, errors.New("storage unavailable")
+			}
+			return envtestFiles, nil
+		},
 	}).SetupWithManager(k8sManager)
 	Expect(err).NotTo(HaveOccurred())
 

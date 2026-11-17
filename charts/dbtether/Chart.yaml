@@ -2,8 +2,8 @@ apiVersion: v2
 name: dbtether
 description: A Kubernetes operator for managing PostgreSQL databases in external clusters
 type: application
-version: 0.10.0
-appVersion: "0.10.0"
+version: 0.11.0
+appVersion: "0.11.0"
 home: https://github.com/certainty3452/dbtether
 keywords:
   - postgresql
@@ -130,6 +130,7 @@ annotations:
           name: company-s3
         ttlAfterCompletion: 1h
         trigger: "v1.2.3"
+        deletionPolicy: Retain
     - apiVersion: dbtether.io/v1alpha1
       kind: BackupSchedule
       metadata:
@@ -161,19 +162,5 @@ annotations:
             name: orders-db-restored
         onConflict: drop
   artifacthub.io/changes: |
-    - kind: changed
-      description: "Breaking: Using a Database from another namespace now requires listing that namespace in `allowedNamespaces` (names or patterns like `box-*`; `*` allows any). Apply the new CRDs and add it before upgrading."
-    - kind: changed
-      description: "Breaking: Database name and cluster, user name and Restore spec can't be changed after creation. A Restore must name exactly one source."
-    - kind: changed
-      description: "Breaking: S3 backups need permission to tag objects; without it they now fail instead of producing broken files."
-    - kind: fixed
-      description: "Backups could end up empty or truncated, and retention could delete other databases' backups. GCS and Azure backups now work."
-    - kind: fixed
-      description: "Deleting a Database no longer touches databases it doesn't own; lowered privileges are actually revoked, and outside changes are repaired."
-    - kind: fixed
-      description: "Backups and restores survive operator restarts, and a locked or unreachable database no longer stalls the operator."
-    - kind: changed
-      description: "Chart logging and metrics settings now take effect; logs default to JSON at info level."
-    - kind: security
-      description: "Go and dependencies updated to fix known vulnerabilities."
+    - kind: added
+      description: "A Backup can remove its file from storage when it is deleted; off by default."

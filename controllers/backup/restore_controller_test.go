@@ -694,6 +694,86 @@ func TestResolveSource_LatestFrom(t *testing.T) {
 	assert.Equal(t, "storage-2", storageRef)
 }
 
+func TestResolveSource_LatestFrom_SkipsDeletingBackup(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+	earlier := metav1.NewTime(now.Add(-1 * time.Hour))
+
+	newBackup := func(name, path string, completedAt *metav1.Time) *dbtether.Backup {
+		return &dbtether.Backup{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: dbtether.BackupSpec{
+				DatabaseRef: dbtether.DatabaseReference{Name: "target-db"},
+				StorageRef:  dbtether.StorageReference{Name: "storage-1"},
+			},
+			Status: dbtether.BackupStatus{Phase: "Completed", Path: path, CompletedAt: completedAt},
+		}
+	}
+	deleting := newBackup("backup-deleting", "deleting/path.sql.gz", &now)
+	deleting.DeletionTimestamp = &now
+	deleting.Finalizers = []string{backupFinalizer}
+
+	r := newFakeRestoreReconciler(deleting, newBackup("backup-live", "live/path.sql.gz", &earlier))
+
+	restore := &dbtether.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-restore", Namespace: "default"},
+		Spec: dbtether.RestoreSpec{
+			Source: dbtether.RestoreSource{
+				LatestFrom: &dbtether.LatestFromSource{
+					DatabaseRef: dbtether.DatabaseReference{Name: "target-db"},
+				},
+			},
+		},
+	}
+
+	path, _, err := r.resolveSource(ctx, restore)
+	require.NoError(t, err)
+	assert.Equal(t, "live/path.sql.gz", path)
+}
+
+func TestResolveSource_LatestFrom_AllBackupsDeletingMatchesNoBackups(t *testing.T) {
+	ctx := context.Background()
+	now := metav1.Now()
+
+	newDeletingBackup := func(name, path string) *dbtether.Backup {
+		return &dbtether.Backup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Namespace:         "default",
+				DeletionTimestamp: &now,
+				Finalizers:        []string{backupFinalizer},
+			},
+			Spec: dbtether.BackupSpec{
+				DatabaseRef: dbtether.DatabaseReference{Name: "target-db"},
+				StorageRef:  dbtether.StorageReference{Name: "storage-1"},
+			},
+			Status: dbtether.BackupStatus{Phase: "Completed", Path: path, CompletedAt: &now},
+		}
+	}
+	restore := &dbtether.Restore{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-restore", Namespace: "default"},
+		Spec: dbtether.RestoreSpec{
+			Source: dbtether.RestoreSource{
+				LatestFrom: &dbtether.LatestFromSource{
+					DatabaseRef: dbtether.DatabaseReference{Name: "target-db"},
+				},
+			},
+		},
+	}
+
+	_, _, noBackupsErr := newFakeRestoreReconciler().resolveSource(ctx, restore)
+	require.Error(t, noBackupsErr)
+
+	r := newFakeRestoreReconciler(newDeletingBackup("backup-a", "a/path.sql.gz"), newDeletingBackup("backup-b", "b/path.sql.gz"))
+	path, storageRef, err := r.resolveSource(ctx, restore)
+
+	require.Error(t, err)
+	assert.Empty(t, path)
+	assert.Empty(t, storageRef)
+	assert.Equal(t, noBackupsErr.Error(), err.Error())
+	assert.True(t, isInvalidRestoreSource(err))
+}
+
 func TestResolveSource_LatestFrom_NoBackups(t *testing.T) {
 	ctx := context.Background()
 	r := newFakeRestoreReconciler()

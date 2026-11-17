@@ -72,11 +72,19 @@ spec:
                 required:
                 - name
                 type: object
+              deletionPolicy:
+                default: Retain
+                description: Retain (default) keeps the backup file when the Backup
+                  is deleted, Delete removes it.
+                enum:
+                - Delete
+                - Retain
+                type: string
               filenameTemplate:
                 default: '{{ .Timestamp }}.sql.gz'
                 description: |-
                   Filename template for the backup file
-                  Available: .DatabaseName, .Timestamp, .Random (6 chars lowercase alphanumeric)
+                  Available: .ClusterName, .DatabaseName, .Timestamp, .Year, .Month, .Day, .RunID
                 type: string
               jobConfig:
                 description: Job configuration for backup execution

@@ -98,7 +98,7 @@ func (c *AzureClient) Exists(ctx context.Context, key string) (bool, error) {
 
 func (c *AzureClient) Delete(ctx context.Context, key string) error {
 	_, err := c.client.DeleteBlob(ctx, c.container, key, nil)
-	if err != nil {
+	if err != nil && !bloberror.HasCode(err, bloberror.BlobNotFound) {
 		return fmt.Errorf("failed to delete from Azure Blob: %w", err)
 	}
 	return nil

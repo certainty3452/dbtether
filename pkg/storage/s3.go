@@ -161,10 +161,17 @@ func (c *S3Client) Delete(ctx context.Context, key string) error {
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
 	})
-	if err != nil {
+	if err != nil && !isMissingKeyError(err) {
 		return fmt.Errorf("failed to delete from S3: %w", err)
 	}
 	return nil
+}
+
+// AWS returns 204 for a missing key; some S3-compatible stores answer NoSuchKey.
+// A bodiless 404 (NotFound) may be a proxy or route problem, so it stays an error.
+func isMissingKeyError(err error) bool {
+	var apiErr smithy.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchKey"
 }
 
 // Needs only s3:ListBucket on the bucket.

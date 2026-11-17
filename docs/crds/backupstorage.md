@@ -95,10 +95,10 @@ Exactly one of `s3`, `gcs`, `azure`. Admission rejects none of them and `credent
 
 ## Required permissions
 
-| Provider | Probe call | Probe permission | Backup, retention and restore |
-|----------|------------|------------------|-------------------------------|
+| Provider | Probe call | Probe permission | Backup, retention, `deletionPolicy: Delete` and restore |
+|----------|------------|------------------|---------------------------------------------------------|
 | AWS S3 | `HeadBucket` | `s3:ListBucket` | `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:PutObjectTagging`, `s3:AbortMultipartUpload` |
-| GCS | `Bucket.Attrs` | `storage.buckets.get` | `storage.objects.create`; get, list and delete objects for restore and retention; overwriting an existing object (fixed `filenameTemplate`) also needs `storage.objects.delete` |
+| GCS | `Bucket.Attrs` | `storage.buckets.get` | `storage.objects.create`; get, list and delete objects for restore, retention and `deletionPolicy: Delete`; overwriting an existing object (fixed `filenameTemplate`) also needs `storage.objects.delete` |
 | Azure | `Container.GetProperties` | container Read | `Storage Blob Data Contributor` |
 
 Uploads carry object tags, so S3 needs `s3:PutObjectTagging` or every upload fails.

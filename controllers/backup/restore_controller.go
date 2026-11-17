@@ -475,6 +475,11 @@ func (r *RestoreReconciler) resolveFromLatest(
 			continue
 		}
 
+		// Its file may be deleted before the Restore job reads it.
+		if !backup.DeletionTimestamp.IsZero() {
+			continue
+		}
+
 		if backup.Status.Phase != "Completed" {
 			continue
 		}

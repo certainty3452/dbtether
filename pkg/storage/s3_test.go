@@ -5,9 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/aws/smithy-go"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -165,6 +168,44 @@ func TestS3Upload_TaggingDeniedErrorNamesPermission(t *testing.T) {
 			require.Error(t, err)
 			require.Contains(t, err.Error(), "s3:PutObjectTagging")
 			require.False(t, f.stored)
+		})
+	}
+}
+
+func TestS3Delete_MissingKeyIsSuccess(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int
+		body    string
+		wantErr bool
+	}{
+		{name: "AWS 204", status: http.StatusNoContent},
+		{name: "404 NoSuchKey", status: http.StatusNotFound, body: `<?xml version="1.0"?><Error><Code>NoSuchKey</Code><Message>missing</Message></Error>`},
+		{name: "404 without body", status: http.StatusNotFound, wantErr: true},
+		{name: "404 NoSuchBucket", status: http.StatusNotFound, body: `<?xml version="1.0"?><Error><Code>NoSuchBucket</Code><Message>missing</Message></Error>`, wantErr: true},
+		{name: "403 AccessDenied", status: http.StatusForbidden, body: `<?xml version="1.0"?><Error><Code>AccessDenied</Code><Message>denied</Message></Error>`, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodDelete, r.Method)
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			t.Cleanup(srv.Close)
+			c, err := NewS3Client(context.Background(), &S3Config{
+				Bucket: "b", Region: "us-east-1", Endpoint: srv.URL,
+				AccessKey: "AKIATEST", SecretKey: "secret",
+			}, nil)
+			require.NoError(t, err)
+
+			err = c.Delete(context.Background(), "cluster/db/run.sql.gz")
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
 		})
 	}
 }
